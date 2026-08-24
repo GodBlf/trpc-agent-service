@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/platform"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
@@ -24,7 +25,8 @@ func main() {
 	addr := flag.String("addr", defaultAddr, "HTTP listen address")
 	flag.Parse()
 
-	server := &http.Server{Addr: *addr, Handler: web.NewHandlerWithRunner(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"})}
+	life := lifecycle.New()
+	server := &http.Server{Addr: *addr, Handler: web.NewHandlerWithRunnerAndLifecycle(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life)}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -37,6 +39,9 @@ func main() {
 	<-stop
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if err := life.Shutdown(ctx); err != nil {
+		log.Printf("lifecycle shutdown: %v", err)
+	}
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
 	}

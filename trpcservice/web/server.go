@@ -1,10 +1,12 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/platform"
 )
 
@@ -21,12 +23,37 @@ func NewHandler() http.Handler {
 // NewHandlerWithRunner adds the stage-0 platform loop and injects the trusted
 // tenant context at the server boundary.
 func NewHandlerWithRunner(runner platform.RunnerAdapter, tenant platform.TenantContext) http.Handler {
+	return NewHandlerWithRunnerAndLifecycle(runner, tenant, nil)
+}
+
+// NewHandlerWithRunnerAndLifecycle applies admission control and propagates
+// service shutdown to active runner contexts.
+func NewHandlerWithRunnerAndLifecycle(runner platform.RunnerAdapter, tenant platform.TenantContext, life *lifecycle.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/version", versionHandler)
 	run := platform.RunHandler{Runner: runner}
 	mux.Handle("/v1/run", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		run.ServeHTTP(w, r.WithContext(platform.WithTenantContext(r.Context(), tenant)))
+		if life == nil {
+			run.ServeHTTP(w, r.WithContext(platform.WithTenantContext(r.Context(), tenant)))
+			return
+		}
+		release, ok := life.Acquire()
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]map[string]string{"error": {"code": "service_closing", "message": "service is shutting down"}})
+			return
+		}
+		defer release()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		go func() {
+			select {
+			case <-life.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		run.ServeHTTP(w, r.WithContext(platform.WithTenantContext(ctx, tenant)))
 	}))
 	return mux
 }

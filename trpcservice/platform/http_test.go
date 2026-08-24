@@ -64,3 +64,16 @@ func TestRunHandlerRequiresTrustedTenantContext(t *testing.T) {
 		t.Fatalf("status = %d", w.Code)
 	}
 }
+
+func TestRunHandlerRejectsCancelledRequestBeforeRunner(t *testing.T) {
+	ctx, cancel := context.WithCancel(WithTenantContext(context.Background(), TenantContext{TenantID: "t"}))
+	cancel()
+	r := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(`{"app_id":"a","session_id":"s","input":"x"}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	(RunHandler{Runner: fakeRunner{}}).ServeHTTP(w, r)
+	var got errorResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if w.Code != http.StatusRequestTimeout || got.Error.Code != "request_cancelled" {
+		t.Fatalf("got %d/%q, want %d/request_cancelled", w.Code, got.Error.Code, http.StatusRequestTimeout)
+	}
+}

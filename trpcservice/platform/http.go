@@ -61,6 +61,10 @@ func (h RunHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "tenant_context_missing", "trusted tenant context is required")
 		return
 	}
+	if err := r.Context().Err(); err != nil {
+		writeError(w, http.StatusRequestTimeout, "request_cancelled", "request context cancelled")
+		return
+	}
 	result, err := h.Runner.Run(r.Context(), RunnerRequest{AppID: req.AppID, SessionID: req.SessionID, Input: req.Input})
 	if err != nil {
 		if errors.Is(err, r.Context().Err()) {

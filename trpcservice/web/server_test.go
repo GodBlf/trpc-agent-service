@@ -1,12 +1,16 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/platform"
 )
 
 func TestNewHandlerHealthz(t *testing.T) {
@@ -51,5 +55,19 @@ func TestNewHandlerUnknownRoute(t *testing.T) {
 	NewHandler().ServeHTTP(res, req)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandlerWithLifecycleRejectsNewWorkAfterShutdown(t *testing.T) {
+	life := lifecycle.New()
+	if err := life.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlerWithRunnerAndLifecycle(platform.EchoRunner{}, platform.TenantContext{TenantID: "t"}, life)
+	req := httptest.NewRequest(http.MethodPost, "/v1/run", strings.NewReader(`{"app_id":"a","session_id":"s","input":"x"}`))
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", res.Code, http.StatusServiceUnavailable)
 	}
 }
