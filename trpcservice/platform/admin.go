@@ -1,0 +1,334 @@
+package platform
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Role string
+
+const (
+	RolePlatformAdmin Role = "platform_admin"
+	RoleTenantAdmin   Role = "tenant_admin"
+	RoleOperator      Role = "operator"
+	RoleViewer        Role = "viewer"
+)
+
+type TenantAssignment struct {
+	TenantID   string `json:"tenant_id"`
+	TenantName string `json:"tenant_name"`
+	Role       Role   `json:"role"`
+}
+
+type DevelopmentIdentity struct {
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Assignments []TenantAssignment `json:"assignments"`
+}
+
+type identityResponse struct {
+	ID             string             `json:"id"`
+	Name           string             `json:"name"`
+	ActiveTenantID string             `json:"active_tenant_id"`
+	ActiveRole     Role               `json:"active_role"`
+	Assignments    []TenantAssignment `json:"assignments"`
+}
+
+// MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
+// Stage 2 replaces storage through the frozen adapter boundary.
+type MemoryPlatform struct {
+	mu          sync.RWMutex
+	tenants     map[string]Tenant
+	apps        map[string]AgentApp
+	deployments map[string]Deployment
+	versions    map[string][]DeploymentVersion
+}
+
+func NewMemoryPlatform() *MemoryPlatform {
+	return &MemoryPlatform{
+		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
+		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
+	}
+}
+
+func (p *MemoryPlatform) seedTenant(assignment TenantAssignment) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.tenants[assignment.TenantID]; !exists {
+		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+	}
+}
+
+func (p *MemoryPlatform) createTenant(tenant Tenant) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.tenants[tenant.ID]; exists {
+		return false
+	}
+	p.tenants[tenant.ID] = tenant
+	return true
+}
+
+func (p *MemoryPlatform) tenant(id string) (Tenant, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	tenant, ok := p.tenants[id]
+	return tenant, ok
+}
+
+func (p *MemoryPlatform) listTenants() []Tenant {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	items := make([]Tenant, 0, len(p.tenants))
+	for _, tenant := range p.tenants {
+		items = append(items, tenant)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items
+}
+
+type developmentSession struct {
+	activeTenantID string
+}
+
+type AdminHandler struct {
+	platform *MemoryPlatform
+	identity DevelopmentIdentity
+	mu       sync.Mutex
+	sessions map[string]*developmentSession
+	runtime  *Runtime
+}
+
+func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
+	if platform == nil {
+		platform = NewMemoryPlatform()
+	}
+	for _, assignment := range identity.Assignments {
+		platform.seedTenant(assignment)
+	}
+	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil)}
+}
+
+// ConfigureRuntime replaces the default fake runtime and attaches lifecycle
+// admission. It is intended for process composition and deterministic tests.
+func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecycle) {
+	h.runtime = NewRuntime(h.platform, runner, life)
+}
+
+func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/api/v1/auth/me":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+			return
+		}
+		h.handleIdentity(w, r)
+	case "/api/v1/auth/switch-tenant":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+			return
+		}
+		h.handleSwitchTenant(w, r)
+	case "/api/v1/admin/tenants":
+		h.handleTenants(w, h.trustedRequest(w, r))
+	default:
+		if h.handleAdminResource(w, r) {
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/tenants/") {
+			h.handleTenant(w, h.trustedRequest(w, r), strings.TrimPrefix(r.URL.Path, "/api/v1/admin/tenants/"))
+			return
+		}
+		http.NotFound(w, r)
+	}
+}
+
+func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *http.Request {
+	_, session, ok := h.session(w, r)
+	if !ok {
+		return r
+	}
+	assignment, ok := h.assignment(session.activeTenantID)
+	if !ok {
+		return r
+	}
+	ctx := WithTenantContext(r.Context(), TenantContext{TenantID: assignment.TenantID, UserID: h.identity.ID, Role: assignment.Role})
+	return r.WithContext(ctx)
+}
+
+func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
+	trusted, ok := TenantContextFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if trusted.Role == RolePlatformAdmin {
+			writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listTenants()})
+			return
+		}
+		tenant, exists := h.platform.tenant(trusted.TenantID)
+		items := []Tenant{}
+		if exists {
+			items = append(items, tenant)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	case http.MethodPost:
+		if trusted.Role != RolePlatformAdmin {
+			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
+			return
+		}
+		var request struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil || !validResourceID(request.ID) || !validDisplayName(request.Name) {
+			writeError(w, http.StatusBadRequest, "invalid_tenant", "id and name must be valid")
+			return
+		}
+		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
+		if !h.platform.createTenant(tenant) {
+			writeError(w, http.StatusConflict, "tenant_exists", "tenant identifier already exists")
+			return
+		}
+		h.mu.Lock()
+		h.identity.Assignments = append(h.identity.Assignments, TenantAssignment{TenantID: tenant.ID, TenantName: tenant.Name, Role: RolePlatformAdmin})
+		h.mu.Unlock()
+		writeJSON(w, http.StatusCreated, tenant)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
+	}
+}
+
+func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id string) {
+	trusted, ok := TenantContextFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		return
+	}
+	if trusted.Role != RolePlatformAdmin && trusted.TenantID != id {
+		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
+		return
+	}
+	tenant, exists := h.platform.tenant(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, tenant)
+}
+
+var resourceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{2,62}$`)
+
+func validResourceID(id string) bool { return resourceIDPattern.MatchString(id) }
+
+func validDisplayName(name string) bool {
+	length := len([]rune(strings.TrimSpace(name)))
+	return length >= 2 && length <= 80
+}
+
+func (h *AdminHandler) handleIdentity(w http.ResponseWriter, r *http.Request) {
+	_, session, ok := h.session(w, r)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "development_identity_unavailable", "development identity has no tenant assignments")
+		return
+	}
+	assignment, _ := h.assignment(session.activeTenantID)
+	identity := h.identitySnapshot()
+	writeJSON(w, http.StatusOK, identityResponse{
+		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
+		ActiveRole: assignment.Role, Assignments: identity.Assignments,
+	})
+}
+
+func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		TenantID string `json:"tenant_id"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || request.TenantID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "tenant_id is required")
+		return
+	}
+	assignment, approved := h.assignment(request.TenantID)
+	if !approved {
+		writeError(w, http.StatusForbidden, "tenant_not_assigned", "tenant is not assigned to the development identity")
+		return
+	}
+	_, session, ok := h.session(w, r)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "development_identity_unavailable", "development identity has no tenant assignments")
+		return
+	}
+	h.mu.Lock()
+	session.activeTenantID = request.TenantID
+	h.mu.Unlock()
+	identity := h.identitySnapshot()
+	writeJSON(w, http.StatusOK, identityResponse{
+		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
+		ActiveRole: assignment.Role, Assignments: identity.Assignments,
+	})
+}
+
+func (h *AdminHandler) assignment(tenantID string) (TenantAssignment, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.assignmentLocked(tenantID)
+}
+
+func (h *AdminHandler) assignmentLocked(tenantID string) (TenantAssignment, bool) {
+	for _, assignment := range h.identity.Assignments {
+		if assignment.TenantID == tenantID {
+			return assignment, true
+		}
+	}
+	return TenantAssignment{}, false
+}
+
+func (h *AdminHandler) identitySnapshot() DevelopmentIdentity {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	identity := h.identity
+	identity.Assignments = append([]TenantAssignment(nil), h.identity.Assignments...)
+	return identity
+}
+
+func (h *AdminHandler) session(w http.ResponseWriter, r *http.Request) (string, *developmentSession, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cookie, err := r.Cookie("trpc_dev_session"); err == nil {
+		if session := h.sessions[cookie.Value]; session != nil {
+			return cookie.Value, session, true
+		}
+	}
+	if len(h.identity.Assignments) == 0 {
+		return "", nil, false
+	}
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", nil, false
+	}
+	token := hex.EncodeToString(tokenBytes)
+	session := &developmentSession{activeTenantID: h.identity.Assignments[0].TenantID}
+	h.sessions[token] = session
+	http.SetCookie(w, &http.Cookie{
+		Name: "trpc_dev_session", Value: token, Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	return token, session, true
+}
