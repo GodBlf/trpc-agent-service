@@ -5,7 +5,7 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   reporter: "line",
-  use: { baseURL: "http://127.0.0.1:18080", trace: "retain-on-failure" },
+  use: { baseURL: "http://127.0.0.1:18080", trace: "retain-on-failure", channel: "chromium" },
   webServer: {
     command: "cd .. && ./build.sh && ./bin/trpc-service -addr 127.0.0.1:18080",
     url: "http://127.0.0.1:18080/healthz",
