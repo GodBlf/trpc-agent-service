@@ -313,7 +313,7 @@ func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey str
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := resourceKey(deployment.TenantID, deployment.ID)
-	creationKey := key + "\x00" + idempotencyKey
+	creationKey := versionCreationKey{tenantID: deployment.TenantID, deploymentID: deployment.ID, idempotencyKey: idempotencyKey}
 	if creation, exists := p.versionCreations[creationKey]; exists {
 		if creation.config != string(canonical) {
 			return DeploymentVersion{}, "idempotency_key_reused", false

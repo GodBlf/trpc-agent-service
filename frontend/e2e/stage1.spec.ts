@@ -4,7 +4,48 @@ async function expectNoHorizontalOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 }
 
-async function createActiveTenantApp(page: Page, suffix: string, ordinal: string) {
+async function createVersion(page: Page, config: string) {
+  await page.getByRole("button", { name: "创建版本" }).first().click();
+  await page.getByLabel("JSON 配置").fill(config);
+  await page.locator("form").getByRole("button", { name: "创建版本" }).click();
+}
+
+async function createVersionWithAmbiguousRetry(page: Page, tenantId: string) {
+  const keys: string[] = [];
+  const versionsPattern = "**/api/v1/admin/deployments/*/versions";
+  await page.route(versionsPattern, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    keys.push(route.request().headers()["idempotency-key"] ?? "");
+    if (keys.length === 1) {
+      const response = await route.fetch();
+      expect(response.status()).toBe(201);
+      await route.abort("failed");
+      return;
+    }
+    await route.continue();
+  });
+
+  await createVersion(page, `{"runner":"fake","scope":"${tenantId}"}`);
+  await expect(page.getByRole("alert")).toContainText("无法连接服务，请重试");
+  await page.locator("form").getByRole("button", { name: "创建版本" }).click();
+  await expect(page.getByText("v1", { exact: true })).toBeVisible();
+  await page.unroute(versionsPattern);
+  expect(keys).toHaveLength(2);
+  expect(keys[0]).toBeTruthy();
+  expect(keys[1]).toBe(keys[0]);
+
+  const nextRequestPromise = page.waitForRequest((request) => request.method() === "POST" && request.url().includes("/versions"));
+  await createVersion(page, `{"runner":"fake","scope":"${tenantId}","revision":2}`);
+  const nextRequest = await nextRequestPromise;
+  expect(nextRequest.headers()["idempotency-key"]).toBeTruthy();
+  expect(nextRequest.headers()["idempotency-key"]).not.toBe(keys[0]);
+  await expect(page.getByText("v2", { exact: true })).toBeVisible();
+}
+
+async function createActiveTenantApp(page: Page, suffix: string, ordinal: string, verifyIdempotency = false) {
   const tenantId = `tenant-${suffix}-${ordinal}`;
   const appId = `app-${suffix}-${ordinal}`;
   const deploymentId = `deploy-${suffix}-${ordinal}`;
@@ -28,15 +69,36 @@ async function createActiveTenantApp(page: Page, suffix: string, ordinal: string
   await page.getByRole("button", { name: "新建部署" }).click();
   await page.getByLabel("部署标识").fill(deploymentId);
   await page.getByRole("button", { name: "创建部署" }).click();
-  await page.getByRole("button", { name: "创建版本" }).first().click();
-  await page.getByLabel("JSON 配置").fill(`{"runner":"fake","scope":"${tenantId}"}`);
-  await page.locator("form").getByRole("button", { name: "创建版本" }).click();
-  await expect(page.getByText("v1")).toBeVisible();
+  if (verifyIdempotency) {
+    await createVersionWithAmbiguousRetry(page, tenantId);
+  } else {
+    await createVersion(page, `{"runner":"fake","scope":"${tenantId}"}`);
+    await expect(page.getByText("v1", { exact: true })).toBeVisible();
+  }
   await page.getByRole("button", { name: "发布", exact: true }).click();
   await expect(page.getByText("published").first()).toBeVisible();
   await page.getByRole("button", { name: "激活" }).click();
   await expect(page.getByText("active").first()).toBeVisible();
   return { tenantId, appId, deploymentId };
+}
+
+async function verifyCompetingActivation(page: Page, appId: string, deploymentId: string) {
+  await page.getByRole("button", { name: "关闭详情" }).click();
+  await page.getByRole("button", { name: "新建部署" }).click();
+  await page.getByLabel("部署标识").fill(deploymentId);
+  await page.getByLabel("Agent 应用").selectOption(appId);
+  await page.getByRole("button", { name: "创建部署" }).click();
+  await createVersion(page, '{"runner":"fake","candidate":true}');
+  await expect(page.getByText("v1", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "发布", exact: true }).click();
+  await expect(page.getByText("published").first()).toBeVisible();
+  const conflictPromise = page.waitForResponse((response) => response.url().endsWith(`/deployments/${deploymentId}/transition`) && response.status() === 409);
+  await page.getByRole("button", { name: "激活" }).click();
+  const conflict = await conflictPromise;
+  expect((await conflict.json()).error.code).toBe("agent_app_already_has_active_deployment");
+  await expect(page.getByRole("alert")).toContainText("Agent App already has an active Deployment");
+  await expect(page.getByRole("heading", { name: deploymentId })).toBeVisible();
+  await expect(page.getByText("published").first()).toBeVisible();
 }
 
 async function runApp(page: Page, appId: string, sessionId: string, input: string) {
@@ -56,9 +118,10 @@ test("complete Stage 1 management workflow", async ({ page }, testInfo) => {
   await expect(page.getByText("Local Developer")).toBeVisible();
   await expect(page.getByRole("navigation", { name: "主导航" })).toBeVisible();
 
-  const first = await createActiveTenantApp(page, suffix, "one");
+  const first = await createActiveTenantApp(page, suffix, "one", true);
   const firstRun = await runApp(page, first.appId, `session-${suffix}-one`, "hello-one");
   expect(firstRun).toEqual({ status: 200, body: { session_id: `session-${suffix}-one`, output: "echo:hello-one" } });
+  await verifyCompetingActivation(page, first.appId, `candidate-${suffix}-one`);
 
   const second = await createActiveTenantApp(page, suffix, "two");
   const secondRun = await runApp(page, second.appId, `session-${suffix}-two`, "hello-two");

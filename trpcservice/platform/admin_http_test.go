@@ -46,6 +46,20 @@ func postJSONWithKey(t *testing.T, client *http.Client, url, body, key string) *
 	return response
 }
 
+func requireJSONResponse(t *testing.T, client *http.Client, url, body, idempotencyKey string, wantStatus int, target any) {
+	t.Helper()
+	response := postJSONWithKey(t, client, url, body, idempotencyKey)
+	if target != nil {
+		decodeResponse(t, response, wantStatus, target)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != wantStatus {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("POST %s = %d, want %d: %s", url, response.StatusCode, wantStatus, data)
+	}
+}
+
 func newDevelopmentClient(t *testing.T, identity DevelopmentIdentity) (*httptest.Server, *http.Client) {
 	t.Helper()
 	server := httptest.NewServer(NewAdminHandler(NewMemoryPlatform(), identity))
@@ -489,16 +503,7 @@ func TestAgentAppAllowsOnlyOneActiveDeployment(t *testing.T) {
 	client := &http.Client{Jar: jar}
 	post := func(path, body, idempotencyKey string, wantStatus int, target any) {
 		t.Helper()
-		response := postJSONWithKey(t, client, server.URL+path, body, idempotencyKey)
-		if target == nil {
-			defer response.Body.Close()
-			if response.StatusCode != wantStatus {
-				data, _ := io.ReadAll(response.Body)
-				t.Fatalf("POST %s = %d, want %d: %s", path, response.StatusCode, wantStatus, data)
-			}
-			return
-		}
-		decodeResponse(t, response, wantStatus, target)
+		requireJSONResponse(t, client, server.URL+path, body, idempotencyKey, wantStatus, target)
 	}
 
 	post("/api/v1/admin/agent-apps", `{"id":"app-one","name":"App One"}`, "", http.StatusCreated, nil)
@@ -614,16 +619,7 @@ func TestTwoTenantRoutesResolveScopedDeploymentVersions(t *testing.T) {
 	client := &http.Client{Jar: jar}
 	post := func(path, body, key string, wantStatus int, target any) {
 		t.Helper()
-		response := postJSONWithKey(t, client, server.URL+path, body, key)
-		if target != nil {
-			decodeResponse(t, response, wantStatus, target)
-			return
-		}
-		defer response.Body.Close()
-		if response.StatusCode != wantStatus {
-			data, _ := io.ReadAll(response.Body)
-			t.Fatalf("POST %s = %d, want %d: %s", path, response.StatusCode, wantStatus, data)
-		}
+		requireJSONResponse(t, client, server.URL+path, body, key, wantStatus, target)
 	}
 	activate := func(appID, deploymentID, key string) DeploymentVersion {
 		t.Helper()
@@ -640,7 +636,7 @@ func TestTwoTenantRoutesResolveScopedDeploymentVersions(t *testing.T) {
 	var responseOne GatewayResponse
 	post("/api/v1/admin/run", `{"app_id":"app-one","session_id":"session-one","input":"one"}`, "", http.StatusOK, &responseOne)
 	runOne := <-runs
-	if responseOne.Output != "captured:one" || runOne.tenant.TenantID != "tenant-one" || runOne.request.AppID != "app-one" || runOne.request.DeploymentID != "deploy-one" || runOne.request.VersionID != versionOne.ID {
+	if responseOne.Output != "captured:one" || runOne.tenant.TenantID != "tenant-one" || runOne.request.AppID != "app-one" || runOne.request.SessionID != "session-one" || runOne.request.DeploymentID != "deploy-one" || runOne.request.VersionID != versionOne.ID {
 		t.Fatalf("tenant one route = response %#v, run %#v", responseOne, runOne)
 	}
 
@@ -649,7 +645,7 @@ func TestTwoTenantRoutesResolveScopedDeploymentVersions(t *testing.T) {
 	var responseTwo GatewayResponse
 	post("/api/v1/admin/run", `{"app_id":"app-two","session_id":"session-two","input":"two"}`, "", http.StatusOK, &responseTwo)
 	runTwo := <-runs
-	if responseTwo.Output != "captured:two" || runTwo.tenant.TenantID != "tenant-two" || runTwo.request.AppID != "app-two" || runTwo.request.DeploymentID != "deploy-two" || runTwo.request.VersionID != versionTwo.ID {
+	if responseTwo.Output != "captured:two" || runTwo.tenant.TenantID != "tenant-two" || runTwo.request.AppID != "app-two" || runTwo.request.SessionID != "session-two" || runTwo.request.DeploymentID != "deploy-two" || runTwo.request.VersionID != versionTwo.ID {
 		t.Fatalf("tenant two route = response %#v, run %#v", responseTwo, runTwo)
 	}
 

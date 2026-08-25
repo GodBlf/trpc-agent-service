@@ -49,7 +49,13 @@ type MemoryPlatform struct {
 	apps             map[string]AgentApp
 	deployments      map[string]Deployment
 	versions         map[string][]DeploymentVersion
-	versionCreations map[string]versionCreation
+	versionCreations map[versionCreationKey]versionCreation
+}
+
+type versionCreationKey struct {
+	tenantID       string
+	deploymentID   string
+	idempotencyKey string
 }
 
 type versionCreation struct {
@@ -61,7 +67,7 @@ func NewMemoryPlatform() *MemoryPlatform {
 	return &MemoryPlatform{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
-		versionCreations: make(map[string]versionCreation),
+		versionCreations: make(map[versionCreationKey]versionCreation),
 	}
 }
 
