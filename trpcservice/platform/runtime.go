@@ -14,14 +14,26 @@ type RuntimeLifecycle interface {
 	IsClosing() bool
 }
 
+type ComponentRole string
+type ComponentLifecycle string
+
+const (
+	ComponentGateway     ComponentRole      = "gateway"
+	ComponentWorker      ComponentRole      = "worker"
+	LifecycleHealthy     ComponentLifecycle = "healthy"
+	LifecycleUnavailable ComponentLifecycle = "unavailable"
+	LifecycleClosing     ComponentLifecycle = "closing"
+	LifecycleError       ComponentLifecycle = "error"
+)
+
 type RuntimeComponentStatus struct {
-	ID        string `json:"id"`
-	Role      string `json:"role"`
-	Available bool   `json:"available"`
-	Lifecycle string `json:"lifecycle"`
-	Active    int64  `json:"active_executions"`
-	Completed int64  `json:"completed_executions"`
-	Failed    int64  `json:"failed_executions"`
+	ID        string             `json:"id"`
+	Role      ComponentRole      `json:"role"`
+	Available bool               `json:"available"`
+	Lifecycle ComponentLifecycle `json:"lifecycle"`
+	Active    int64              `json:"active_executions"`
+	Completed int64              `json:"completed_executions"`
+	Failed    int64              `json:"failed_executions"`
 }
 
 type runtimeError struct {
@@ -33,26 +45,51 @@ func (e *runtimeError) Error() string { return e.code }
 func (e *runtimeError) Unwrap() error { return e.err }
 
 type Runtime struct {
-	platform        *MemoryPlatform
-	runner          RunnerAdapter
-	life            RuntimeLifecycle
-	gates           sessionGates
-	active          atomic.Int64
-	complete        atomic.Int64
-	failed          atomic.Int64
-	workerAvailable atomic.Bool
+	platform       *MemoryPlatform
+	worker         *StatelessWorker
+	life           RuntimeLifecycle
+	gates          sessionGates
+	global         runtimeCounters
+	counterMu      sync.Mutex
+	tenantCounters map[string]*runtimeCounters
+}
+
+type runtimeCounters struct{ active, complete, failed atomic.Int64 }
+
+// StatelessWorker is the Stage 1 execution boundary. It owns no Tenant,
+// Deployment, or Session state and delegates only the resolved request.
+type StatelessWorker struct {
+	runner    RunnerAdapter
+	available atomic.Bool
+	lastError atomic.Bool
+}
+
+func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
+	worker := &StatelessWorker{runner: runner}
+	worker.available.Store(true)
+	return worker
+}
+
+func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
+	result, err := w.runner.Run(ctx, RunnerRequest{AppID: request.AppID, SessionID: request.SessionID, Input: request.Input, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.lastError.Store(true)
+		}
+		return GatewayResponse{}, err
+	}
+	w.lastError.Store(false)
+	return GatewayResponse{SessionID: request.SessionID, Output: result.Output}, nil
 }
 
 func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {
 	if runner == nil {
 		runner = EchoRunner{}
 	}
-	runtime := &Runtime{platform: platform, runner: runner, life: life, gates: sessionGates{items: make(map[string]*sessionGate)}}
-	runtime.workerAvailable.Store(true)
-	return runtime
+	return &Runtime{platform: platform, worker: NewStatelessWorker(runner), life: life, gates: sessionGates{items: make(map[string]*sessionGate)}, tenantCounters: make(map[string]*runtimeCounters)}
 }
 
-func (rt *Runtime) SetWorkerAvailable(available bool) { rt.workerAvailable.Store(available) }
+func (rt *Runtime) SetWorkerAvailable(available bool) { rt.worker.available.Store(available) }
 
 func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request GatewayRequest) (GatewayResponse, error) {
 	if tenant.TenantID == "" {
@@ -61,15 +98,19 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if !canOperate(tenant.Role) {
 		return GatewayResponse{}, &runtimeError{code: "forbidden"}
 	}
-	if !rt.workerAvailable.Load() {
+	if !rt.worker.available.Load() {
 		return GatewayResponse{}, &runtimeError{code: "worker_unavailable"}
 	}
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return GatewayResponse{}, &runtimeError{code: "invalid_request"}
 	}
-	if !rt.platform.hasActiveDeployment(tenant.TenantID, request.AppID) {
+	deployment, found := rt.platform.activeDeployment(tenant.TenantID, request.AppID)
+	if !found {
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
 	}
+	request.DeploymentID, request.VersionID = deployment.ID, deployment.VersionID
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var releaseLife func()
 	if rt.life != nil {
 		var ok bool
@@ -78,16 +119,6 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 			return GatewayResponse{}, &runtimeError{code: "service_closing"}
 		}
 		defer releaseLife()
-	}
-	releaseGate, err := rt.gates.acquire(ctx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
-	if err != nil {
-		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
-	}
-	defer releaseGate()
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	if rt.life != nil {
 		go func() {
 			select {
 			case <-rt.life.Done():
@@ -96,45 +127,83 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}()
 	}
-	rt.active.Add(1)
-	defer rt.active.Add(-1)
-	result, err := rt.runner.Run(runCtx, RunnerRequest{AppID: request.AppID, SessionID: request.SessionID, Input: request.Input})
+	releaseGate, err := rt.gates.acquire(runCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
 	if err != nil {
-		rt.failed.Add(1)
+		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
+	}
+	defer releaseGate()
+
+	if err := runCtx.Err(); err != nil {
+		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
+	}
+	counters := rt.countersFor(tenant.TenantID)
+	rt.global.active.Add(1)
+	counters.active.Add(1)
+	defer rt.global.active.Add(-1)
+	defer counters.active.Add(-1)
+	result, err := rt.worker.Execute(runCtx, request)
+	if err != nil {
+		rt.global.failed.Add(1)
+		counters.failed.Add(1)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || runCtx.Err() != nil {
 			return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
 		}
 		return GatewayResponse{}, &runtimeError{code: "runner_error", err: err}
 	}
-	rt.complete.Add(1)
-	return GatewayResponse{SessionID: request.SessionID, Output: result.Output}, nil
+	rt.global.complete.Add(1)
+	counters.complete.Add(1)
+	return result, nil
 }
 
 func (rt *Runtime) Status() []RuntimeComponentStatus {
-	lifecycle := "healthy"
+	return rt.status(&rt.global)
+}
+
+func (rt *Runtime) StatusFor(tenant TenantContext) []RuntimeComponentStatus {
+	if tenant.Role == RolePlatformAdmin {
+		return rt.Status()
+	}
+	return rt.status(rt.countersFor(tenant.TenantID))
+}
+
+func (rt *Runtime) status(counters *runtimeCounters) []RuntimeComponentStatus {
+	lifecycle := LifecycleHealthy
 	if rt.life != nil && rt.life.IsClosing() {
-		lifecycle = "closing"
+		lifecycle = LifecycleClosing
 	}
 	workerLifecycle := lifecycle
-	if !rt.workerAvailable.Load() {
-		workerLifecycle = "unavailable"
+	if !rt.worker.available.Load() {
+		workerLifecycle = LifecycleUnavailable
+	} else if lifecycle == LifecycleHealthy && rt.worker.lastError.Load() {
+		workerLifecycle = LifecycleError
 	}
-	active, complete, failed := rt.active.Load(), rt.complete.Load(), rt.failed.Load()
+	active, complete, failed := counters.active.Load(), counters.complete.Load(), counters.failed.Load()
 	return []RuntimeComponentStatus{
-		{ID: "gateway-local", Role: "gateway", Available: lifecycle == "healthy", Lifecycle: lifecycle, Active: active, Completed: complete, Failed: failed},
-		{ID: "worker-local", Role: "worker", Available: workerLifecycle == "healthy", Lifecycle: workerLifecycle, Active: active, Completed: complete, Failed: failed},
+		{ID: "gateway-local", Role: ComponentGateway, Available: lifecycle == LifecycleHealthy, Lifecycle: lifecycle, Active: active, Completed: complete, Failed: failed},
+		{ID: "worker-local", Role: ComponentWorker, Available: workerLifecycle == LifecycleHealthy, Lifecycle: workerLifecycle, Active: active, Completed: complete, Failed: failed},
 	}
 }
 
-func (p *MemoryPlatform) hasActiveDeployment(tenantID, appID string) bool {
+func (rt *Runtime) countersFor(tenantID string) *runtimeCounters {
+	rt.counterMu.Lock()
+	defer rt.counterMu.Unlock()
+	counters := rt.tenantCounters[tenantID]
+	if counters == nil {
+		counters = &runtimeCounters{}
+		rt.tenantCounters[tenantID] = counters
+	}
+	return counters
+}
+
+func (p *MemoryPlatform) activeDeployment(tenantID, appID string) (Deployment, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, deployment := range p.deployments {
 		if deployment.TenantID == tenantID && deployment.AgentAppID == appID && deployment.Status == DeploymentActive && deployment.VersionID != "" {
-			return true
+			return deployment, true
 		}
 	}
-	return false
+	return Deployment{}, false
 }
 
 type sessionGate struct {
@@ -226,5 +295,5 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.runtime.Status()})
+	writeJSON(w, http.StatusOK, map[string]any{"items": h.runtime.StatusFor(tenant)})
 }

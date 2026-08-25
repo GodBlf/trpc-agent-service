@@ -8,6 +8,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -59,6 +60,56 @@ func TestDevelopmentIdentityCanOnlySwitchToServerApprovedTenant(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusForbidden || apiErr.Error.Code != "tenant_not_assigned" {
 		t.Fatalf("got %d/%q", resp.StatusCode, apiErr.Error.Code)
+	}
+}
+
+func TestDevelopmentIdentityConcurrentSwitchAndReadIsRaceFree(t *testing.T) {
+	server, client := newDevelopmentClient(t, DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{
+		{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin},
+		{TenantID: "tenant-two", TenantName: "Two", Role: RoleViewer},
+	}})
+	defer server.Close()
+	response, err := client.Get(server.URL + "/api/v1/auth/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(2)
+		go func(index int) {
+			defer wg.Done()
+			tenant := "tenant-one"
+			if index%2 == 1 {
+				tenant = "tenant-two"
+			}
+			response, err := client.Post(server.URL+"/api/v1/auth/switch-tenant", "application/json", bytes.NewBufferString(`{"tenant_id":"`+tenant+`"}`))
+			if err == nil {
+				response.Body.Close()
+			}
+		}(i)
+		go func() {
+			defer wg.Done()
+			response, err := client.Get(server.URL + "/api/v1/auth/me")
+			if err == nil {
+				response.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestDevelopmentSessionsRemainBounded(t *testing.T) {
+	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleViewer}}})
+	for i := 0; i < maxDevelopmentSessions+20; i++ {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil))
+	}
+	handler.mu.Lock()
+	count := len(handler.sessions)
+	handler.mu.Unlock()
+	if count != maxDevelopmentSessions {
+		t.Fatalf("sessions = %d, want %d", count, maxDevelopmentSessions)
 	}
 }
 

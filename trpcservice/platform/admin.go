@@ -96,7 +96,10 @@ func (p *MemoryPlatform) listTenants() []Tenant {
 
 type developmentSession struct {
 	activeTenantID string
+	lastSeen       time.Time
 }
+
+const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
 	platform *MemoryPlatform
@@ -159,7 +162,8 @@ func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *h
 	if !ok {
 		return r
 	}
-	ctx := WithTenantContext(r.Context(), TenantContext{TenantID: assignment.TenantID, UserID: h.identity.ID, Role: assignment.Role})
+	identity := h.identitySnapshot()
+	ctx := WithTenantContext(r.Context(), TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
 	return r.WithContext(ctx)
 }
 
@@ -270,13 +274,16 @@ func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusForbidden, "tenant_not_assigned", "tenant is not assigned to the development identity")
 		return
 	}
-	_, session, ok := h.session(w, r)
+	token, _, ok := h.session(w, r)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "development_identity_unavailable", "development identity has no tenant assignments")
 		return
 	}
 	h.mu.Lock()
-	session.activeTenantID = request.TenantID
+	if session := h.sessions[token]; session != nil {
+		session.activeTenantID = request.TenantID
+		session.lastSeen = time.Now().UTC()
+	}
 	h.mu.Unlock()
 	identity := h.identitySnapshot()
 	writeJSON(w, http.StatusOK, identityResponse{
@@ -308,27 +315,38 @@ func (h *AdminHandler) identitySnapshot() DevelopmentIdentity {
 	return identity
 }
 
-func (h *AdminHandler) session(w http.ResponseWriter, r *http.Request) (string, *developmentSession, bool) {
+func (h *AdminHandler) session(w http.ResponseWriter, r *http.Request) (string, developmentSession, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if cookie, err := r.Cookie("trpc_dev_session"); err == nil {
 		if session := h.sessions[cookie.Value]; session != nil {
-			return cookie.Value, session, true
+			session.lastSeen = time.Now().UTC()
+			return cookie.Value, *session, true
 		}
 	}
 	if len(h.identity.Assignments) == 0 {
-		return "", nil, false
+		return "", developmentSession{}, false
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", nil, false
+		return "", developmentSession{}, false
+	}
+	if len(h.sessions) >= maxDevelopmentSessions {
+		var oldestToken string
+		var oldest time.Time
+		for candidate, session := range h.sessions {
+			if oldestToken == "" || session.lastSeen.Before(oldest) {
+				oldestToken, oldest = candidate, session.lastSeen
+			}
+		}
+		delete(h.sessions, oldestToken)
 	}
 	token := hex.EncodeToString(tokenBytes)
-	session := &developmentSession{activeTenantID: h.identity.Assignments[0].TenantID}
+	session := &developmentSession{activeTenantID: h.identity.Assignments[0].TenantID, lastSeen: time.Now().UTC()}
 	h.sessions[token] = session
 	http.SetCookie(w, &http.Cookie{
 		Name: "trpc_dev_session", Value: token, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	return token, session, true
+	return token, *session, true
 }

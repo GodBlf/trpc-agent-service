@@ -71,6 +71,9 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
 .form-actions button:not(.primary) { border: 1px solid #cbd5d0; background: white; border-radius: 6px; padding: 8px 13px; }
 .form-error { color: #a12f26; font-size: 13px; }
+.inline-error { color: #8a2f26; background: #fff1ed; border: 1px solid #eccbc2; border-radius: 6px; padding: 9px 12px; }
+.version-record { display: grid; gap: 6px; margin-bottom: 10px; }
+.version-record pre { margin: 0; padding: 8px; max-width: 100%; overflow: auto; background: #f4f6f5; border-radius: 6px; font-size: 11px; }
 .status { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #e9eeeb; color: #4b5953; font-size: 12px; }
 .status.active, .status.healthy { background: #dcefe7; color: #1f654e; }
 .status.published { background: #e3ebf5; color: #315f8d; }

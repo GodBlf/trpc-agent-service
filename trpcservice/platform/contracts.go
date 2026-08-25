@@ -82,9 +82,11 @@ type DeploymentVersion struct {
 }
 
 type GatewayRequest struct {
-	AppID     string `json:"app_id"`
-	SessionID string `json:"session_id"`
-	Input     string `json:"input"`
+	AppID        string `json:"app_id"`
+	SessionID    string `json:"session_id"`
+	Input        string `json:"input"`
+	DeploymentID string `json:"-"`
+	VersionID    string `json:"-"`
 }
 
 type GatewayResponse struct {
@@ -120,9 +122,11 @@ type SessionEvent struct {
 }
 
 type RunnerRequest struct {
-	AppID     string
-	SessionID string
-	Input     string
+	AppID        string
+	SessionID    string
+	Input        string
+	DeploymentID string
+	VersionID    string
 }
 
 type RunnerResponse struct {

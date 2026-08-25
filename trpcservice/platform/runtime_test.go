@@ -40,6 +40,34 @@ type blockingRunner struct {
 	max     int
 }
 
+type capturingRunner struct {
+	request chan RunnerRequest
+	err     error
+}
+
+func (r capturingRunner) Run(_ context.Context, request RunnerRequest) (RunnerResponse, error) {
+	if r.request != nil {
+		r.request <- request
+	}
+	if r.err != nil {
+		return RunnerResponse{}, r.err
+	}
+	return RunnerResponse{Output: "captured"}, nil
+}
+
+func TestGatewayResolvesVersionBeforeStatelessWorkerInvokesRunner(t *testing.T) {
+	requests := make(chan RunnerRequest, 1)
+	runtime := NewRuntime(activeTestPlatform(t), capturingRunner{request: requests}, nil)
+	_, err := runtime.Handle(context.Background(), TenantContext{TenantID: "tenant-one", Role: RoleOperator}, GatewayRequest{AppID: "app-one", SessionID: "session", Input: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.DeploymentID != "deploy-one" || request.VersionID != "deploy-one-v1" {
+		t.Fatalf("resolved request = %#v", request)
+	}
+}
+
 func (r *blockingRunner) Run(ctx context.Context, request RunnerRequest) (RunnerResponse, error) {
 	r.mu.Lock()
 	r.active++
@@ -202,6 +230,54 @@ func TestRuntimeShutdownCancelsActiveWorkAndReportsClosing(t *testing.T) {
 	}
 	if _, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "new", Input: "x"}); err == nil || err.Error() != "service_closing" {
 		t.Fatalf("new work = %v", err)
+	}
+}
+
+func TestRuntimeShutdownCancelsQueuedSessionWorkBeforeRunner(t *testing.T) {
+	runner := &blockingRunner{entered: make(chan string, 2), release: make(chan struct{})}
+	life := lifecycle.New()
+	runtime := NewRuntime(activeTestPlatform(t), runner, life)
+	tenant := TenantContext{TenantID: "tenant-one", Role: RoleOperator}
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "same", Input: "work"})
+			done <- err
+		}()
+	}
+	<-runner.entered
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		shutdownDone <- life.Shutdown(ctx)
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-done; err == nil || err.Error() != "request_cancelled" {
+			t.Fatalf("work result = %v", err)
+		}
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.entered:
+		t.Fatal("queued work reached Runner during shutdown")
+	default:
+	}
+}
+
+func TestRuntimeStatusReportsWorkerErrorAndTenantScopedCounters(t *testing.T) {
+	runtime := NewRuntime(activeTestPlatform(t), capturingRunner{err: errors.New("runner down")}, nil)
+	tenant := TenantContext{TenantID: "tenant-one", Role: RoleOperator}
+	_, _ = runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "session", Input: "x"})
+	status := runtime.StatusFor(tenant)
+	if status[1].Lifecycle != LifecycleError || status[1].Failed != 1 {
+		t.Fatalf("tenant status = %#v", status)
+	}
+	other := runtime.StatusFor(TenantContext{TenantID: "tenant-two", Role: RoleOperator})
+	if other[1].Failed != 0 {
+		t.Fatalf("cross-tenant counters leaked: %#v", other)
 	}
 }
 

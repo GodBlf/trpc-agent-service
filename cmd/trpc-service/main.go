@@ -29,7 +29,10 @@ func main() {
 	store := platform.NewMemoryPlatform()
 	identity := platform.DevelopmentIdentity{
 		ID: "local-developer", Name: "Local Developer",
-		Assignments: []platform.TenantAssignment{{TenantID: "tenant-dev", TenantName: "Development Tenant", Role: platform.RolePlatformAdmin}},
+		Assignments: []platform.TenantAssignment{
+			{TenantID: "tenant-dev", TenantName: "Development Tenant", Role: platform.RolePlatformAdmin},
+			{TenantID: "tenant-view", TenantName: "Read-only Tenant", Role: platform.RoleViewer},
+		},
 	}
 	admin := platform.NewAdminHandler(store, identity)
 	admin.ConfigureRuntime(platform.EchoRunner{}, life)

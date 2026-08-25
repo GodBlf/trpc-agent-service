@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Building2, Plus, X } from "lucide-react";
 import { APIError, api, type Identity, type Tenant } from "./api";
 import { AsyncState } from "./AsyncState";
@@ -8,12 +8,14 @@ export function TenantsPage({ identity, identityChanged }: { identity: Identity;
   const [selected, setSelected] = useState<Tenant>();
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<APIError>();
+  const requestGeneration = useRef(0);
 
   const load = () => {
+	const generation = ++requestGeneration.current;
     setError(undefined);
-    api.tenants().then(({ items }) => setItems(items)).catch(setError);
+	api.tenants().then(({ items }) => { if (requestGeneration.current === generation) setItems(items); }).catch((caught) => { if (requestGeneration.current === generation) setError(caught); });
   };
-  useEffect(load, [identity.active_tenant_id]);
+  useEffect(() => { load(); return () => { requestGeneration.current++; }; }, [identity.active_tenant_id]);
 
   const create = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();

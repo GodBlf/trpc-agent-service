@@ -14,8 +14,8 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
-  echo "error: frontend dependencies are missing; run 'cd frontend && npm ci'" >&2
-  exit 1
+  echo "frontend dependencies are missing; installing from package-lock.json"
+  npm --prefix "$ROOT/frontend" ci
 fi
 
 npm --prefix "$ROOT/frontend" run build
