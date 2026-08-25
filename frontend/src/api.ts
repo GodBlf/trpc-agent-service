@@ -25,7 +25,7 @@ export interface AgentApp { id: string; tenant_id: string; name: string; created
 export type DeploymentStatus = "draft" | "published" | "active" | "paused";
 export interface Deployment { id: string; tenant_id: string; agent_app_id: string; version_id?: string; status: DeploymentStatus; desired_replicas: number; created_at: string }
 export interface DeploymentVersion { id: string; deployment_id: string; agent_app_id: string; number: number; config: Record<string, unknown>; created_at: string }
-export interface RuntimeStatus { id: string; role: "gateway" | "worker"; available: boolean; lifecycle: "healthy" | "unavailable" | "closing"; active_executions: number; completed_executions: number; failed_executions: number }
+export interface RuntimeStatus { id: string; role: "gateway" | "worker"; available: boolean; lifecycle: "healthy" | "unavailable" | "closing" | "error"; active_executions: number; completed_executions: number; failed_executions: number }
 
 export class APIError extends Error {
   constructor(
@@ -67,7 +67,7 @@ export const api = {
   deployments: () => request<ListResponse<Deployment>>("/api/v1/admin/deployments"),
   createDeployment: (input: { id: string; agent_app_id: string }) => request<Deployment>("/api/v1/admin/deployments", { method: "POST", body: JSON.stringify(input) }),
   versions: (id: string) => request<ListResponse<DeploymentVersion>>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/versions`),
-  createVersion: (id: string, config: Record<string, unknown>) => request<DeploymentVersion>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/versions`, { method: "POST", body: JSON.stringify({ config }) }),
+  createVersion: (id: string, config: Record<string, unknown>, idempotencyKey: string) => request<DeploymentVersion>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/versions`, { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: JSON.stringify({ config }) }),
   transition: (id: string, status: DeploymentStatus, version_id?: string) => request<Deployment>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/transition`, { method: "POST", body: JSON.stringify({ status, version_id }) }),
   runtimeStatus: () => request<ListResponse<RuntimeStatus>>("/api/v1/admin/runtime/status"),
 };

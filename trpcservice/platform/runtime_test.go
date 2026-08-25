@@ -21,7 +21,7 @@ func activeTestPlatform(t *testing.T) *MemoryPlatform {
 	if !store.createDeployment(deployment) {
 		t.Fatal("create deployment")
 	}
-	version := store.createVersion(deployment, map[string]any{"model": "fake"})
+	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
 	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
 	if !ok {
 		t.Fatal("publish")
@@ -154,7 +154,7 @@ func TestRuntimeDoesNotShareSessionGateAcrossTenants(t *testing.T) {
 	if !store.createDeployment(deployment) {
 		t.Fatal("create second deployment")
 	}
-	version := store.createVersion(deployment, map[string]any{"model": "fake"})
+	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
 	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
 	if !ok {
 		t.Fatal("publish second")

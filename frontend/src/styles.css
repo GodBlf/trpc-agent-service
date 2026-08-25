@@ -78,6 +78,7 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .status.active, .status.healthy { background: #dcefe7; color: #1f654e; }
 .status.published { background: #e3ebf5; color: #315f8d; }
 .status.paused, .status.unavailable, .status.closing { background: #f6e5df; color: #963c2e; }
+.status.error { background: #f8d7da; color: #921f2b; border: 1px solid #e8aeb5; }
 .stack-actions { display: grid; gap: 8px; margin-top: 18px; }
 .stack-actions button { border: 1px solid #cbd5d0; background: white; border-radius: 6px; padding: 8px; }
 .runtime-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }

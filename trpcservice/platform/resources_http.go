@@ -209,6 +209,15 @@ func (h *AdminHandler) handleVersions(w http.ResponseWriter, r *http.Request, te
 			writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
 			return
 		}
+		idempotencyKey := r.Header.Get("Idempotency-Key")
+		if idempotencyKey == "" {
+			writeError(w, http.StatusBadRequest, "idempotency_key_required", "Idempotency-Key header is required")
+			return
+		}
+		if !validIdempotencyKey(idempotencyKey) {
+			writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must contain 1 to 128 printable ASCII characters")
+			return
+		}
 		var request struct {
 			Config map[string]any `json:"config"`
 		}
@@ -216,11 +225,27 @@ func (h *AdminHandler) handleVersions(w http.ResponseWriter, r *http.Request, te
 			writeError(w, http.StatusBadRequest, "invalid_deployment_config", "config must be a non-empty JSON object")
 			return
 		}
-		version := h.platform.createVersion(deployment, request.Config)
+		version, code, ok := h.platform.createVersion(deployment, idempotencyKey, request.Config)
+		if !ok {
+			writeError(w, http.StatusConflict, code, "Idempotency-Key was already used with different configuration")
+			return
+		}
 		writeJSON(w, http.StatusCreated, version)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
 	}
+}
+
+func validIdempotencyKey(key string) bool {
+	if len(key) == 0 || len(key) > 128 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, tenant TenantContext, deployment Deployment) {
@@ -242,7 +267,11 @@ func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, 
 	}
 	updated, code, ok := h.platform.transition(deployment, request.Status, request.VersionID)
 	if !ok {
-		writeError(w, http.StatusConflict, code, "Deployment lifecycle transition is not allowed")
+		message := "Deployment lifecycle transition is not allowed"
+		if code == "agent_app_already_has_active_deployment" {
+			message = "Agent App already has an active Deployment"
+		}
+		writeError(w, http.StatusConflict, code, message)
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
@@ -279,14 +308,26 @@ func (p *MemoryPlatform) listDeployments(tenantID string) []Deployment {
 	return items
 }
 
-func (p *MemoryPlatform) createVersion(deployment Deployment, config map[string]any) DeploymentVersion {
+func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey string, config map[string]any) (DeploymentVersion, string, bool) {
+	canonical, _ := json.Marshal(config)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := resourceKey(deployment.TenantID, deployment.ID)
+	creationKey := key + "\x00" + idempotencyKey
+	if creation, exists := p.versionCreations[creationKey]; exists {
+		if creation.config != string(canonical) {
+			return DeploymentVersion{}, "idempotency_key_reused", false
+		}
+		version := creation.version
+		version.Config = cloneConfig(version.Config)
+		return version, "", true
+	}
 	number := len(p.versions[key]) + 1
 	version := DeploymentVersion{ID: fmt.Sprintf("%s-v%d", deployment.ID, number), TenantID: deployment.TenantID, AgentAppID: deployment.AgentAppID, DeploymentID: deployment.ID, Number: number, Config: cloneConfig(config), CreatedAt: time.Now().UTC()}
 	p.versions[key] = append(p.versions[key], version)
-	return version
+	p.versionCreations[creationKey] = versionCreation{config: string(canonical), version: version}
+	version.Config = cloneConfig(version.Config)
+	return version, "", true
 }
 
 func cloneConfig(config map[string]any) map[string]any {
@@ -316,6 +357,13 @@ func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus
 	valid := (current.Status == DeploymentDraft && next == DeploymentPublished) || (current.Status == DeploymentPublished && next == DeploymentActive) || (current.Status == DeploymentActive && next == DeploymentPaused)
 	if !valid {
 		return Deployment{}, "invalid_deployment_transition", false
+	}
+	if next == DeploymentActive {
+		for _, item := range p.deployments {
+			if item.TenantID == current.TenantID && item.AgentAppID == current.AgentAppID && item.ID != current.ID && item.Status == DeploymentActive {
+				return Deployment{}, "agent_app_already_has_active_deployment", false
+			}
+		}
 	}
 	if next == DeploymentPublished {
 		found := false

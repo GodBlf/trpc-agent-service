@@ -44,17 +44,24 @@ type identityResponse struct {
 // MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
 // Stage 2 replaces storage through the frozen adapter boundary.
 type MemoryPlatform struct {
-	mu          sync.RWMutex
-	tenants     map[string]Tenant
-	apps        map[string]AgentApp
-	deployments map[string]Deployment
-	versions    map[string][]DeploymentVersion
+	mu               sync.RWMutex
+	tenants          map[string]Tenant
+	apps             map[string]AgentApp
+	deployments      map[string]Deployment
+	versions         map[string][]DeploymentVersion
+	versionCreations map[string]versionCreation
+}
+
+type versionCreation struct {
+	config  string
+	version DeploymentVersion
 }
 
 func NewMemoryPlatform() *MemoryPlatform {
 	return &MemoryPlatform{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
+		versionCreations: make(map[string]versionCreation),
 	}
 }
 
