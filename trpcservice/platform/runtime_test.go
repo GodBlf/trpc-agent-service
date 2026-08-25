@@ -45,6 +45,19 @@ type capturingRunner struct {
 	err     error
 }
 
+type notifyingLifecycle struct {
+	*lifecycle.Service
+	acquired chan struct{}
+}
+
+func (life *notifyingLifecycle) Acquire() (func(), bool) {
+	release, ok := life.Service.Acquire()
+	if ok {
+		life.acquired <- struct{}{}
+	}
+	return release, ok
+}
+
 func (r capturingRunner) Run(_ context.Context, request RunnerRequest) (RunnerResponse, error) {
 	if r.request != nil {
 		r.request <- request
@@ -235,17 +248,21 @@ func TestRuntimeShutdownCancelsActiveWorkAndReportsClosing(t *testing.T) {
 
 func TestRuntimeShutdownCancelsQueuedSessionWorkBeforeRunner(t *testing.T) {
 	runner := &blockingRunner{entered: make(chan string, 2), release: make(chan struct{})}
-	life := lifecycle.New()
+	life := &notifyingLifecycle{Service: lifecycle.New(), acquired: make(chan struct{}, 2)}
 	runtime := NewRuntime(activeTestPlatform(t), runner, life)
 	tenant := TenantContext{TenantID: "tenant-one", Role: RoleOperator}
 	done := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		go func() {
-			_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "same", Input: "work"})
-			done <- err
-		}()
-	}
+	go func() {
+		_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "same", Input: "work"})
+		done <- err
+	}()
+	<-life.acquired
 	<-runner.entered
+	go func() {
+		_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "same", Input: "work"})
+		done <- err
+	}()
+	<-life.acquired
 	shutdownDone := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

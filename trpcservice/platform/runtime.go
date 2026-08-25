@@ -136,6 +136,9 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if err := runCtx.Err(); err != nil {
 		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
 	}
+	if rt.life != nil && rt.life.IsClosing() {
+		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: context.Canceled}
+	}
 	counters := rt.countersFor(tenant.TenantID)
 	rt.global.active.Add(1)
 	counters.active.Add(1)
