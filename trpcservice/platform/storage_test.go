@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/alicebob/miniredis/v2"
 )
 
 func TestInMemoryStoreOrdersAndDeduplicatesEvents(t *testing.T) {
@@ -54,8 +56,9 @@ func TestInMemoryStoreConcurrentAppendsHaveUniqueSequences(t *testing.T) {
 }
 
 func TestRedisInstancesShareNamespace(t *testing.T) {
-	a := NewRedisStore("test-shared")
-	b := NewRedisStore("test-shared")
+	server := miniredis.RunT(t)
+	a := NewRedisStore(server.Addr())
+	b := NewRedisStore(server.Addr())
 	if err := a.AppendSessionEvent(context.Background(), SessionEvent{TenantID: "t", SessionID: "s", IdempotencyKey: "k", Type: "message", Payload: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}

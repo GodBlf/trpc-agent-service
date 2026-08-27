@@ -96,7 +96,11 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .data-toolbar small { color: #68756f; }
 .data-controls { justify-content: flex-start; }
 .data-controls label { display: grid; gap: 6px; color: #68756f; font-size: 12px; }
-.data-controls input { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 10px; min-width: 220px; }
+.data-controls input, .data-controls select { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 10px; min-width: 150px; background: white; }
+.data-controls > button:not(.primary) { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 12px; background: white; align-self: end; }
+.migration-state { border: 1px solid #cbd5d0; border-radius: 6px; padding: 10px 12px; background: white; }
+.migration-state.completed { border-color: #9bcab9; background: #edf8f3; }
+.migration-state.failed { border-color: #eccbc2; background: #fff1ed; color: #8a2f26; }
 .data-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .event-list { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
 .event-list li { display: grid; gap: 4px; font-size: 13px; }

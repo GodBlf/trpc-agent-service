@@ -139,6 +139,13 @@ test("complete Stage 1 management workflow", async ({ page }, testInfo) => {
   await expectNoHorizontalOverflow(page);
   await page.screenshot({ path: testInfo.outputPath("runtime-status.png"), fullPage: true });
 
+  await page.getByRole("button", { name: "数据管理" }).click();
+  await expect(page.getByText("healthy")).toBeVisible();
+  await page.getByLabel("Session ID").fill(`session-${suffix}-two`);
+  await expect(page.getByText("message.input")).toBeVisible();
+  await expect(page.getByText("message.output")).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+
   await page.getByRole("combobox", { name: "当前租户" }).selectOption("tenant-view");
   await page.getByRole("button", { name: "租户" }).click();
   await expect(page.getByRole("button", { name: "新建租户" })).toHaveCount(0);

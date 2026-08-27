@@ -80,5 +80,6 @@ export const api = {
   session: (id: string) => request<SessionState>(`/api/v1/admin/sessions/${encodeURIComponent(id)}`),
   sessionEvents: (id: string) => request<ListResponse<SessionEvent>>(`/api/v1/admin/sessions/${encodeURIComponent(id)}/events`),
   memory: (id: string) => request<ListResponse<MemoryRecord>>(`/api/v1/admin/memory/${encodeURIComponent(id)}`),
-  migrate: (dry_run: boolean) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify({ dry_run }) }),
+  migrate: (input: { dry_run: boolean; source_address: string; destination_path: string; checkpoint_path: string; batch_size: number }) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify(input) }),
+  migration: (id: string) => request<MigrationResult>(`/api/v1/admin/migrations/${encodeURIComponent(id)}`),
 };

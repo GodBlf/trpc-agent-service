@@ -35,6 +35,9 @@ func main() {
 		},
 	}
 	admin := platform.NewAdminHandler(store, identity)
+	if err := admin.ConfigureBackendSelections(os.Getenv("TRPC_BACKEND_SELECTIONS")); err != nil && os.Getenv("TRPC_BACKEND_SELECTIONS") != "" {
+		log.Fatalf("backend selections: %v", err)
+	}
 	admin.ConfigureRuntime(platform.EchoRunner{}, life)
 	server := &http.Server{Addr: *addr, Handler: web.NewStage1Handler(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life, admin)}
 	stop := make(chan os.Signal, 1)

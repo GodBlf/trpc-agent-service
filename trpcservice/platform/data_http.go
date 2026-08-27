@@ -1,7 +1,9 @@
 package platform
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,11 +12,14 @@ import (
 
 type migrationResult struct {
 	ID               string `json:"id"`
+	TenantID         string `json:"-"`
 	Status           string `json:"status"`
 	DryRun           bool   `json:"dry_run"`
+	Sessions         int    `json:"sessions"`
 	SourceCount      int    `json:"source_count"`
 	DestinationCount int    `json:"destination_count"`
 	Checksum         string `json:"checksum,omitempty"`
+	Resumed          bool   `json:"resumed"`
 	Message          string `json:"message,omitempty"`
 }
 
@@ -88,7 +93,13 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 	}
 	h.mu.Lock()
 	h.backends[tenant.TenantID] = store
+	h.backendSelections[tenant.TenantID] = backendSelection{Backend: req.Backend, Address: req.Address}
+	err := h.persistBackendSelectionsLocked()
 	h.mu.Unlock()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backend_selection_not_persisted", "backend selection could not be persisted")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"backend": req.Backend, "health": store.Health(r.Context())})
 }
 
@@ -161,7 +172,18 @@ func (h *AdminHandler) handleMemoryData(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, store DataStore, tenant TenantContext, parts []string) {
+func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _ DataStore, tenant TenantContext, parts []string) {
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		h.mu.Lock()
+		result, ok := h.migrations[parts[0]]
+		h.mu.Unlock()
+		if !ok || result.TenantID != tenant.TenantID {
+			writeError(w, http.StatusNotFound, "migration_not_found", "migration was not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
 	if len(parts) != 0 {
 		writeError(w, http.StatusNotFound, "not_found", "resource was not found")
 		return
@@ -175,12 +197,45 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	var req struct {
-		DryRun bool `json:"dry_run"`
+		DryRun          bool   `json:"dry_run"`
+		SourceAddress   string `json:"source_address"`
+		DestinationPath string `json:"destination_path"`
+		CheckpointPath  string `json:"checkpoint_path"`
+		BatchSize       int    `json:"batch_size"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeStrict(r, &req); err != nil || req.SourceAddress == "" || req.DestinationPath == "" {
+		writeError(w, http.StatusBadRequest, "invalid_migration", "source_address and destination_path are required")
+		return
 	}
-	result := migrationResult{ID: "migration-" + time.Now().UTC().Format("20060102150405.000000000"), Status: "completed", DryRun: req.DryRun, Message: "no source records"}
+	idBytes := make([]byte, 8)
+	_, _ = rand.Read(idBytes)
+	id := "migration-" + hex.EncodeToString(idBytes)
+	result := migrationResult{ID: id, TenantID: tenant.TenantID, Status: "running", DryRun: req.DryRun}
+	h.mu.Lock()
+	h.migrations[id] = result
+	h.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		source := NewRedisStore(req.SourceAddress)
+		defer source.Close()
+		destination, err := NewSQLiteStore(req.DestinationPath)
+		if err == nil {
+			defer destination.Close()
+		}
+		var report MigrationReport
+		if err == nil {
+			report, err = MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: tenant.TenantID, DryRun: req.DryRun, BatchSize: req.BatchSize, CheckpointPath: req.CheckpointPath})
+		}
+		updated := migrationResult{ID: id, TenantID: tenant.TenantID, Status: report.Status, DryRun: req.DryRun, Sessions: report.Sessions, SourceCount: report.SourceCount, DestinationCount: report.DestinationCount, Checksum: report.Checksum, Resumed: report.Resumed}
+		if err != nil {
+			updated.Status = "failed"
+			updated.Message = err.Error()
+		}
+		h.mu.Lock()
+		h.migrations[id] = updated
+		h.mu.Unlock()
+	}()
 	writeJSON(w, http.StatusAccepted, result)
 }
 

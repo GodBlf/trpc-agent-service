@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -54,13 +52,12 @@ type InMemoryStore struct {
 	mu      sync.RWMutex
 	events  map[string][]SessionEvent
 	byKey   map[memoryEventKey]SessionEvent
-	state   map[string]SessionState
 	memory  map[string]MemoryRecord
 	backend string
 }
 
 func NewInMemoryStore() *InMemoryStore {
-	return &InMemoryStore{events: map[string][]SessionEvent{}, byKey: map[memoryEventKey]SessionEvent{}, state: map[string]SessionState{}, memory: map[string]MemoryRecord{}, backend: "inmemory"}
+	return &InMemoryStore{events: map[string][]SessionEvent{}, byKey: map[memoryEventKey]SessionEvent{}, memory: map[string]MemoryRecord{}, backend: "inmemory"}
 }
 
 func storageSessionKey(tenant, session string) string { return tenant + "\x00" + session }
@@ -68,27 +65,33 @@ func storageMemoryKey(tenant, session, key string) string {
 	return tenant + "\x00" + session + "\x00" + key
 }
 
-func (s *InMemoryStore) GetSession(_ context.Context, tenant, session string) (Session, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	state, ok := s.state[storageSessionKey(tenant, session)]
-	if !ok {
-		return Session{}, ErrNotFound
-	}
-	return state.Session, nil
+func (s *InMemoryStore) GetSession(ctx context.Context, tenant, session string) (Session, error) {
+	state, err := s.GetSessionState(ctx, tenant, session)
+	return state.Session, err
 }
 
-func (s *InMemoryStore) GetSessionState(_ context.Context, tenant, session string) (SessionState, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	state, ok := s.state[storageSessionKey(tenant, session)]
-	if !ok {
+func (s *InMemoryStore) GetSessionState(ctx context.Context, tenant, session string) (SessionState, error) {
+	events, err := s.ListSessionEvents(ctx, tenant, session, 0)
+	if err != nil {
+		return SessionState{}, err
+	}
+	return materializeSession(tenant, session, events)
+}
+
+func materializeSession(tenant, session string, events []SessionEvent) (SessionState, error) {
+	if len(events) == 0 {
 		return SessionState{}, ErrNotFound
 	}
-	return cloneState(state), nil
+	state := SessionState{Session: Session{ID: session, TenantID: tenant}, EventCount: len(events)}
+	for _, event := range events {
+		state.Sequence = event.Sequence
+		state.UpdatedAt = event.OccurredAt
+		if event.Type == "summary" {
+			state.Summary = string(event.Payload)
+		}
+	}
+	return state, nil
 }
-
-func cloneState(state SessionState) SessionState { return state }
 
 func (s *InMemoryStore) AppendSessionEvent(ctx context.Context, event SessionEvent) error {
 	if err := ctx.Err(); err != nil {
@@ -117,18 +120,13 @@ func (s *InMemoryStore) AppendSessionEvent(ctx context.Context, event SessionEve
 	event.Payload = append([]byte(nil), event.Payload...)
 	s.events[stream] = append(s.events[stream], event)
 	s.byKey[key] = event
-	state := s.state[stream]
-	state.Session = Session{ID: event.SessionID, TenantID: event.TenantID, Sequence: event.Sequence}
-	state.EventCount = len(s.events[stream])
-	state.UpdatedAt = event.OccurredAt
-	if event.Type == "summary" {
-		state.Summary = string(event.Payload)
-	}
-	s.state[stream] = state
 	return nil
 }
 
-func (s *InMemoryStore) ListSessionEvents(_ context.Context, tenant, session string, after uint64) ([]SessionEvent, error) {
+func (s *InMemoryStore) ListSessionEvents(ctx context.Context, tenant, session string, after uint64) ([]SessionEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	stream := s.events[storageSessionKey(tenant, session)]
@@ -142,7 +140,10 @@ func (s *InMemoryStore) ListSessionEvents(_ context.Context, tenant, session str
 	return result, nil
 }
 
-func (s *InMemoryStore) ListMemory(_ context.Context, tenant, session string) ([]MemoryRecord, error) {
+func (s *InMemoryStore) ListMemory(ctx context.Context, tenant, session string) ([]MemoryRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := []MemoryRecord{}
@@ -173,100 +174,11 @@ func (s *InMemoryStore) PutMemory(ctx context.Context, item MemoryRecord) error 
 	return nil
 }
 
-func (s *InMemoryStore) Health(context.Context) BackendHealth {
+func (s *InMemoryStore) Health(ctx context.Context) BackendHealth {
+	if err := ctx.Err(); err != nil {
+		return BackendHealth{Backend: s.backend, Status: "unavailable", Checked: time.Now().UTC()}
+	}
 	return BackendHealth{Backend: s.backend, Status: "healthy", Checked: time.Now().UTC()}
-}
-
-// RedisStore models a shared Redis namespace without requiring a provider in
-// local tests. Instances created with the same address share the same state.
-type RedisStore struct {
-	*InMemoryStore
-	address string
-}
-
-var redisNamespaces sync.Map
-
-func NewRedisStore(address string) *RedisStore {
-	if address == "" {
-		address = "local"
-	}
-	value, _ := redisNamespaces.LoadOrStore(address, NewInMemoryStore())
-	store := value.(*InMemoryStore)
-	store.backend = "redis"
-	return &RedisStore{InMemoryStore: store, address: address}
-}
-func (s *RedisStore) Health(context.Context) BackendHealth {
-	return BackendHealth{Backend: "redis", Status: "healthy", Message: s.address, Checked: time.Now().UTC()}
-}
-
-// SQLiteStore persists the reference store as JSON. The shape is deliberately
-// SQL-compatible and keeps local development free from CGO/provider setup.
-type SQLiteStore struct {
-	*InMemoryStore
-	path string
-}
-
-func NewSQLiteStore(path string) (*SQLiteStore, error) {
-	s := &SQLiteStore{InMemoryStore: NewInMemoryStore(), path: path}
-	s.backend = "sqlite"
-	if path == "" {
-		return s, nil
-	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var dump struct {
-		Events map[string][]SessionEvent
-		State  map[string]SessionState
-		Memory map[string]MemoryRecord
-	}
-	if err := json.Unmarshal(data, &dump); err != nil {
-		return nil, err
-	}
-	s.events, s.state, s.memory = dump.Events, dump.State, dump.Memory
-	s.byKey = map[memoryEventKey]SessionEvent{}
-	for _, stream := range s.events {
-		for _, event := range stream {
-			s.byKey[memoryEventKey{event.TenantID, event.SessionID, event.IdempotencyKey}] = event
-		}
-	}
-	return s, nil
-}
-func (s *SQLiteStore) persist() error {
-	if s.path == "" {
-		return nil
-	}
-	s.mu.RLock()
-	dump := struct {
-		Events map[string][]SessionEvent
-		State  map[string]SessionState
-		Memory map[string]MemoryRecord
-	}{s.events, s.state, s.memory}
-	data, err := json.Marshal(dump)
-	s.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.path, data, 0600)
-}
-func (s *SQLiteStore) AppendSessionEvent(ctx context.Context, e SessionEvent) error {
-	if err := s.InMemoryStore.AppendSessionEvent(ctx, e); err != nil {
-		return err
-	}
-	return s.persist()
-}
-func (s *SQLiteStore) PutMemory(ctx context.Context, e MemoryRecord) error {
-	if err := s.InMemoryStore.PutMemory(ctx, e); err != nil {
-		return err
-	}
-	return s.persist()
-}
-func (s *SQLiteStore) Health(context.Context) BackendHealth {
-	return BackendHealth{Backend: "sqlite", Status: "healthy", Message: s.path, Checked: time.Now().UTC()}
 }
 
 func itoa(v uint64) string {

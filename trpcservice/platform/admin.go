@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -115,13 +117,16 @@ type developmentSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
-	platform *MemoryPlatform
-	identity DevelopmentIdentity
-	mu       sync.Mutex
-	sessions map[string]*developmentSession
-	runtime  *Runtime
-	data     DataStore
-	backends map[string]DataStore
+	platform             *MemoryPlatform
+	identity             DevelopmentIdentity
+	mu                   sync.Mutex
+	sessions             map[string]*developmentSession
+	runtime              *Runtime
+	data                 DataStore
+	backends             map[string]DataStore
+	migrations           map[string]migrationResult
+	backendSelections    map[string]backendSelection
+	backendSelectionPath string
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -131,7 +136,7 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	for _, assignment := range identity.Assignments {
 		platform.seedTenant(assignment)
 	}
-	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore)}
+	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore), migrations: make(map[string]migrationResult), backendSelections: make(map[string]backendSelection)}
 }
 
 // ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
@@ -142,11 +147,58 @@ func (h *AdminHandler) ConfigureDataStore(store DataStore) {
 	}
 }
 
+type backendSelection struct {
+	Backend string `json:"backend"`
+	Address string `json:"address"`
+}
+
+func (h *AdminHandler) ConfigureBackendSelections(path string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.backendSelectionPath = path
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &h.backendSelections)
+}
+func (h *AdminHandler) persistBackendSelectionsLocked() error {
+	if h.backendSelectionPath == "" {
+		return nil
+	}
+	data, err := json.Marshal(h.backendSelections)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(h.backendSelectionPath, data, 0600)
+}
+
 func (h *AdminHandler) storeForTenant(tenantID string) DataStore {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if store := h.backends[tenantID]; store != nil {
 		return store
+	}
+	if selection, ok := h.backendSelections[tenantID]; ok {
+		var store DataStore
+		switch selection.Backend {
+		case "redis":
+			store = NewRedisStore(selection.Address)
+		case "sqlite":
+			store, _ = NewSQLiteStore(selection.Address)
+		default:
+			store = NewInMemoryStore()
+		}
+		if store != nil {
+			h.backends[tenantID] = store
+			return store
+		}
 	}
 	return h.data
 }
