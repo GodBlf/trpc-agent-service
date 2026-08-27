@@ -103,22 +103,22 @@ type Worker interface {
 }
 
 type Session struct {
-	ID       string
-	TenantID string
-	AppID    string
-	UserID   string
-	Sequence uint64
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	AppID    string `json:"app_id,omitempty"`
+	UserID   string `json:"user_id,omitempty"`
+	Sequence uint64 `json:"sequence"`
 }
 
 type SessionEvent struct {
-	ID             string
-	TenantID       string
-	SessionID      string
-	Sequence       uint64
-	IdempotencyKey string
-	Type           string
-	Payload        []byte
-	OccurredAt     time.Time
+	ID             string    `json:"id"`
+	TenantID       string    `json:"tenant_id"`
+	SessionID      string    `json:"session_id"`
+	Sequence       uint64    `json:"sequence"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	Type           string    `json:"type"`
+	Payload        []byte    `json:"payload"`
+	OccurredAt     time.Time `json:"occurred_at"`
 }
 
 type RunnerRequest struct {

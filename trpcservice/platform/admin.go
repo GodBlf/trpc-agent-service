@@ -120,6 +120,8 @@ type AdminHandler struct {
 	mu       sync.Mutex
 	sessions map[string]*developmentSession
 	runtime  *Runtime
+	data     DataStore
+	backends map[string]DataStore
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -129,7 +131,24 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	for _, assignment := range identity.Assignments {
 		platform.seedTenant(assignment)
 	}
-	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil)}
+	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore)}
+}
+
+// ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
+// during process composition before serving requests.
+func (h *AdminHandler) ConfigureDataStore(store DataStore) {
+	if store != nil {
+		h.data = store
+	}
+}
+
+func (h *AdminHandler) storeForTenant(tenantID string) DataStore {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if store := h.backends[tenantID]; store != nil {
+		return store
+	}
+	return h.data
 }
 
 // ConfigureRuntime replaces the default fake runtime and attaches lifecycle
@@ -139,6 +158,10 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isDataPath(r.URL.Path) {
+		h.handleDataResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/"))
+		return
+	}
 	switch r.URL.Path {
 	case "/api/v1/auth/me":
 		if r.Method != http.MethodGet {
