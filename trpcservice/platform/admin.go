@@ -135,6 +135,7 @@ type AdminHandler struct {
 	migrationCtx             context.Context
 	migrationCancel          context.CancelFunc
 	migrationWG              sync.WaitGroup
+	migrationRunning         bool
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -151,8 +152,15 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 // ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
 // during process composition before serving requests.
 func (h *AdminHandler) ConfigureDataStore(store DataStore) {
-	if store != nil {
-		h.data = store
+	if store == nil {
+		return
+	}
+	h.mu.Lock()
+	old := h.data
+	h.data = store
+	h.mu.Unlock()
+	if closer, ok := old.(interface{ Close() error }); ok {
+		_ = closer.Close()
 	}
 }
 
@@ -227,6 +235,11 @@ func (h *AdminHandler) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var first error
+	if closer, ok := h.data.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			first = err
+		}
+	}
 	for _, store := range h.backends {
 		if closer, ok := store.(interface{ Close() error }); ok {
 			if err := closer.Close(); err != nil && first == nil {

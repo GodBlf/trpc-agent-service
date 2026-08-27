@@ -228,11 +228,18 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 	id := "migration-" + hex.EncodeToString(idBytes)
 	result := migrationResult{ID: id, TenantID: tenant.TenantID, Status: "running", DryRun: req.DryRun}
 	h.mu.Lock()
+	if h.migrationRunning {
+		h.mu.Unlock()
+		writeError(w, http.StatusConflict, "migration_in_progress", "another migration is already running")
+		return
+	}
+	h.migrationRunning = true
 	h.migrations[id] = result
 	h.mu.Unlock()
 	h.migrationWG.Add(1)
 	go func() {
 		defer h.migrationWG.Done()
+		defer func() { h.mu.Lock(); h.migrationRunning = false; h.mu.Unlock() }()
 		ctx, cancel := context.WithTimeout(h.migrationCtx, 10*time.Minute)
 		defer cancel()
 		source := NewRedisStore(sourceAddress)
