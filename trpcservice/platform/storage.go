@@ -220,14 +220,6 @@ func itoa(v uint64) string {
 	}
 	return string(buf[i:])
 }
-func eventChecksum(events []SessionEvent) string {
-	h := sha256.New()
-	for _, e := range events {
-		h.Write(e.Payload)
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func migrationChecksum(events []SessionEvent, memory []MemoryRecord) string {
 	h := sha256.New()
 	for _, event := range events {
