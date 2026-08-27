@@ -30,7 +30,7 @@ export interface BackendHealth { backend: string; status: string; message?: stri
 export interface SessionState { id: string; tenant_id: string; sequence: number; summary: string; event_count: number; updated_at: string }
 export interface SessionEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
 export interface MemoryRecord { id: string; tenant_id: string; session_id: string; key: string; value: string; updated_at: string }
-export interface MigrationResult { id: string; status: string; dry_run: boolean; source_count: number; destination_count: number; checksum?: string; message?: string }
+export interface MigrationResult { id: string; status: string; dry_run: boolean; sessions: number; processed_sessions: number; source_count: number; destination_count: number; checksum?: string; message?: string }
 
 export class APIError extends Error {
   constructor(

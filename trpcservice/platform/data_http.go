@@ -12,16 +12,17 @@ import (
 )
 
 type migrationResult struct {
-	ID               string `json:"id"`
-	TenantID         string `json:"-"`
-	Status           string `json:"status"`
-	DryRun           bool   `json:"dry_run"`
-	Sessions         int    `json:"sessions"`
-	SourceCount      int    `json:"source_count"`
-	DestinationCount int    `json:"destination_count"`
-	Checksum         string `json:"checksum,omitempty"`
-	Resumed          bool   `json:"resumed"`
-	Message          string `json:"message,omitempty"`
+	ID                string `json:"id"`
+	TenantID          string `json:"-"`
+	Status            string `json:"status"`
+	DryRun            bool   `json:"dry_run"`
+	Sessions          int    `json:"sessions"`
+	ProcessedSessions int    `json:"processed_sessions"`
+	SourceCount       int    `json:"source_count"`
+	DestinationCount  int    `json:"destination_count"`
+	Checksum          string `json:"checksum,omitempty"`
+	Resumed           bool   `json:"resumed"`
+	Message           string `json:"message,omitempty"`
 }
 
 func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -250,9 +251,13 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 		}
 		var report MigrationReport
 		if err == nil {
-			report, err = MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: tenant.TenantID, DryRun: req.DryRun, BatchSize: req.BatchSize, CheckpointPath: checkpointPath})
+			report, err = MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: tenant.TenantID, DryRun: req.DryRun, BatchSize: req.BatchSize, CheckpointPath: checkpointPath, Progress: func(progress MigrationReport) {
+				h.mu.Lock()
+				h.migrations[id] = migrationResult{ID: id, TenantID: tenant.TenantID, Status: "running", DryRun: req.DryRun, Sessions: progress.Sessions, ProcessedSessions: progress.ProcessedSessions, SourceCount: progress.SourceCount, DestinationCount: progress.DestinationCount, Checksum: progress.Checksum, Resumed: progress.Resumed}
+				h.mu.Unlock()
+			}})
 		}
-		updated := migrationResult{ID: id, TenantID: tenant.TenantID, Status: report.Status, DryRun: req.DryRun, Sessions: report.Sessions, SourceCount: report.SourceCount, DestinationCount: report.DestinationCount, Checksum: report.Checksum, Resumed: report.Resumed}
+		updated := migrationResult{ID: id, TenantID: tenant.TenantID, Status: report.Status, DryRun: req.DryRun, Sessions: report.Sessions, ProcessedSessions: report.ProcessedSessions, SourceCount: report.SourceCount, DestinationCount: report.DestinationCount, Checksum: report.Checksum, Resumed: report.Resumed}
 		if err != nil {
 			updated.Status = "failed"
 			updated.Message = err.Error()

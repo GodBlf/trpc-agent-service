@@ -227,3 +227,27 @@ func eventChecksum(events []SessionEvent) string {
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+func migrationChecksum(events []SessionEvent, memory []MemoryRecord) string {
+	h := sha256.New()
+	for _, event := range events {
+		h.Write([]byte(event.TenantID))
+		h.Write([]byte(event.SessionID))
+		h.Write([]byte(itoa(event.Sequence)))
+		h.Write([]byte(event.Type))
+		h.Write(event.Payload)
+	}
+	sort.Slice(memory, func(i, j int) bool {
+		if memory[i].SessionID == memory[j].SessionID {
+			return memory[i].Key < memory[j].Key
+		}
+		return memory[i].SessionID < memory[j].SessionID
+	})
+	for _, item := range memory {
+		h.Write([]byte(item.TenantID))
+		h.Write([]byte(item.SessionID))
+		h.Write([]byte(item.Key))
+		h.Write([]byte(item.Value))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}

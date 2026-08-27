@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -104,4 +105,54 @@ func TestSQLiteStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil || len(events) != 1 {
 		t.Fatalf("events=%#v err=%v", events, err)
 	}
+}
+
+func runDataStoreContract(t *testing.T, store DataStore, tenant string) {
+	t.Helper()
+	ctx := context.Background()
+	session := "contract-session"
+	event := SessionEvent{TenantID: tenant, SessionID: session, IdempotencyKey: "event-one", Type: "message", Payload: []byte("hello")}
+	if err := store.AppendSessionEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSessionEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	conflict := event
+	conflict.Type = "summary"
+	if err := store.AppendSessionEvent(ctx, conflict); !errors.Is(err, ErrDuplicateEvent) {
+		t.Fatalf("conflict=%v", err)
+	}
+	if err := store.PutMemory(ctx, MemoryRecord{TenantID: tenant, SessionID: session, Key: "name", Value: "Ada"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListSessionEvents(ctx, tenant, session, 0)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+	memory, err := store.ListMemory(ctx, tenant, session)
+	if err != nil || len(memory) != 1 || memory[0].Value != "Ada" {
+		t.Fatalf("memory=%#v err=%v", memory, err)
+	}
+	state, err := store.GetSessionState(ctx, tenant, session)
+	if err != nil || state.EventCount != 1 {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+	other, err := store.ListSessionEvents(ctx, tenant+"-other", session, 0)
+	if err != nil || len(other) != 0 {
+		t.Fatalf("cross tenant=%#v err=%v", other, err)
+	}
+}
+
+func TestRedisAndSQLiteDataStoreContracts(t *testing.T) {
+	server := miniredis.RunT(t)
+	redisStore := NewRedisStore(server.Addr())
+	defer redisStore.Close()
+	runDataStoreContract(t, redisStore, "redis-contract")
+	sqliteStore, err := NewSQLiteStore(filepath.Join(t.TempDir(), "contract.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqliteStore.Close()
+	runDataStoreContract(t, sqliteStore, "sqlite-contract")
 }

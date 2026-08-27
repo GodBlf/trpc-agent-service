@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Database, RefreshCw } from "lucide-react";
 import { api, type BackendHealth, type Identity, type MemoryRecord, type MigrationResult, type SessionEvent, type SessionState } from "./api";
 import { AsyncState } from "./AsyncState";
@@ -12,19 +12,23 @@ export function DataPage({ identity }: { identity: Identity }) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [memory, setMemory] = useState<MemoryRecord[]>([]);
   const [migration, setMigration] = useState<MigrationResult>();
+  const [dryRun,setDryRun] = useState(true);
   const [failed, setFailed] = useState(false);
+  const requestGeneration = useRef(0);
 
   const load = useCallback(async () => {
+    const generation = ++requestGeneration.current;
     try {
       setFailed(false);
       const [backendResponse, state, eventResponse, memoryResponse] = await Promise.all([
         api.backend(), api.session(sessionID).catch(() => undefined),
         api.sessionEvents(sessionID), api.memory(sessionID),
       ]);
+      if (generation !== requestGeneration.current) return;
       setBackend(backendResponse.health); setBackendChoice(backendResponse.backend);
       setAvailableBackends(backendResponse.available_backends);
       setSession(state); setEvents(eventResponse.items); setMemory(memoryResponse.items);
-    } catch { setFailed(true); }
+    } catch { if (generation === requestGeneration.current) setFailed(true); }
   }, [sessionID]);
 
   useEffect(() => { void load(); }, [load]);
@@ -42,7 +46,7 @@ export function DataPage({ identity }: { identity: Identity }) {
   };
   const createMigration = async () => {
     try {
-      setMigration(await api.migrate({ dry_run: true, batch_size: 100 }));
+      setMigration(await api.migrate({ dry_run: dryRun, batch_size: 100 }));
     } catch { setFailed(true); }
   };
 
@@ -55,9 +59,10 @@ export function DataPage({ identity }: { identity: Identity }) {
       <label>后端<select value={backendChoice} onChange={(event) => setBackendChoice(event.target.value)}>{availableBackends.map((backendID)=><option key={backendID} value={backendID}>{backendID}</option>)}</select></label>
       {canConfigure && <button onClick={() => void selectBackend()}>应用后端</button>}
       <label>Session ID<input value={sessionID} onChange={(event) => setSessionID(event.target.value)} /></label>
-      {canConfigure && <button className="primary" onClick={() => void createMigration()}><Database aria-hidden="true" />Dry-run 迁移</button>}
+      {canConfigure && <label className="check-control"><input type="checkbox" checked={dryRun} onChange={(event)=>setDryRun(event.target.checked)} />仅校验</label>}
+      {canConfigure && <button className="primary" onClick={() => void createMigration()}><Database aria-hidden="true" />启动迁移</button>}
     </div>
-    {migration && <div className={`migration-state ${migration.status}`}>迁移 {migration.status}：{migration.source_count} / {migration.destination_count} {migration.message}</div>}
+    {migration && <div className={`migration-state ${migration.status}`}>迁移 {migration.status}：Session {migration.processed_sessions || 0} / {migration.sessions || 0}，记录 {migration.source_count} / {migration.destination_count} {migration.message}</div>}
     <div className="data-grid">
       <DataPanel title="Session / Summary">{session ? <dl><dt>事件数</dt><dd>{session.event_count}</dd><dt>序列</dt><dd>{session.sequence}</dd><dt>Summary</dt><dd>{session.summary || "暂无"}</dd></dl> : <AsyncState kind="empty" />}</DataPanel>
       <DataPanel title="Session Events">{events.length ? <ol className="event-list">{events.map((event) => <li key={event.id}><code>#{event.sequence}</code> {event.type}<span>{event.payload}</span></li>)}</ol> : <AsyncState kind="empty" />}</DataPanel>

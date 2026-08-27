@@ -2,6 +2,8 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -19,16 +21,18 @@ type MigrationOptions struct {
 	BatchSize      int
 	CheckpointPath string
 	MaxRetries     int
+	Progress       func(MigrationReport)
 }
 type MigrationReport struct {
-	Status           string `json:"status"`
-	DryRun           bool   `json:"dry_run"`
-	Sessions         int    `json:"sessions"`
-	SourceCount      int    `json:"source_count"`
-	DestinationCount int    `json:"destination_count"`
-	Checksum         string `json:"checksum"`
-	Resumed          bool   `json:"resumed"`
-	Message          string `json:"message,omitempty"`
+	Status            string `json:"status"`
+	DryRun            bool   `json:"dry_run"`
+	Sessions          int    `json:"sessions"`
+	ProcessedSessions int    `json:"processed_sessions"`
+	SourceCount       int    `json:"source_count"`
+	DestinationCount  int    `json:"destination_count"`
+	Checksum          string `json:"checksum"`
+	Resumed           bool   `json:"resumed"`
+	Message           string `json:"message,omitempty"`
 }
 type migrationCheckpoint struct {
 	TenantID string `json:"tenant_id"`
@@ -52,69 +56,67 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 		options.MaxRetries = 3
 	}
 	report := MigrationReport{Status: "running", DryRun: options.DryRun, Sessions: len(sessions)}
-	type sessionData struct {
-		events []SessionEvent
-		memory []MemoryRecord
-	}
-	sourceData := make(map[string]sessionData, len(sessions))
-	var sourceEvents []SessionEvent
+	sourceHash := sha256.New()
 	for _, session := range sessions {
-		events, err := source.ListSessionEvents(ctx, options.TenantID, session, 0)
+		events, memory, err := readSessionData(ctx, source, options.TenantID, session)
 		if err != nil {
 			return report, err
 		}
-		memory, err := source.ListMemory(ctx, options.TenantID, session)
-		if err != nil {
-			return report, err
-		}
-		sourceData[session] = sessionData{events: events, memory: memory}
-		sourceEvents = append(sourceEvents, events...)
+		sourceHash.Write([]byte(migrationChecksum(events, memory)))
 		report.SourceCount += len(events) + len(memory)
 	}
-	report.Checksum = eventChecksum(sourceEvents)
+	report.Checksum = hex.EncodeToString(sourceHash.Sum(nil))
 	checkpoint := migrationCheckpoint{TenantID: options.TenantID}
 	if data, err := os.ReadFile(options.CheckpointPath); err == nil {
 		if json.Unmarshal(data, &checkpoint) == nil && checkpoint.TenantID == options.TenantID {
 			report.Resumed = checkpoint.Next > 0
 		}
 	}
-	for index := checkpoint.Next; index < len(sessions); index++ {
-		if err := ctx.Err(); err != nil {
-			return report, err
+	for start := checkpoint.Next; start < len(sessions); start += options.BatchSize {
+		end := start + options.BatchSize
+		if end > len(sessions) {
+			end = len(sessions)
 		}
-		session := sessions[index]
-		data := sourceData[session]
+		for _, session := range sessions[start:end] {
+			if err := ctx.Err(); err != nil {
+				return report, err
+			}
+			events, memory, err := readSessionData(ctx, source, options.TenantID, session)
+			if err != nil {
+				return report, err
+			}
+			if !options.DryRun {
+				for _, event := range events {
+					if err := retry(ctx, options.MaxRetries, func() error { return destination.AppendSessionEvent(ctx, event) }); err != nil {
+						return report, err
+					}
+				}
+				for _, item := range memory {
+					if err := retry(ctx, options.MaxRetries, func() error { return destination.PutMemory(ctx, item) }); err != nil {
+						return report, err
+					}
+				}
+			}
+		}
+		report.ProcessedSessions = end
 		if !options.DryRun {
-			for _, event := range data.events {
-				if err := retry(ctx, options.MaxRetries, func() error { return destination.AppendSessionEvent(ctx, event) }); err != nil {
-					return report, err
-				}
+			checkpoint.Next = end
+			if err := writeCheckpoint(options.CheckpointPath, checkpoint); err != nil {
+				return report, err
 			}
-			for _, item := range data.memory {
-				if err := retry(ctx, options.MaxRetries, func() error { return destination.PutMemory(ctx, item) }); err != nil {
-					return report, err
-				}
-			}
-			if (index+1)%options.BatchSize == 0 || index+1 == len(sessions) {
-				checkpoint.Next = index + 1
-				if err := writeCheckpoint(options.CheckpointPath, checkpoint); err != nil {
-					return report, err
-				}
-			}
+		}
+		if options.Progress != nil {
+			options.Progress(report)
 		}
 	}
-	var destinationEvents []SessionEvent
+	destinationHash := sha256.New()
 	if !options.DryRun {
 		for _, session := range sessions {
-			events, err := destination.ListSessionEvents(ctx, options.TenantID, session, 0)
+			events, memory, err := readSessionData(ctx, destination, options.TenantID, session)
 			if err != nil {
 				return report, err
 			}
-			memory, err := destination.ListMemory(ctx, options.TenantID, session)
-			if err != nil {
-				return report, err
-			}
-			destinationEvents = append(destinationEvents, events...)
+			destinationHash.Write([]byte(migrationChecksum(events, memory)))
 			report.DestinationCount += len(events) + len(memory)
 		}
 		if report.SourceCount != report.DestinationCount {
@@ -126,7 +128,7 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 	} else {
 		report.DestinationCount = report.SourceCount
 	}
-	if !options.DryRun && report.Checksum != eventChecksum(destinationEvents) {
+	if !options.DryRun && report.Checksum != hex.EncodeToString(destinationHash.Sum(nil)) {
 		report.Status = "failed"
 		report.Message = "source and destination content differ"
 		return report, errors.New(report.Message)
@@ -134,10 +136,18 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 	report.Status = "completed"
 	return report, nil
 }
+func readSessionData(ctx context.Context, store DataStore, tenant, session string) ([]SessionEvent, []MemoryRecord, error) {
+	events, err := store.ListSessionEvents(ctx, tenant, session, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	memory, err := store.ListMemory(ctx, tenant, session)
+	return events, memory, err
+}
 func retry(ctx context.Context, max int, fn func() error) error {
 	var err error
 	for i := 0; i < max; i++ {
-		if err = fn(); err == nil || errors.Is(err, ErrDuplicateEvent) {
+		if err = fn(); err == nil {
 			return nil
 		}
 		select {
@@ -169,13 +179,26 @@ func (s *InMemoryStore) ListSessionIDs(ctx context.Context, tenant string) ([]st
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ids := []string{}
+	set := map[string]struct{}{}
 	prefix := tenant + "\x00"
 	for key := range s.events {
 		if strings.HasPrefix(key, prefix) {
-			ids = append(ids, strings.TrimPrefix(key, prefix))
+			set[strings.TrimPrefix(key, prefix)] = struct{}{}
 		}
 	}
+	for key := range s.memory {
+		if strings.HasPrefix(key, prefix) {
+			remainder := strings.TrimPrefix(key, prefix)
+			if index := strings.IndexByte(remainder, '\x00'); index >= 0 {
+				set[remainder[:index]] = struct{}{}
+			}
+		}
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
 	return ids, nil
 }
 func (s *SQLStore) ListSessionIDs(ctx context.Context, tenant string) ([]string, error) {

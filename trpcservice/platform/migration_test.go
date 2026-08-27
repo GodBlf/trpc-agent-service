@@ -13,6 +13,12 @@ type flakyDestination struct {
 	DataStore
 	failures int
 }
+type corruptingDestination struct{ DataStore }
+
+func (s *corruptingDestination) PutMemory(ctx context.Context, item MemoryRecord) error {
+	item.Value += "-corrupt"
+	return s.DataStore.PutMemory(ctx, item)
+}
 
 func (s *flakyDestination) AppendSessionEvent(ctx context.Context, event SessionEvent) error {
 	if s.failures > 0 {
@@ -101,5 +107,20 @@ func TestMigrationRetriesAndHonorsCancellation(t *testing.T) {
 	cancel()
 	if _, err := MigrateRedisToSQL(cancelled, source, NewInMemoryStore(), MigrationOptions{TenantID: "tenant-a"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestMigrationDetectsMemoryContentMismatch(t *testing.T) {
+	source := NewInMemoryStore()
+	ctx := context.Background()
+	if err := source.AppendSessionEvent(ctx, SessionEvent{TenantID: "tenant-a", SessionID: "session-a", IdempotencyKey: "one", Type: "message", Payload: []byte("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.PutMemory(ctx, MemoryRecord{TenantID: "tenant-a", SessionID: "session-a", Key: "name", Value: "Ada"}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := MigrateRedisToSQL(ctx, source, &corruptingDestination{DataStore: NewInMemoryStore()}, MigrationOptions{TenantID: "tenant-a"})
+	if err == nil || report.Status != "failed" {
+		t.Fatalf("report=%#v err=%v", report, err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestRedisIntegrationProfile(t *testing.T) {
@@ -28,6 +29,7 @@ func TestPostgreSQLCompatibilityProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	runDataStoreContract(t, store, "postgres-contract-"+time.Now().UTC().Format("150405.000000000"))
 	tenant := "profile-tenant"
 	session := "profile-session"
 	event := SessionEvent{TenantID: tenant, SessionID: session, IdempotencyKey: "profile-event", Type: "message", Payload: []byte("postgres")}
