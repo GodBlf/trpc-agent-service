@@ -14,6 +14,7 @@ import (
 func TestDataManagementAPIUsesTrustedTenantAndBackendSelection(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 	h := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RolePlatformAdmin}, {TenantID: "tenant-b", TenantName: "B", Role: RoleViewer}}})
+	h.ConfigureBackendCatalog(redisServer.Addr(), "")
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 	client := ts.Client()
@@ -25,7 +26,7 @@ func TestDataManagementAPIUsesTrustedTenantAndBackendSelection(t *testing.T) {
 		t.Fatalf("health=%d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	body, _ := json.Marshal(map[string]string{"backend": "redis", "address": redisServer.Addr()})
+	body, _ := json.Marshal(map[string]string{"backend": "redis"})
 	resp, err = client.Post(ts.URL+"/api/v1/admin/storage/backend", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)

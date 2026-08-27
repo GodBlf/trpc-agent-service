@@ -44,6 +44,31 @@ type DataStore interface {
 	Health(context.Context) BackendHealth
 }
 
+type unavailableStore struct{ backend string }
+
+func (s *unavailableStore) failure() error {
+	return errors.New("platform: " + s.backend + " storage unavailable")
+}
+func (s *unavailableStore) GetSession(context.Context, string, string) (Session, error) {
+	return Session{}, s.failure()
+}
+func (s *unavailableStore) AppendSessionEvent(context.Context, SessionEvent) error {
+	return s.failure()
+}
+func (s *unavailableStore) ListSessionEvents(context.Context, string, string, uint64) ([]SessionEvent, error) {
+	return nil, s.failure()
+}
+func (s *unavailableStore) GetSessionState(context.Context, string, string) (SessionState, error) {
+	return SessionState{}, s.failure()
+}
+func (s *unavailableStore) ListMemory(context.Context, string, string) ([]MemoryRecord, error) {
+	return nil, s.failure()
+}
+func (s *unavailableStore) PutMemory(context.Context, MemoryRecord) error { return s.failure() }
+func (s *unavailableStore) Health(context.Context) BackendHealth {
+	return BackendHealth{Backend: s.backend, Status: "unavailable", Checked: time.Now().UTC()}
+}
+
 type memoryEventKey struct{ tenant, session, key string }
 
 // InMemoryStore is the deterministic reference implementation used by local

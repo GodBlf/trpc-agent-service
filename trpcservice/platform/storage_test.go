@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -30,6 +31,24 @@ func TestInMemoryStoreOrdersAndDeduplicatesEvents(t *testing.T) {
 	state, err := s.GetSessionState(ctx, "t", "s")
 	if err != nil || state.Summary != "sum" || state.EventCount != 2 {
 		t.Fatalf("state=%#v err=%v", state, err)
+	}
+}
+
+func TestPersistedUnavailableSQLiteDoesNotFallBackToMemory(t *testing.T) {
+	config := filepath.Join(t.TempDir(), "backends.json")
+	if err := os.WriteFile(config, []byte(`{"tenant-a":{"backend":"sqlite","address":"/missing-parent/store.db"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RolePlatformAdmin}}})
+	if err := handler.ConfigureBackendSelections(config); err != nil {
+		t.Fatal(err)
+	}
+	store := handler.storeForTenant("tenant-a")
+	if health := store.Health(context.Background()); health.Status != "unavailable" {
+		t.Fatalf("health=%#v", health)
+	}
+	if err := store.PutMemory(context.Background(), MemoryRecord{TenantID: "tenant-a", SessionID: "s", Key: "k"}); err == nil {
+		t.Fatal("unavailable store accepted a write")
 	}
 }
 

@@ -6,7 +6,7 @@ import { AsyncState } from "./AsyncState";
 export function DataPage({ identity }: { identity: Identity }) {
   const [backend, setBackend] = useState<BackendHealth>();
   const [backendChoice, setBackendChoice] = useState("inmemory");
-  const [backendAddress, setBackendAddress] = useState("");
+  const [availableBackends, setAvailableBackends] = useState<string[]>(["inmemory"]);
   const [sessionID, setSessionID] = useState("demo-session");
   const [session, setSession] = useState<SessionState>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -22,6 +22,7 @@ export function DataPage({ identity }: { identity: Identity }) {
         api.sessionEvents(sessionID), api.memory(sessionID),
       ]);
       setBackend(backendResponse.health); setBackendChoice(backendResponse.backend);
+      setAvailableBackends(backendResponse.available_backends);
       setSession(state); setEvents(eventResponse.items); setMemory(memoryResponse.items);
     } catch { setFailed(true); }
   }, [sessionID]);
@@ -36,12 +37,12 @@ export function DataPage({ identity }: { identity: Identity }) {
   }, [migration]);
 
   const selectBackend = async () => {
-    try { setBackend((await api.selectBackend(backendChoice, backendAddress || undefined)).health); }
+    try { setBackend((await api.selectBackend(backendChoice)).health); }
     catch { setFailed(true); }
   };
   const createMigration = async () => {
     try {
-      setMigration(await api.migrate({ dry_run: true, source_address: backendAddress || "127.0.0.1:6379", destination_path: "data/stage2.db", checkpoint_path: "data/stage2-migration.checkpoint", batch_size: 100 }));
+      setMigration(await api.migrate({ dry_run: true, batch_size: 100 }));
     } catch { setFailed(true); }
   };
 
@@ -51,8 +52,7 @@ export function DataPage({ identity }: { identity: Identity }) {
   return <div className="data-page">
     <div className="data-toolbar"><div><strong>数据后端</strong><span className={`status ${backend.status}`}>{backend.status}</span><small>{backend.backend}</small></div><button className="icon-button" title="刷新" onClick={() => void load()}><RefreshCw aria-hidden="true" /></button></div>
     <div className="data-controls">
-      <label>后端<select value={backendChoice} onChange={(event) => setBackendChoice(event.target.value)}><option value="inmemory">InMemory</option><option value="redis">Redis</option><option value="sqlite">SQLite</option></select></label>
-      <label>地址或路径<input value={backendAddress} onChange={(event) => setBackendAddress(event.target.value)} placeholder="Redis 地址或 SQLite 路径" /></label>
+      <label>后端<select value={backendChoice} onChange={(event) => setBackendChoice(event.target.value)}>{availableBackends.map((backendID)=><option key={backendID} value={backendID}>{backendID}</option>)}</select></label>
       {canConfigure && <button onClick={() => void selectBackend()}>应用后端</button>}
       <label>Session ID<input value={sessionID} onChange={(event) => setSessionID(event.target.value)} /></label>
       {canConfigure && <button className="primary" onClick={() => void createMigration()}><Database aria-hidden="true" />Dry-run 迁移</button>}

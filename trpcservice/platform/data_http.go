@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -55,7 +56,14 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 	}
 	if r.Method == http.MethodGet {
 		store := h.storeForTenant(tenant.TenantID)
-		writeJSON(w, http.StatusOK, map[string]any{"backend": store.Health(r.Context()).Backend, "health": store.Health(r.Context())})
+		h.mu.Lock()
+		available := make([]string, 0, len(h.backendCatalog))
+		for id := range h.backendCatalog {
+			available = append(available, id)
+		}
+		h.mu.Unlock()
+		sort.Strings(available)
+		writeJSON(w, http.StatusOK, map[string]any{"backend": store.Health(r.Context()).Backend, "health": store.Health(r.Context()), "available_backends": available})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -68,20 +76,26 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 	}
 	var req struct {
 		Backend string `json:"backend"`
-		Address string `json:"address"`
 	}
 	if err := decodeStrict(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_backend", "backend is required")
 		return
 	}
+	h.mu.Lock()
+	selection, configured := h.backendCatalog[req.Backend]
+	h.mu.Unlock()
+	if !configured {
+		writeError(w, http.StatusBadRequest, "backend_not_configured", "backend is not configured by the server")
+		return
+	}
 	var store DataStore
-	switch req.Backend {
+	switch selection.Backend {
 	case "inmemory":
 		store = NewInMemoryStore()
 	case "redis":
-		store = NewRedisStore(req.Address)
+		store = NewRedisStore(selection.Address)
 	case "sqlite":
-		sqlite, err := NewSQLiteStore(req.Address)
+		sqlite, err := NewSQLiteStore(selection.Address)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_backend", err.Error())
 			return
@@ -91,12 +105,10 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusBadRequest, "invalid_backend", "backend must be inmemory, redis, or sqlite")
 		return
 	}
-	h.mu.Lock()
-	h.backends[tenant.TenantID] = store
-	h.backendSelections[tenant.TenantID] = backendSelection{Backend: req.Backend, Address: req.Address}
-	err := h.persistBackendSelectionsLocked()
-	h.mu.Unlock()
-	if err != nil {
+	if err := h.selectBackend(tenant.TenantID, selection, store); err != nil {
+		if closer, ok := store.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		writeError(w, http.StatusInternalServerError, "backend_selection_not_persisted", "backend selection could not be persisted")
 		return
 	}
@@ -197,14 +209,18 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 		return
 	}
 	var req struct {
-		DryRun          bool   `json:"dry_run"`
-		SourceAddress   string `json:"source_address"`
-		DestinationPath string `json:"destination_path"`
-		CheckpointPath  string `json:"checkpoint_path"`
-		BatchSize       int    `json:"batch_size"`
+		DryRun    bool `json:"dry_run"`
+		BatchSize int  `json:"batch_size"`
 	}
-	if err := decodeStrict(r, &req); err != nil || req.SourceAddress == "" || req.DestinationPath == "" {
-		writeError(w, http.StatusBadRequest, "invalid_migration", "source_address and destination_path are required")
+	if err := decodeStrict(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_migration", "dry_run and batch_size must be valid")
+		return
+	}
+	h.mu.Lock()
+	sourceAddress, destinationPath, checkpointPath := h.migrationSourceAddress, h.migrationDestinationPath, h.migrationCheckpointPath
+	h.mu.Unlock()
+	if sourceAddress == "" || destinationPath == "" {
+		writeError(w, http.StatusServiceUnavailable, "migration_not_configured", "migration endpoints are configured by the server")
 		return
 	}
 	idBytes := make([]byte, 8)
@@ -214,18 +230,20 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 	h.mu.Lock()
 	h.migrations[id] = result
 	h.mu.Unlock()
+	h.migrationWG.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer h.migrationWG.Done()
+		ctx, cancel := context.WithTimeout(h.migrationCtx, 10*time.Minute)
 		defer cancel()
-		source := NewRedisStore(req.SourceAddress)
+		source := NewRedisStore(sourceAddress)
 		defer source.Close()
-		destination, err := NewSQLiteStore(req.DestinationPath)
+		destination, err := NewSQLiteStore(destinationPath)
 		if err == nil {
 			defer destination.Close()
 		}
 		var report MigrationReport
 		if err == nil {
-			report, err = MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: tenant.TenantID, DryRun: req.DryRun, BatchSize: req.BatchSize, CheckpointPath: req.CheckpointPath})
+			report, err = MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: tenant.TenantID, DryRun: req.DryRun, BatchSize: req.BatchSize, CheckpointPath: checkpointPath})
 		}
 		updated := migrationResult{ID: id, TenantID: tenant.TenantID, Status: report.Status, DryRun: req.DryRun, Sessions: report.Sessions, SourceCount: report.SourceCount, DestinationCount: report.DestinationCount, Checksum: report.Checksum, Resumed: report.Resumed}
 		if err != nil {

@@ -52,6 +52,26 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 		options.MaxRetries = 3
 	}
 	report := MigrationReport{Status: "running", DryRun: options.DryRun, Sessions: len(sessions)}
+	type sessionData struct {
+		events []SessionEvent
+		memory []MemoryRecord
+	}
+	sourceData := make(map[string]sessionData, len(sessions))
+	var sourceEvents []SessionEvent
+	for _, session := range sessions {
+		events, err := source.ListSessionEvents(ctx, options.TenantID, session, 0)
+		if err != nil {
+			return report, err
+		}
+		memory, err := source.ListMemory(ctx, options.TenantID, session)
+		if err != nil {
+			return report, err
+		}
+		sourceData[session] = sessionData{events: events, memory: memory}
+		sourceEvents = append(sourceEvents, events...)
+		report.SourceCount += len(events) + len(memory)
+	}
+	report.Checksum = eventChecksum(sourceEvents)
 	checkpoint := migrationCheckpoint{TenantID: options.TenantID}
 	if data, err := os.ReadFile(options.CheckpointPath); err == nil {
 		if json.Unmarshal(data, &checkpoint) == nil && checkpoint.TenantID == options.TenantID {
@@ -63,37 +83,37 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 			return report, err
 		}
 		session := sessions[index]
-		events, err := source.ListSessionEvents(ctx, options.TenantID, session, 0)
-		if err != nil {
-			return report, err
-		}
-		memory, err := source.ListMemory(ctx, options.TenantID, session)
-		if err != nil {
-			return report, err
-		}
-		report.SourceCount += len(events) + len(memory)
+		data := sourceData[session]
 		if !options.DryRun {
-			for _, event := range events {
+			for _, event := range data.events {
 				if err := retry(ctx, options.MaxRetries, func() error { return destination.AppendSessionEvent(ctx, event) }); err != nil {
 					return report, err
 				}
 			}
-			for _, item := range memory {
+			for _, item := range data.memory {
 				if err := retry(ctx, options.MaxRetries, func() error { return destination.PutMemory(ctx, item) }); err != nil {
 					return report, err
 				}
 			}
 			if (index+1)%options.BatchSize == 0 || index+1 == len(sessions) {
 				checkpoint.Next = index + 1
-				if err := writeCheckpoint(options.CheckpointPath, checkpoint); err != nil { return report, err }
+				if err := writeCheckpoint(options.CheckpointPath, checkpoint); err != nil {
+					return report, err
+				}
 			}
 		}
 	}
 	var destinationEvents []SessionEvent
 	if !options.DryRun {
 		for _, session := range sessions {
-			events, _ := destination.ListSessionEvents(ctx, options.TenantID, session, 0)
-			memory, _ := destination.ListMemory(ctx, options.TenantID, session)
+			events, err := destination.ListSessionEvents(ctx, options.TenantID, session, 0)
+			if err != nil {
+				return report, err
+			}
+			memory, err := destination.ListMemory(ctx, options.TenantID, session)
+			if err != nil {
+				return report, err
+			}
 			destinationEvents = append(destinationEvents, events...)
 			report.DestinationCount += len(events) + len(memory)
 		}
@@ -106,12 +126,6 @@ func MigrateRedisToSQL(ctx context.Context, source DataStore, destination DataSt
 	} else {
 		report.DestinationCount = report.SourceCount
 	}
-	var all []SessionEvent
-	for _, session := range sessions {
-		events, _ := source.ListSessionEvents(ctx, options.TenantID, session, 0)
-		all = append(all, events...)
-	}
-	report.Checksum = eventChecksum(all)
 	if !options.DryRun && report.Checksum != eventChecksum(destinationEvents) {
 		report.Status = "failed"
 		report.Message = "source and destination content differ"
@@ -181,21 +195,28 @@ func (s *SQLStore) ListSessionIDs(ctx context.Context, tenant string) ([]string,
 	return ids, rows.Err()
 }
 func (s *RedisStore) ListSessionIDs(ctx context.Context, tenant string) ([]string, error) {
-	prefix := s.prefix + "events:" + tenant + ":"
-	var cursor uint64
-	ids := []string{}
-	for {
-		keys, next, err := s.client.Scan(ctx, cursor, prefix+"*", 100).Result()
-		if err != nil {
-			return nil, err
-		}
-		for _, key := range keys {
-			ids = append(ids, strings.TrimPrefix(key, prefix))
-		}
-		cursor = next
-		if cursor == 0 {
-			break
+	ids := map[string]struct{}{}
+	for _, kind := range []string{"events", "memory"} {
+		prefix := s.prefix + kind + ":" + tenant + ":"
+		var cursor uint64
+		for {
+			keys, next, err := s.client.Scan(ctx, cursor, prefix+"*", 100).Result()
+			if err != nil {
+				return nil, err
+			}
+			for _, key := range keys {
+				ids[strings.TrimPrefix(key, prefix)] = struct{}{}
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
 		}
 	}
-	return ids, nil
+	result := make([]string, 0, len(ids))
+	for id := range ids {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, nil
 }

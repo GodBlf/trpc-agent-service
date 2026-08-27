@@ -13,7 +13,9 @@ TRPC_TEST_POSTGRES_DSN='postgres://trpc:trpc@127.0.0.1:5432/trpc_agent?sslmode=d
 go test ./trpcservice/platform
 ```
 
-Backend selection is tenant-scoped and server-authorized. Set `TRPC_BACKEND_SELECTIONS` to a writable JSON control-plane file when selection must survive service restart. Addresses and paths are never returned by the API.
+Backend selection is tenant-scoped and server-authorized. Configure the selectable catalog with `TRPC_REDIS_ADDR` and `TRPC_SQLITE_PATH`, and set `TRPC_BACKEND_SELECTIONS` to a writable JSON control-plane file when selection must survive service restart. Clients choose only server-defined backend IDs; addresses and paths are never accepted or returned by the API.
+
+Migration endpoints are server-owned. Configure `TRPC_MIGRATION_REDIS_ADDR`, `TRPC_MIGRATION_SQLITE_PATH`, and `TRPC_MIGRATION_CHECKPOINT_PATH`; tenant administrators can start and inspect jobs but cannot submit network addresses or filesystem paths.
 
 ## Redis-To-SQL Migration
 

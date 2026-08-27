@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -117,16 +118,23 @@ type developmentSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
-	platform             *MemoryPlatform
-	identity             DevelopmentIdentity
-	mu                   sync.Mutex
-	sessions             map[string]*developmentSession
-	runtime              *Runtime
-	data                 DataStore
-	backends             map[string]DataStore
-	migrations           map[string]migrationResult
-	backendSelections    map[string]backendSelection
-	backendSelectionPath string
+	platform                 *MemoryPlatform
+	identity                 DevelopmentIdentity
+	mu                       sync.Mutex
+	sessions                 map[string]*developmentSession
+	runtime                  *Runtime
+	data                     DataStore
+	backends                 map[string]DataStore
+	migrations               map[string]migrationResult
+	backendSelections        map[string]backendSelection
+	backendSelectionPath     string
+	backendCatalog           map[string]backendSelection
+	migrationSourceAddress   string
+	migrationDestinationPath string
+	migrationCheckpointPath  string
+	migrationCtx             context.Context
+	migrationCancel          context.CancelFunc
+	migrationWG              sync.WaitGroup
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -136,7 +144,8 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	for _, assignment := range identity.Assignments {
 		platform.seedTenant(assignment)
 	}
-	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore), migrations: make(map[string]migrationResult), backendSelections: make(map[string]backendSelection)}
+	migrationCtx, migrationCancel := context.WithCancel(context.Background())
+	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore), migrations: make(map[string]migrationResult), backendSelections: make(map[string]backendSelection), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}}, migrationCtx: migrationCtx, migrationCancel: migrationCancel}
 }
 
 // ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
@@ -168,15 +177,65 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	}
 	return json.Unmarshal(data, &h.backendSelections)
 }
-func (h *AdminHandler) persistBackendSelectionsLocked() error {
-	if h.backendSelectionPath == "" {
-		return nil
+func (h *AdminHandler) ConfigureMigration(sourceAddress, destinationPath, checkpointPath string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.migrationSourceAddress = sourceAddress
+	h.migrationDestinationPath = destinationPath
+	h.migrationCheckpointPath = checkpointPath
+}
+func (h *AdminHandler) ConfigureBackendCatalog(redisAddress, sqlitePath string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if redisAddress != "" {
+		h.backendCatalog["redis"] = backendSelection{Backend: "redis", Address: redisAddress}
 	}
-	data, err := json.Marshal(h.backendSelections)
-	if err != nil {
-		return err
+	if sqlitePath != "" {
+		h.backendCatalog["sqlite"] = backendSelection{Backend: "sqlite", Address: sqlitePath}
 	}
-	return os.WriteFile(h.backendSelectionPath, data, 0600)
+}
+
+func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := make(map[string]backendSelection, len(h.backendSelections)+1)
+	for key, value := range h.backendSelections {
+		next[key] = value
+	}
+	next[tenantID] = selection
+	if h.backendSelectionPath != "" {
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(h.backendSelectionPath, data, 0600); err != nil {
+			return err
+		}
+	}
+	old := h.backends[tenantID]
+	h.backendSelections = next
+	h.backends[tenantID] = store
+	if closer, ok := old.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+	return nil
+}
+
+func (h *AdminHandler) Close() error {
+	h.migrationCancel()
+	h.migrationWG.Wait()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var first error
+	for _, store := range h.backends {
+		if closer, ok := store.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	h.backends = map[string]DataStore{}
+	return first
 }
 
 func (h *AdminHandler) storeForTenant(tenantID string) DataStore {
@@ -191,14 +250,16 @@ func (h *AdminHandler) storeForTenant(tenantID string) DataStore {
 		case "redis":
 			store = NewRedisStore(selection.Address)
 		case "sqlite":
-			store, _ = NewSQLiteStore(selection.Address)
+			var err error
+			store, err = NewSQLiteStore(selection.Address)
+			if err != nil {
+				store = &unavailableStore{backend: "sqlite"}
+			}
 		default:
 			store = NewInMemoryStore()
 		}
-		if store != nil {
-			h.backends[tenantID] = store
-			return store
-		}
+		h.backends[tenantID] = store
+		return store
 	}
 	return h.data
 }

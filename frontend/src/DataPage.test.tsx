@@ -5,7 +5,7 @@ import { DataPage } from "./DataPage";
 test("shows backend health and starts a migration dry-run", async () => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const path = String(input);
-    if (path.endsWith("/storage/backend")) return new Response(JSON.stringify({ backend: "inmemory", health: { backend: "inmemory", status: "healthy", checked_at: "now" } }), { status: 200 });
+    if (path.endsWith("/storage/backend")) return new Response(JSON.stringify({ backend: "inmemory", available_backends: ["inmemory"], health: { backend: "inmemory", status: "healthy", checked_at: "now" } }), { status: 200 });
     if (path.includes("/sessions/") && path.endsWith("/events")) return new Response(JSON.stringify({ items: [] }), { status: 200 });
     if (path.includes("/sessions/")) return new Response(JSON.stringify({ error: { code: "session_not_found", message: "missing" } }), { status: 404 });
     if (path.includes("/memory/")) return new Response(JSON.stringify({ items: [] }), { status: 200 });

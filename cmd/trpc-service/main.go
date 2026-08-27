@@ -39,6 +39,8 @@ func main() {
 		log.Fatalf("backend selections: %v", err)
 	}
 	admin.ConfigureRuntime(platform.EchoRunner{}, life)
+	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
+	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
 	server := &http.Server{Addr: *addr, Handler: web.NewStage1Handler(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life, admin)}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -57,5 +59,8 @@ func main() {
 	}
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
+	}
+	if err := admin.Close(); err != nil {
+		log.Printf("data stores: %v", err)
 	}
 }
