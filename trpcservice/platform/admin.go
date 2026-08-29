@@ -1,10 +1,13 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -115,11 +118,25 @@ type developmentSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
-	platform *MemoryPlatform
-	identity DevelopmentIdentity
-	mu       sync.Mutex
-	sessions map[string]*developmentSession
-	runtime  *Runtime
+	platform                 *MemoryPlatform
+	identity                 DevelopmentIdentity
+	mu                       sync.Mutex
+	sessions                 map[string]*developmentSession
+	runtime                  *Runtime
+	backends                 *backendRegistry
+	migrations               map[string]migrationResult
+	backendSelectionPath     string
+	backendCatalog           map[string]backendSelection
+	migrationSourceAddress   string
+	migrationDestinationPath string
+	migrationCheckpointPath  string
+	migrationCtx             context.Context
+	migrationCancel          context.CancelFunc
+	migrationWG              sync.WaitGroup
+	migrationRunning         bool
+	closing                  bool
+	failureCtx               context.Context
+	failureCancel            context.CancelFunc
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -129,7 +146,104 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	for _, assignment := range identity.Assignments {
 		platform.seedTenant(assignment)
 	}
-	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil)}
+	migrationCtx, migrationCancel := context.WithCancel(context.Background())
+	failureCtx, failureCancel := context.WithCancel(context.Background())
+	return &AdminHandler{
+		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
+		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
+		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
+		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
+	}
+}
+
+// ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
+// during process composition before serving requests.
+func (h *AdminHandler) ConfigureDataStore(store DataStore) {
+	if store == nil {
+		return
+	}
+	h.backends.replaceDefault(store)
+}
+
+type backendSelection struct {
+	Backend string `json:"backend"`
+	Address string `json:"address"`
+}
+
+func (h *AdminHandler) ConfigureBackendSelections(path string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.backendSelectionPath = path
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var selections map[string]backendSelection
+	if err := json.Unmarshal(data, &selections); err != nil {
+		return err
+	}
+	h.backends.setSelections(selections)
+	return nil
+}
+func (h *AdminHandler) ConfigureMigration(sourceAddress, destinationPath, checkpointPath string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.migrationSourceAddress = sourceAddress
+	h.migrationDestinationPath = destinationPath
+	h.migrationCheckpointPath = checkpointPath
+}
+func (h *AdminHandler) ConfigureBackendCatalog(redisAddress, sqlitePath string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if redisAddress != "" {
+		h.backendCatalog["redis"] = backendSelection{Backend: "redis", Address: redisAddress}
+	}
+	if sqlitePath != "" {
+		h.backendCatalog["sqlite"] = backendSelection{Backend: "sqlite", Address: sqlitePath}
+	}
+}
+
+func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := h.backends.selectionSnapshot()
+	next[tenantID] = selection
+	if h.backendSelectionPath != "" {
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(h.backendSelectionPath, data, 0600); err != nil {
+			return err
+		}
+	}
+	h.backends.replace(tenantID, selection, store)
+	return nil
+}
+
+func (h *AdminHandler) Close() error {
+	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
+		return nil
+	}
+	h.closing = true
+	h.mu.Unlock()
+	h.backends.beginClose()
+	h.migrationCancel()
+	h.failureCancel()
+	h.migrationWG.Wait()
+	return h.backends.close()
+}
+
+func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
+	return h.backends.acquire(tenantID)
 }
 
 // ConfigureRuntime replaces the default fake runtime and attaches lifecycle
@@ -139,6 +253,10 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isDataPath(r.URL.Path) {
+		h.handleDataResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/"))
+		return
+	}
 	switch r.URL.Path {
 	case "/api/v1/auth/me":
 		if r.Method != http.MethodGet {

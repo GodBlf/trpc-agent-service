@@ -139,11 +139,26 @@ test("complete Stage 1 management workflow", async ({ page }, testInfo) => {
   await expectNoHorizontalOverflow(page);
   await page.screenshot({ path: testInfo.outputPath("runtime-status.png"), fullPage: true });
 
+  await page.getByRole("button", { name: "数据管理" }).click();
+  await expect(page.getByText("healthy")).toBeVisible();
+  await page.getByLabel("Session ID").fill(`session-${suffix}-two`);
+  await expect(page.getByText("message.input")).toBeVisible();
+  await expect(page.getByText("message.output")).toBeVisible();
+  await page.getByLabel("后端").selectOption("sqlite");
+  await page.getByRole("button", { name: "应用后端" }).click();
+  await expect(page.getByText("sqlite").first()).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+
   await page.getByRole("combobox", { name: "当前租户" }).selectOption("tenant-view");
+  await expect(page.getByText("message.input")).toHaveCount(0);
+  await expect(page.getByText("message.output")).toHaveCount(0);
   await page.getByRole("button", { name: "租户" }).click();
   await expect(page.getByRole("button", { name: "新建租户" })).toHaveCount(0);
   await page.getByRole("button", { name: "Agent 应用" }).click();
   await expect(page.getByRole("button", { name: "新建应用" })).toHaveCount(0);
   await page.getByRole("button", { name: "运行节点" }).click();
   await expect(page.getByText("没有访问权限")).toBeVisible();
+  await page.getByRole("button", { name: "数据管理" }).click();
+  await expect(page.getByRole("button", { name: "应用后端" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "启动迁移" })).toHaveCount(0);
 });

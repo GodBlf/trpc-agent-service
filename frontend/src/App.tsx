@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Boxes, Building2, ChevronDown, LayoutDashboard, Network, Rocket, ServerCog } from "lucide-react";
+import { Boxes, Building2, ChevronDown, Database, LayoutDashboard, Network, Rocket, ServerCog } from "lucide-react";
 import { api, type Identity } from "./api";
 import { AsyncState } from "./AsyncState";
 import { TenantsPage } from "./TenantsPage";
 import { AppsPage } from "./AppsPage";
 import { DeploymentsPage } from "./DeploymentsPage";
 import { RuntimePage } from "./RuntimePage";
+import { DataPage } from "./DataPage";
 
 const navigation = [
   { label: "概览", icon: LayoutDashboard },
@@ -13,6 +14,7 @@ const navigation = [
   { label: "Agent 应用", icon: Boxes },
   { label: "部署", icon: Rocket },
   { label: "运行节点", icon: Network },
+  { label: "数据管理", icon: Database },
 ];
 
 export default function App() {
@@ -65,7 +67,7 @@ export default function App() {
         </header>
         <main>
           <div className="page-heading"><div><h2>{active}</h2><p>由后端提供的实时平台数据</p></div></div>
-          {active === "租户" ? <TenantsPage identity={identity} identityChanged={load} /> : active === "Agent 应用" ? <AppsPage identity={identity} /> : active === "部署" ? <DeploymentsPage identity={identity} /> : active === "运行节点" ? <RuntimePage /> : <AsyncState kind="empty" />}
+          {active === "租户" ? <TenantsPage identity={identity} identityChanged={load} /> : active === "Agent 应用" ? <AppsPage identity={identity} /> : active === "部署" ? <DeploymentsPage identity={identity} /> : active === "运行节点" ? <RuntimePage /> : active === "数据管理" ? <DataPage key={identity.active_tenant_id} identity={identity} /> : <AsyncState kind="empty" />}
         </main>
       </section>
     </div>

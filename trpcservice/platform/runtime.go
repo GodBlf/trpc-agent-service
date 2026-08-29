@@ -2,10 +2,12 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type RuntimeLifecycle interface {
@@ -262,8 +264,26 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "app_id, session_id, and input are required")
 		return
 	}
+	requestID := r.Header.Get("Idempotency-Key")
+	if !validIdempotencyKey(requestID) {
+		requestID = time.Now().UTC().Format("20060102150405.000000000")
+	}
+	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
+	defer releaseStore()
+	input, _ := json.Marshal(map[string]string{"app_id": request.AppID, "input": request.Input})
+	if err := store.AppendSessionEvent(r.Context(), SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":input", Type: "message.input", Payload: input}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
+		return
+	}
 	response, err := h.runtime.Handle(r.Context(), tenant, request)
 	if err != nil {
+		failureCtx, cancelFailure := context.WithTimeout(h.failureCtx, 2*time.Second)
+		_ = store.AppendSessionEvent(failureCtx, SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":failed", Type: "run.failed", Payload: []byte(err.Error())})
+		cancelFailure()
 		code := err.Error()
 		status := http.StatusBadGateway
 		switch code {
@@ -279,6 +299,11 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusServiceUnavailable
 		}
 		writeError(w, status, code, "routed execution failed")
+		return
+	}
+	output, _ := json.Marshal(map[string]string{"output": response.Output})
+	if err := store.AppendSessionEvent(r.Context(), SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":output", Type: "message.output", Payload: output}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
 		return
 	}
 	writeJSON(w, http.StatusOK, response)

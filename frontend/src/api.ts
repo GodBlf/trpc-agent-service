@@ -26,6 +26,11 @@ export type DeploymentStatus = "draft" | "published" | "active" | "paused";
 export interface Deployment { id: string; tenant_id: string; agent_app_id: string; version_id?: string; status: DeploymentStatus; desired_replicas: number; created_at: string }
 export interface DeploymentVersion { id: string; deployment_id: string; agent_app_id: string; number: number; config: Record<string, unknown>; created_at: string }
 export interface RuntimeStatus { id: string; role: "gateway" | "worker"; available: boolean; lifecycle: "healthy" | "unavailable" | "closing" | "error"; active_executions: number; completed_executions: number; failed_executions: number }
+export interface BackendHealth { backend: string; status: string; message?: string; checked_at: string }
+export interface SessionState { id: string; tenant_id: string; sequence: number; summary: string; event_count: number; updated_at: string }
+export interface SessionEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
+export interface MemoryRecord { id: string; tenant_id: string; session_id: string; key: string; value: string; updated_at: string }
+export interface MigrationResult { id: string; status: string; dry_run: boolean; sessions: number; processed_sessions: number; source_count: number; destination_count: number; checksum?: string; message?: string }
 
 export class APIError extends Error {
   constructor(
@@ -70,4 +75,11 @@ export const api = {
   createVersion: (id: string, config: Record<string, unknown>, idempotencyKey: string) => request<DeploymentVersion>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/versions`, { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: JSON.stringify({ config }) }),
   transition: (id: string, status: DeploymentStatus, version_id?: string) => request<Deployment>(`/api/v1/admin/deployments/${encodeURIComponent(id)}/transition`, { method: "POST", body: JSON.stringify({ status, version_id }) }),
   runtimeStatus: () => request<ListResponse<RuntimeStatus>>("/api/v1/admin/runtime/status"),
+  backend: () => request<{ backend: string; health: BackendHealth; available_backends: string[] }>("/api/v1/admin/storage/backend"),
+  selectBackend: (backend: string) => request<{ backend: string; health: BackendHealth }>("/api/v1/admin/storage/backend", { method: "POST", body: JSON.stringify({ backend }) }),
+  session: (id: string) => request<SessionState>(`/api/v1/admin/sessions/${encodeURIComponent(id)}`),
+  sessionEvents: (id: string) => request<ListResponse<SessionEvent>>(`/api/v1/admin/sessions/${encodeURIComponent(id)}/events`),
+  memory: (id: string) => request<ListResponse<MemoryRecord>>(`/api/v1/admin/memory/${encodeURIComponent(id)}`),
+  migrate: (input: { dry_run: boolean; batch_size: number }) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify(input) }),
+  migration: (id: string) => request<MigrationResult>(`/api/v1/admin/migrations/${encodeURIComponent(id)}`),
 };
