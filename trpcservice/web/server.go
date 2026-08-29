@@ -29,6 +29,16 @@ func NewHandlerWithRunner(runner platform.RunnerAdapter, tenant platform.TenantC
 // NewHandlerWithRunnerAndLifecycle applies admission control and propagates
 // service shutdown to active runner contexts.
 func NewHandlerWithRunnerAndLifecycle(runner platform.RunnerAdapter, tenant platform.TenantContext, life *lifecycle.Service) http.Handler {
+	return newHandler(runner, tenant, life, nil, false)
+}
+
+// NewStage1Handler serves the Stage 1 APIs and packaged Management Console
+// while retaining all Stage 0 compatibility endpoints.
+func NewStage1Handler(runner platform.RunnerAdapter, tenant platform.TenantContext, life *lifecycle.Service, admin http.Handler) http.Handler {
+	return newHandler(runner, tenant, life, admin, true)
+}
+
+func newHandler(runner platform.RunnerAdapter, tenant platform.TenantContext, life *lifecycle.Service, admin http.Handler, serveFrontend bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/version", versionHandler)
@@ -55,6 +65,12 @@ func NewHandlerWithRunnerAndLifecycle(runner platform.RunnerAdapter, tenant plat
 		}()
 		run.ServeHTTP(w, r.WithContext(platform.WithTenantContext(ctx, tenant)))
 	}))
+	if admin != nil {
+		mux.Handle("/api/", admin)
+	}
+	if serveFrontend {
+		mux.Handle("/", frontendHandler())
+	}
 	return mux
 }
 

@@ -147,6 +147,35 @@ cd trpc-agent-service
 ./start.sh
 ```
 
+服务启动后打开 `http://127.0.0.1:8080/` 使用 Management Console。Stage 1 默认启用仅供本地开发与自动化验收使用的 Development Identity；它不是生产认证方案。
+
+前端开发模式：
+
+```bash
+# 终端 1
+go run ./cmd/trpc-service
+
+# 终端 2，/api 会代理到 127.0.0.1:8080
+cd frontend
+npm ci
+npm run dev
+```
+
+阶段 1 验证命令：
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+cd frontend
+npm run typecheck
+npm test
+npm run build
+npm run test:e2e
+```
+
+`build.sh` 要求已安装 Node.js、npm 和前端依赖，依次构建 React 前端和 Go 二进制。生产前端资源会嵌入 `bin/trpc-service`，不需要单独部署静态站点。
+
 停止服务：
 
 ```bash

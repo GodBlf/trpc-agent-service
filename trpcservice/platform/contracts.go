@@ -13,6 +13,7 @@ import (
 type TenantContext struct {
 	TenantID string
 	UserID   string
+	Role     Role
 }
 
 // TenantIDFromContext is a convenience for ports that only need the boundary
@@ -39,15 +40,16 @@ func TenantContextFromContext(ctx context.Context) (TenantContext, bool) {
 }
 
 type Tenant struct {
-	ID        string
-	Name      string
-	CreatedAt time.Time
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type AgentApp struct {
-	ID       string
-	TenantID string
-	Name     string
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type DeploymentStatus string
@@ -60,31 +62,36 @@ const (
 )
 
 type Deployment struct {
-	ID              string
-	TenantID        string
-	AgentAppID      string
-	VersionID       string
-	Status          DeploymentStatus
-	DesiredReplicas int
+	ID              string           `json:"id"`
+	TenantID        string           `json:"tenant_id"`
+	AgentAppID      string           `json:"agent_app_id"`
+	VersionID       string           `json:"version_id,omitempty"`
+	Status          DeploymentStatus `json:"status"`
+	DesiredReplicas int              `json:"desired_replicas"`
+	CreatedAt       time.Time        `json:"created_at"`
 }
 
 type DeploymentVersion struct {
-	ID         string
-	AgentAppID string
-	Number     int
-	Config     map[string]any
-	CreatedAt  time.Time
+	ID           string         `json:"id"`
+	TenantID     string         `json:"tenant_id"`
+	AgentAppID   string         `json:"agent_app_id"`
+	DeploymentID string         `json:"deployment_id"`
+	Number       int            `json:"number"`
+	Config       map[string]any `json:"config"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 type GatewayRequest struct {
-	AppID     string
-	SessionID string
-	Input     string
+	AppID        string `json:"app_id"`
+	SessionID    string `json:"session_id"`
+	Input        string `json:"input"`
+	DeploymentID string `json:"-"`
+	VersionID    string `json:"-"`
 }
 
 type GatewayResponse struct {
-	SessionID string
-	Output    string
+	SessionID string `json:"session_id"`
+	Output    string `json:"output"`
 }
 
 type Gateway interface {
@@ -115,9 +122,11 @@ type SessionEvent struct {
 }
 
 type RunnerRequest struct {
-	AppID     string
-	SessionID string
-	Input     string
+	AppID        string
+	SessionID    string
+	Input        string
+	DeploymentID string
+	VersionID    string
 }
 
 type RunnerResponse struct {

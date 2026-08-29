@@ -26,7 +26,17 @@ func main() {
 	flag.Parse()
 
 	life := lifecycle.New()
-	server := &http.Server{Addr: *addr, Handler: web.NewHandlerWithRunnerAndLifecycle(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life)}
+	store := platform.NewMemoryPlatform()
+	identity := platform.DevelopmentIdentity{
+		ID: "local-developer", Name: "Local Developer",
+		Assignments: []platform.TenantAssignment{
+			{TenantID: "tenant-dev", TenantName: "Development Tenant", Role: platform.RolePlatformAdmin},
+			{TenantID: "tenant-view", TenantName: "Read-only Tenant", Role: platform.RoleViewer},
+		},
+	}
+	admin := platform.NewAdminHandler(store, identity)
+	admin.ConfigureRuntime(platform.EchoRunner{}, life)
+	server := &http.Server{Addr: *addr, Handler: web.NewStage1Handler(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life, admin)}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

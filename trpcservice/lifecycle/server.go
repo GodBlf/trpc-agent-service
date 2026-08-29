@@ -54,6 +54,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 func (s *Service) Done() <-chan struct{} { return s.done }
 
+func (s *Service) IsClosing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing
+}
+
 // ShutdownWithTimeout is a convenience for process signal handlers.
 func (s *Service) ShutdownWithTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
