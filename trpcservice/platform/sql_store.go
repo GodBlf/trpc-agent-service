@@ -178,7 +178,9 @@ func (s *SQLStore) PutMemory(ctx context.Context, m MemoryRecord) error {
 	if m.ID == "" {
 		m.ID = m.TenantID + ":" + m.SessionID + ":" + m.Key
 	}
-	m.UpdatedAt = time.Now().UTC()
+	if m.UpdatedAt.IsZero() {
+		m.UpdatedAt = time.Now().UTC()
+	}
 	query := `INSERT INTO session_memory(tenant_id,session_id,memory_key,memory_id,value,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,session_id,memory_key) DO UPDATE SET memory_id=excluded.memory_id,value=excluded.value,updated_at=excluded.updated_at`
 	_, err := s.db.ExecContext(ctx, s.q(query), m.TenantID, m.SessionID, m.Key, m.ID, m.Value, m.UpdatedAt.Format(time.RFC3339Nano))
 	return err

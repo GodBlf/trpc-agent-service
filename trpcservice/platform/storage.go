@@ -3,9 +3,11 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -194,7 +196,9 @@ func (s *InMemoryStore) PutMemory(ctx context.Context, item MemoryRecord) error 
 	if item.ID == "" {
 		item.ID = item.TenantID + ":" + item.SessionID + ":" + item.Key
 	}
-	item.UpdatedAt = time.Now().UTC()
+	if item.UpdatedAt.IsZero() {
+		item.UpdatedAt = time.Now().UTC()
+	}
 	s.memory[storageMemoryKey(item.TenantID, item.SessionID, item.Key)] = item
 	return nil
 }
@@ -222,12 +226,16 @@ func itoa(v uint64) string {
 }
 func migrationChecksum(events []SessionEvent, memory []MemoryRecord) string {
 	h := sha256.New()
+	writeChecksumField(h, []byte("stage2-v1"))
 	for _, event := range events {
-		h.Write([]byte(event.TenantID))
-		h.Write([]byte(event.SessionID))
-		h.Write([]byte(itoa(event.Sequence)))
-		h.Write([]byte(event.Type))
-		h.Write(event.Payload)
+		writeChecksumField(h, []byte(event.TenantID))
+		writeChecksumField(h, []byte(event.SessionID))
+		writeChecksumField(h, []byte(event.ID))
+		writeChecksumField(h, []byte(strconv.FormatUint(event.Sequence, 10)))
+		writeChecksumField(h, []byte(event.Type))
+		writeChecksumField(h, event.Payload)
+		writeChecksumField(h, []byte(event.IdempotencyKey))
+		writeChecksumField(h, []byte(event.OccurredAt.Format(time.RFC3339Nano)))
 	}
 	sort.Slice(memory, func(i, j int) bool {
 		if memory[i].SessionID == memory[j].SessionID {
@@ -236,10 +244,19 @@ func migrationChecksum(events []SessionEvent, memory []MemoryRecord) string {
 		return memory[i].SessionID < memory[j].SessionID
 	})
 	for _, item := range memory {
-		h.Write([]byte(item.TenantID))
-		h.Write([]byte(item.SessionID))
-		h.Write([]byte(item.Key))
-		h.Write([]byte(item.Value))
+		writeChecksumField(h, []byte(item.TenantID))
+		writeChecksumField(h, []byte(item.SessionID))
+		writeChecksumField(h, []byte(item.ID))
+		writeChecksumField(h, []byte(item.Key))
+		writeChecksumField(h, []byte(item.Value))
+		writeChecksumField(h, []byte(item.UpdatedAt.Format(time.RFC3339Nano)))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeChecksumField(h interface{ Write([]byte) (int, error) }, value []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write(value)
 }

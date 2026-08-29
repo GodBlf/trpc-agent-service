@@ -30,13 +30,13 @@ func main() {
 	defer source.Close()
 	destination, err := platform.NewSQLiteStore(*sqlitePath)
 	if err != nil {
-		fatal(err)
+		fatal()
 	}
 	defer destination.Close()
 	report, err := platform.MigrateRedisToSQL(ctx, source, destination, platform.MigrationOptions{TenantID: *tenant, DryRun: *dryRun, BatchSize: *batch, CheckpointPath: *checkpoint})
 	_ = json.NewEncoder(os.Stdout).Encode(report)
 	if err != nil {
-		fatal(err)
+		fatal()
 	}
 }
-func fatal(err error) { fmt.Fprintln(os.Stderr, "error:", err); os.Exit(1) }
+func fatal() { fmt.Fprintln(os.Stderr, "error: migration failed"); os.Exit(1) }

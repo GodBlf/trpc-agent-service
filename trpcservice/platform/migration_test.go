@@ -15,9 +15,20 @@ type flakyDestination struct {
 }
 type corruptingDestination struct{ DataStore }
 
+type identityCorruptingDestination struct{ DataStore }
+
 func (s *corruptingDestination) PutMemory(ctx context.Context, item MemoryRecord) error {
 	item.Value += "-corrupt"
 	return s.DataStore.PutMemory(ctx, item)
+}
+
+func (s *identityCorruptingDestination) ListSessionEvents(ctx context.Context, tenant, session string, after uint64) ([]SessionEvent, error) {
+	events, err := s.DataStore.ListSessionEvents(ctx, tenant, session, after)
+	if err == nil && len(events) > 0 {
+		events[0].ID = "corrupt-event-id"
+		events[0].IdempotencyKey = "corrupt-idempotency-key"
+	}
+	return events, err
 }
 
 func (s *flakyDestination) AppendSessionEvent(ctx context.Context, event SessionEvent) error {
@@ -79,7 +90,11 @@ func TestRedisToSQLMigrationResumesFromCheckpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := destination.AppendSessionEvent(ctx, first); err != nil {
+	sourceEvents, err := source.ListSessionEvents(ctx, "tenant-a", "a", 0)
+	if err != nil || len(sourceEvents) != 1 {
+		t.Fatalf("source events=%#v err=%v", sourceEvents, err)
+	}
+	if err := destination.AppendSessionEvent(ctx, sourceEvents[0]); err != nil {
 		t.Fatal(err)
 	}
 	checkpoint := filepath.Join(t.TempDir(), "resume.json")
@@ -120,6 +135,18 @@ func TestMigrationDetectsMemoryContentMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, err := MigrateRedisToSQL(ctx, source, &corruptingDestination{DataStore: NewInMemoryStore()}, MigrationOptions{TenantID: "tenant-a"})
+	if err == nil || report.Status != "failed" {
+		t.Fatalf("report=%#v err=%v", report, err)
+	}
+}
+
+func TestMigrationDetectsEventIdentityMismatch(t *testing.T) {
+	source := NewInMemoryStore()
+	ctx := context.Background()
+	if err := source.AppendSessionEvent(ctx, SessionEvent{TenantID: "tenant-a", SessionID: "session-a", IdempotencyKey: "one", Type: "message", Payload: []byte("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := MigrateRedisToSQL(ctx, source, &identityCorruptingDestination{DataStore: NewInMemoryStore()}, MigrationOptions{TenantID: "tenant-a"})
 	if err == nil || report.Status != "failed" {
 		t.Fatalf("report=%#v err=%v", report, err)
 	}

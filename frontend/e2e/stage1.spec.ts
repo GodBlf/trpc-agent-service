@@ -150,6 +150,8 @@ test("complete Stage 1 management workflow", async ({ page }, testInfo) => {
   await expectNoHorizontalOverflow(page);
 
   await page.getByRole("combobox", { name: "当前租户" }).selectOption("tenant-view");
+  await expect(page.getByText("message.input")).toHaveCount(0);
+  await expect(page.getByText("message.output")).toHaveCount(0);
   await page.getByRole("button", { name: "租户" }).click();
   await expect(page.getByRole("button", { name: "新建租户" })).toHaveCount(0);
   await page.getByRole("button", { name: "Agent 应用" }).click();

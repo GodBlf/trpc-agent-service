@@ -31,14 +31,19 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
-	store := h.storeForTenant(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
+	defer releaseStore()
 	if len(parts) == 0 {
 		writeError(w, http.StatusNotFound, "not_found", "resource was not found")
 		return
 	}
 	switch parts[0] {
 	case "storage":
-		h.handleStorage(w, r, tenant, parts[1:])
+		h.handleStorage(w, r, tenant, store, parts[1:])
 	case "sessions":
 		h.handleSessionData(w, r, store, tenant, parts[1:])
 	case "memory":
@@ -50,13 +55,12 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, tenant TenantContext, parts []string) {
+func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, tenant TenantContext, store DataStore, parts []string) {
 	if len(parts) != 1 || parts[0] != "backend" {
 		writeError(w, http.StatusNotFound, "not_found", "resource was not found")
 		return
 	}
 	if r.Method == http.MethodGet {
-		store := h.storeForTenant(tenant.TenantID)
 		h.mu.Lock()
 		available := make([]string, 0, len(h.backendCatalog))
 		for id := range h.backendCatalog {
@@ -89,21 +93,9 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusBadRequest, "backend_not_configured", "backend is not configured by the server")
 		return
 	}
-	var store DataStore
-	switch selection.Backend {
-	case "inmemory":
-		store = NewInMemoryStore()
-	case "redis":
-		store = NewRedisStore(selection.Address)
-	case "sqlite":
-		sqlite, err := NewSQLiteStore(selection.Address)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_backend", err.Error())
-			return
-		}
-		store = sqlite
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_backend", "backend must be inmemory, redis, or sqlite")
+	store, err := newBackendStore(selection)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_backend", "backend is not available")
 		return
 	}
 	if err := h.selectBackend(tenant.TenantID, selection, store); err != nil {
@@ -179,7 +171,23 @@ func (h *AdminHandler) handleMemoryData(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
 			return
 		}
-		writeJSON(w, http.StatusCreated, item)
+		items, err := store.ListMemory(r.Context(), tenant.TenantID, sessionID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			return
+		}
+		created := MemoryRecord{TenantID: tenant.TenantID, SessionID: sessionID, Key: req.Key}
+		for _, persisted := range items {
+			if persisted.Key == req.Key {
+				created = persisted
+				break
+			}
+		}
+		if created.ID == "" {
+			writeError(w, http.StatusServiceUnavailable, "storage_error", "memory record was not persisted")
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
 	}
@@ -218,6 +226,11 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 		return
 	}
 	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
 	sourceAddress, destinationPath, checkpointPath := h.migrationSourceAddress, h.migrationDestinationPath, h.migrationCheckpointPath
 	h.mu.Unlock()
 	if sourceAddress == "" || destinationPath == "" {
@@ -229,6 +242,11 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 	id := "migration-" + hex.EncodeToString(idBytes)
 	result := migrationResult{ID: id, TenantID: tenant.TenantID, Status: "running", DryRun: req.DryRun}
 	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
 	if h.migrationRunning {
 		h.mu.Unlock()
 		writeError(w, http.StatusConflict, "migration_in_progress", "another migration is already running")
@@ -236,8 +254,8 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 	}
 	h.migrationRunning = true
 	h.migrations[id] = result
-	h.mu.Unlock()
 	h.migrationWG.Add(1)
+	h.mu.Unlock()
 	go func() {
 		defer h.migrationWG.Done()
 		defer func() { h.mu.Lock(); h.migrationRunning = false; h.mu.Unlock() }()
@@ -260,7 +278,7 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 		updated := migrationResult{ID: id, TenantID: tenant.TenantID, Status: report.Status, DryRun: req.DryRun, Sessions: report.Sessions, ProcessedSessions: report.ProcessedSessions, SourceCount: report.SourceCount, DestinationCount: report.DestinationCount, Checksum: report.Checksum, Resumed: report.Resumed}
 		if err != nil {
 			updated.Status = "failed"
-			updated.Message = err.Error()
+			updated.Message = "migration failed"
 		}
 		h.mu.Lock()
 		h.migrations[id] = updated

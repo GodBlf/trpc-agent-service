@@ -40,3 +40,17 @@ test("ignores a stale session response", async () => {
   await waitFor(() => expect(screen.queryByText("old summary")).not.toBeInTheDocument());
   fetchMock.mockRestore();
 });
+
+test("keeps backend health visible when tenant data reads fail", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    if (path.endsWith("/storage/backend")) {
+      return new Response(JSON.stringify({ backend: "redis", available_backends: ["redis"], health: { backend: "redis", status: "unavailable", checked_at: "now" } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ error: { code: "storage_error", message: "storage unavailable" } }), { status: 503 });
+  });
+  render(<DataPage identity={{ id: "admin", name: "Admin", active_tenant_id: "tenant-a", active_role: "platform_admin", assignments: [] }} />);
+  expect(await screen.findByText("unavailable")).toBeInTheDocument();
+  expect(screen.getAllByText("redis").length).toBeGreaterThan(0);
+  fetchMock.mockRestore();
+});

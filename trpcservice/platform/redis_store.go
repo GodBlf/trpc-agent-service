@@ -134,7 +134,9 @@ func (s *RedisStore) PutMemory(ctx context.Context, m MemoryRecord) error {
 	if m.ID == "" {
 		m.ID = m.TenantID + ":" + m.SessionID + ":" + m.Key
 	}
-	m.UpdatedAt = time.Now().UTC()
+	if m.UpdatedAt.IsZero() {
+		m.UpdatedAt = time.Now().UTC()
+	}
 	encoded, err := json.Marshal(m)
 	if err != nil {
 		return err

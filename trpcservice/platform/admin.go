@@ -123,10 +123,8 @@ type AdminHandler struct {
 	mu                       sync.Mutex
 	sessions                 map[string]*developmentSession
 	runtime                  *Runtime
-	data                     DataStore
-	backends                 map[string]DataStore
+	backends                 *backendRegistry
 	migrations               map[string]migrationResult
-	backendSelections        map[string]backendSelection
 	backendSelectionPath     string
 	backendCatalog           map[string]backendSelection
 	migrationSourceAddress   string
@@ -136,6 +134,9 @@ type AdminHandler struct {
 	migrationCancel          context.CancelFunc
 	migrationWG              sync.WaitGroup
 	migrationRunning         bool
+	closing                  bool
+	failureCtx               context.Context
+	failureCancel            context.CancelFunc
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -146,7 +147,13 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 		platform.seedTenant(assignment)
 	}
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
-	return &AdminHandler{platform: platform, identity: identity, sessions: make(map[string]*developmentSession), runtime: NewRuntime(platform, EchoRunner{}, nil), data: NewInMemoryStore(), backends: make(map[string]DataStore), migrations: make(map[string]migrationResult), backendSelections: make(map[string]backendSelection), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}}, migrationCtx: migrationCtx, migrationCancel: migrationCancel}
+	failureCtx, failureCancel := context.WithCancel(context.Background())
+	return &AdminHandler{
+		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
+		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
+		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
+		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
+	}
 }
 
 // ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
@@ -155,13 +162,7 @@ func (h *AdminHandler) ConfigureDataStore(store DataStore) {
 	if store == nil {
 		return
 	}
-	h.mu.Lock()
-	old := h.data
-	h.data = store
-	h.mu.Unlock()
-	if closer, ok := old.(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
+	h.backends.replaceDefault(store)
 }
 
 type backendSelection struct {
@@ -183,7 +184,12 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &h.backendSelections)
+	var selections map[string]backendSelection
+	if err := json.Unmarshal(data, &selections); err != nil {
+		return err
+	}
+	h.backends.setSelections(selections)
+	return nil
 }
 func (h *AdminHandler) ConfigureMigration(sourceAddress, destinationPath, checkpointPath string) {
 	h.mu.Lock()
@@ -206,10 +212,7 @@ func (h *AdminHandler) ConfigureBackendCatalog(redisAddress, sqlitePath string) 
 func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	next := make(map[string]backendSelection, len(h.backendSelections)+1)
-	for key, value := range h.backendSelections {
-		next[key] = value
-	}
+	next := h.backends.selectionSnapshot()
 	next[tenantID] = selection
 	if h.backendSelectionPath != "" {
 		data, err := json.Marshal(next)
@@ -220,61 +223,27 @@ func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection
 			return err
 		}
 	}
-	old := h.backends[tenantID]
-	h.backendSelections = next
-	h.backends[tenantID] = store
-	if closer, ok := old.(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
+	h.backends.replace(tenantID, selection, store)
 	return nil
 }
 
 func (h *AdminHandler) Close() error {
-	h.migrationCancel()
-	h.migrationWG.Wait()
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	var first error
-	if closer, ok := h.data.(interface{ Close() error }); ok {
-		if err := closer.Close(); err != nil {
-			first = err
-		}
+	if h.closing {
+		h.mu.Unlock()
+		return nil
 	}
-	for _, store := range h.backends {
-		if closer, ok := store.(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil && first == nil {
-				first = err
-			}
-		}
-	}
-	h.backends = map[string]DataStore{}
-	return first
+	h.closing = true
+	h.mu.Unlock()
+	h.backends.beginClose()
+	h.migrationCancel()
+	h.failureCancel()
+	h.migrationWG.Wait()
+	return h.backends.close()
 }
 
-func (h *AdminHandler) storeForTenant(tenantID string) DataStore {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if store := h.backends[tenantID]; store != nil {
-		return store
-	}
-	if selection, ok := h.backendSelections[tenantID]; ok {
-		var store DataStore
-		switch selection.Backend {
-		case "redis":
-			store = NewRedisStore(selection.Address)
-		case "sqlite":
-			var err error
-			store, err = NewSQLiteStore(selection.Address)
-			if err != nil {
-				store = &unavailableStore{backend: "sqlite"}
-			}
-		default:
-			store = NewInMemoryStore()
-		}
-		h.backends[tenantID] = store
-		return store
-	}
-	return h.data
+func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
+	return h.backends.acquire(tenantID)
 }
 
 // ConfigureRuntime replaces the default fake runtime and attaches lifecycle

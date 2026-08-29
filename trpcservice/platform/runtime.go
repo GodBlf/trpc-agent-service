@@ -268,7 +268,12 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 	if !validIdempotencyKey(requestID) {
 		requestID = time.Now().UTC().Format("20060102150405.000000000")
 	}
-	store := h.storeForTenant(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
+	defer releaseStore()
 	input, _ := json.Marshal(map[string]string{"app_id": request.AppID, "input": request.Input})
 	if err := store.AppendSessionEvent(r.Context(), SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":input", Type: "message.input", Payload: input}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
@@ -276,7 +281,9 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := h.runtime.Handle(r.Context(), tenant, request)
 	if err != nil {
-		_ = store.AppendSessionEvent(context.WithoutCancel(r.Context()), SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":failed", Type: "run.failed", Payload: []byte(err.Error())})
+		failureCtx, cancelFailure := context.WithTimeout(h.failureCtx, 2*time.Second)
+		_ = store.AppendSessionEvent(failureCtx, SessionEvent{TenantID: tenant.TenantID, SessionID: request.SessionID, IdempotencyKey: requestID + ":failed", Type: "run.failed", Payload: []byte(err.Error())})
+		cancelFailure()
 		code := err.Error()
 		status := http.StatusBadGateway
 		switch code {
