@@ -73,7 +73,7 @@ func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
 }
 
 func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
-	result, err := w.runner.Run(ctx, RunnerRequest{AppID: request.AppID, SessionID: request.SessionID, Input: request.Input, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+	result, err := w.runner.Run(ctx, RunnerRequest{AppID: request.AppID, SessionID: request.SessionID, Input: request.Input, RequestID: request.RequestID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.lastError.Store(true)
@@ -268,6 +268,7 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 	if !validIdempotencyKey(requestID) {
 		requestID = time.Now().UTC().Format("20060102150405.000000000")
 	}
+	request.RequestID = requestID
 	store, releaseStore, err := h.acquireStore(tenant.TenantID)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")

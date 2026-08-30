@@ -137,6 +137,12 @@ type AdminHandler struct {
 	closing                  bool
 	failureCtx               context.Context
 	failureCancel            context.CancelFunc
+	channels                 *ChannelCoordinator
+	chatMu                   sync.Mutex
+	activeRuns               map[string]activeChatRun
+	chatCtx                  context.Context
+	chatCancel               context.CancelFunc
+	chatWG                   sync.WaitGroup
 }
 
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
@@ -148,11 +154,14 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	}
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	failureCtx, failureCancel := context.WithCancel(context.Background())
+	chatCtx, chatCancel := context.WithCancel(context.Background())
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
+		channels: NewChannelCoordinator(NewMockChannel()), activeRuns: make(map[string]activeChatRun),
+		chatCtx: chatCtx, chatCancel: chatCancel,
 	}
 }
 
@@ -235,10 +244,12 @@ func (h *AdminHandler) Close() error {
 	}
 	h.closing = true
 	h.mu.Unlock()
+	h.chatCancel()
 	h.backends.beginClose()
 	h.migrationCancel()
-	h.failureCancel()
 	h.migrationWG.Wait()
+	h.chatWG.Wait()
+	h.failureCancel()
 	return h.backends.close()
 }
 
@@ -272,7 +283,19 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSwitchTenant(w, r)
 	case "/api/v1/admin/tenants":
 		h.handleTenants(w, h.trustedRequest(w, r))
+	case "/api/v1/chat/bindings":
+		h.handleChannelBindings(w, h.trustedRequest(w, r))
+	case "/api/v1/chat/channels/mock/callback":
+		h.handleMockChannelCallback(w, h.trustedRequest(w, r))
+	case "/api/v1/chat/mock/faults":
+		h.handleMockFaults(w, h.trustedRequest(w, r))
+	case "/api/v1/chat/sessions":
+		h.handleChatSessionResource(w, h.trustedRequest(w, r), []string{})
 	default:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/chat/sessions/") {
+			h.handleChatSessionResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/chat/sessions/"), "/"), "/"))
+			return
+		}
 		if h.handleAdminResource(w, r) {
 			return
 		}
