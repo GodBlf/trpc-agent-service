@@ -657,7 +657,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 }
 
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
-	response, err := h.runtime.Handle(ctx, options.tenant, GatewayRequest{
+	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
 		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID,
 	})
 	if err != nil {
@@ -672,17 +672,51 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		cancel()
 		return
 	}
-	_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":delta", "message.delta", map[string]string{
-		"request_id": options.requestID, "delta": response.Output,
-	})
-	_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", "message.completed", map[string]string{
-		"request_id": options.requestID, "output": response.Output,
-	})
+	var output string
+	deltaNumber := 0
+	for runtimeEvent := range events {
+		if runtimeEvent.Type == "message.delta" {
+			delta := runtimeEvent.Data["delta"]
+			output += delta
+			key := options.requestID + ":delta"
+			if deltaNumber > 0 {
+				key += fmt.Sprintf("-%d", deltaNumber)
+			}
+			deltaNumber++
+			_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, key, runtimeEvent.Type, map[string]string{
+				"request_id": options.requestID, "delta": delta,
+			})
+		}
+		if runtimeEvent.Type == "message.completed" {
+			if value := runtimeEvent.Data["output"]; value != "" {
+				output = value
+			}
+			_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", runtimeEvent.Type, map[string]string{
+				"request_id": options.requestID, "output": output,
+			})
+		}
+		if runtimeEvent.Type == "run.failed" {
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", map[string]string{
+				"request_id": options.requestID, "error": "run failed",
+			})
+			cancel()
+			return
+		}
+		if runtimeEvent.Type == "run.cancelled" {
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.cancelled", map[string]string{
+				"request_id": options.requestID, "error": "run cancelled",
+			})
+			cancel()
+			return
+		}
+	}
 	if options.binding != nil {
-		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: response.Output})
+		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: output})
 		if err == nil {
 			_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":reply", "channel.reply", map[string]string{
-				"request_id": options.requestID, "message_id": delivery.MessageID, "text": response.Output, "status": delivery.Status,
+				"request_id": options.requestID, "message_id": delivery.MessageID, "text": output, "status": delivery.Status,
 			})
 		} else {
 			deliveryCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)

@@ -99,6 +99,19 @@ func (p *MemoryPlatform) tenant(id string) (Tenant, bool) {
 	return tenant, ok
 }
 
+func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, versions := range p.versions {
+		for _, version := range versions {
+			if version.ID == id {
+				return version, true
+			}
+		}
+	}
+	return DeploymentVersion{}, false
+}
+
 func (p *MemoryPlatform) listTenants() []Tenant {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -250,7 +263,12 @@ func (h *AdminHandler) Close() error {
 	h.migrationWG.Wait()
 	h.chatWG.Wait()
 	h.failureCancel()
-	return h.backends.close()
+	runtimeErr := h.runtime.Close()
+	storeErr := h.backends.close()
+	if runtimeErr != nil {
+		return runtimeErr
+	}
+	return storeErr
 }
 
 func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
@@ -260,6 +278,7 @@ func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) 
 // ConfigureRuntime replaces the default fake runtime and attaches lifecycle
 // admission. It is intended for process composition and deterministic tests.
 func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecycle) {
+	_ = h.runtime.Close()
 	h.runtime = NewRuntime(h.platform, runner, life)
 }
 
