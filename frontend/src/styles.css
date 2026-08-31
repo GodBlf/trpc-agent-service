@@ -105,12 +105,35 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .event-list { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
 .event-list li { display: grid; gap: 4px; font-size: 13px; }
 .event-list li span { color: #68756f; overflow-wrap: anywhere; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.chat-page { height: calc(100vh - 176px); min-height: 480px; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto; gap: 14px; }
+.chat-toolbar { display: flex; align-items: end; gap: 14px; background: white; border: 1px solid #dce3df; border-radius: 8px; padding: 14px 16px; }
+.chat-toolbar label { display: grid; gap: 6px; color: #68756f; font-size: 12px; flex: 1; }
+.chat-toolbar input, .chat-toolbar select { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 10px; background: white; }
+.chat-faults { display: flex; align-items: end; gap: 10px; background: white; border: 1px solid #dce3df; border-radius: 8px; padding: 10px 14px; }
+.chat-faults label { display: grid; gap: 6px; color: #68756f; font-size: 12px; }
+.chat-faults select { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 10px; background: white; }
+.chat-faults small { color: #68756f; }
+.chat-faults > button { border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 8px 11px; }
+.chat-thread { min-height: 0; background: white; border: 1px solid #dce3df; border-radius: 8px; overflow: auto; padding: 16px; }
+.chat-messages { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.chat-messages li { max-width: min(72%, 620px); border: 1px solid #dce3df; border-radius: 10px; padding: 10px 12px; background: #f9faf9; }
+.chat-messages li span { display: block; color: #68756f; font-size: 11px; margin-bottom: 5px; }
+.chat-messages li p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-messages li.user { justify-self: end; background: #e7f1ed; border-color: #c9ded6; }
+.chat-messages li.assistant { justify-self: start; }
+.chat-composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; background: white; border: 1px solid #dce3df; border-radius: 8px; padding: 12px; }
+.chat-composer textarea { border: 1px solid #cbd5d0; border-radius: 6px; padding: 9px 10px; resize: vertical; }
+.chat-actions { display: flex; gap: 8px; align-items: end; }
+.chat-actions > button:not(.primary) { border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 9px 12px; }
+.chat-status { display: flex; align-items: center; gap: 7px; color: #68756f; font-size: 12px; }
+.chat-status svg { width: 15px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 720px) {
   .app-shell { grid-template-columns: 1fr; padding-bottom: 64px; }
   aside { position: fixed; z-index: 10; bottom: 0; left: 0; right: 0; padding: 6px; }
   .brand { display: none; }
-  nav { margin: 0; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  nav { margin: 0; grid-template-columns: repeat(7, minmax(0, 1fr)); }
   nav button { height: 52px; padding: 4px; justify-content: center; flex-direction: column; gap: 1px; font-size: 10px; }
   nav svg { width: 18px; }
   header { padding: 10px 16px; gap: 12px; flex-wrap: wrap; }
@@ -124,4 +147,7 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
   .data-grid { grid-template-columns: 1fr; }
   .data-controls { align-items: stretch; flex-direction: column; }
   .data-controls input { min-width: 0; width: 100%; }
+  .chat-page { height: calc(100vh - 220px); min-height: 430px; }
+  .chat-toolbar { align-items: stretch; flex-direction: column; }
+  .chat-composer { grid-template-columns: 1fr; }
 }

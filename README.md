@@ -161,7 +161,19 @@ npm ci
 npm run dev
 ```
 
-阶段 1 验证命令：
+## 当前实现能力
+
+当前代码已覆盖到 Stage 3 的本地可运行验收范围：
+
+- **多租户管理**：Development Identity、租户切换、Agent 应用、部署版本与状态流转、Gateway/Worker 状态。
+- **存储与数据管理**：租户级 InMemory/Redis/SQLite/PostgreSQL 后端选择、事件回放、迁移与数据检查页面。
+- **Chat Workspace**：在 Management Console 中创建/打开租户隔离 Session、读取后端历史、发送消息、取消运行、失败重试和刷新恢复；浏览器仅保存最近打开的 Session ID，不保存会话历史。
+- **Mock IM 通道**：提供租户/Session 绑定、HMAC 回调验签、用户与会话映射、消息去重、provider sequence 乱序拒绝、回复投递和可配置故障注入。
+- **SSE 契约**：`event_id`、`request_id`、`session_id`、单调 `sequence`、`type`、`data` 稳定 envelope，覆盖 `run.started`、`message.delta`、`message.completed`、`run.failed`、`run.cancelled`、`run.completed`。
+
+Stage 4 才会实现企业微信与 Telegram 真实 Channel Adapter；当前 Web UI 和 Mock IM 仅用于本地链路验收，不计入真实 IM provider 数量。
+
+阶段 3 验证命令：
 
 ```bash
 go test ./...

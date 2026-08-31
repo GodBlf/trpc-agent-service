@@ -31,6 +31,25 @@ export interface SessionState { id: string; tenant_id: string; sequence: number;
 export interface SessionEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
 export interface MemoryRecord { id: string; tenant_id: string; session_id: string; key: string; value: string; updated_at: string }
 export interface MigrationResult { id: string; status: string; dry_run: boolean; sessions: number; processed_sessions: number; source_count: number; destination_count: number; checksum?: string; message?: string }
+export interface ChatSession { id: string; tenant_id: string; app_id: string; user_id?: string; sequence?: number }
+export interface ChatEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
+export interface ChatRunResponse { session_id: string; request_id: string; status: "running" | "pending" | "completed" | "failed" | "cancelled" }
+export interface ChatStreamEvent {
+  event_id: string;
+  request_id: string;
+  session_id: string;
+  sequence: number;
+  type: "run.started" | "message.delta" | "message.completed" | "run.failed" | "run.cancelled" | "run.completed" | string;
+  data: Record<string, unknown>;
+}
+export interface MockFaultConfiguration {
+  scenario: "none" | "timeout" | "retry" | "rate_limit" | "message_length" | "attachment";
+  message_length_limit: number;
+  attachment_size_limit: number;
+  rate_limit: number;
+  timeout_ms: number;
+  retry_limit: number;
+}
 
 export class APIError extends Error {
   constructor(
@@ -82,4 +101,20 @@ export const api = {
   memory: (id: string) => request<ListResponse<MemoryRecord>>(`/api/v1/admin/memory/${encodeURIComponent(id)}`),
   migrate: (input: { dry_run: boolean; batch_size: number }) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify(input) }),
   migration: (id: string) => request<MigrationResult>(`/api/v1/admin/migrations/${encodeURIComponent(id)}`),
+  createChatSession: (app_id: string, session_id: string) =>
+    request<ChatSession>("/api/v1/chat/sessions", { method: "POST", body: JSON.stringify({ app_id, session_id }) }),
+  chatEvents: (id: string) => request<ListResponse<ChatEvent>>(`/api/v1/chat/sessions/${encodeURIComponent(id)}/events`),
+  sendChatMessage: (id: string, input: string, requestID: string) =>
+    request<ChatRunResponse>(`/api/v1/chat/sessions/${encodeURIComponent(id)}/messages`, {
+      method: "POST", headers: { "X-Request-ID": requestID }, body: JSON.stringify({ input }),
+    }),
+  cancelChatRun: (id: string, requestID: string) =>
+    request<ChatRunResponse>(`/api/v1/chat/sessions/${encodeURIComponent(id)}/cancel`, {
+      method: "POST", body: JSON.stringify({ request_id: requestID }),
+    }),
+  mockFaults: (id: string) => request<MockFaultConfiguration>(`/api/v1/chat/mock/faults?session_id=${encodeURIComponent(id)}`),
+  setMockFaults: (id: string, scenario: MockFaultConfiguration["scenario"]) =>
+    request<MockFaultConfiguration>("/api/v1/chat/mock/faults", {
+      method: "POST", body: JSON.stringify({ scenario, session_id: id }),
+    }),
 };
