@@ -105,6 +105,15 @@ func TestChatSSEStreamsOrderedEnvelopeAndResumes(t *testing.T) {
 	}
 }
 
+func TestChatSSERejectsInvalidRequestID(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+
+	response := client.do(http.MethodGet, "/api/v1/chat/sessions/session-one/stream?request_id=bad%7Frequest", "", nil)
+	assertChannelAPIError(t, response, http.StatusBadRequest, "invalid_request_id")
+}
+
 type chatBlockingRunner struct {
 	started chan struct{}
 	once    chan struct{}

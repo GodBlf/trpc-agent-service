@@ -17,6 +17,10 @@ vi.stubGlobal("localStorage", {
   removeItem: (key: string) => storage.delete(key),
 });
 
+beforeEach(() => {
+  storage.clear();
+});
+
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), { status });
 }
@@ -43,6 +47,56 @@ test("restores backend history after refresh without persisting conversation dat
   expect(await screen.findByText("hello")).toBeInTheDocument();
   expect(screen.getByText("echo:hello")).toBeInTheDocument();
   expect(localStorage.getItem("trpc-chat-session:tenant-a")).toBe("session-one");
+});
+
+test("reconnects and resumes the active run after refresh", async () => {
+  localStorage.setItem("trpc-chat-session:tenant-a", "session-one");
+  class RefreshEventSource {
+    onmessage: ((event: MessageEvent<string>) => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    constructor(public readonly url: string) {}
+    close() { this.closed = true; }
+    emit(event: Record<string, unknown>) {
+      this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent<string>);
+    }
+  }
+  const sources: RefreshEventSource[] = [];
+  vi.stubGlobal("EventSource", class extends RefreshEventSource {
+    constructor(url: string) {
+      super(url);
+      sources.push(this);
+    }
+  });
+  const messageCalls: Array<RequestInit | undefined> = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.endsWith("/agent-apps")) return jsonResponse({ items: [{ id: "app-one", tenant_id: "tenant-a", name: "App One", created_at: "now" }] });
+    if (path.endsWith("/chat/sessions/session-one/events")) {
+      return jsonResponse({
+        items: [
+          { id: "event-input", tenant_id: "tenant-a", session_id: "session-one", sequence: 2, idempotency_key: "request-one:input", type: "message.input", payload: btoa(JSON.stringify({ input: "hello", request_id: "request-one" })), occurred_at: "now" },
+          { id: "event-started", tenant_id: "tenant-a", session_id: "session-one", sequence: 3, idempotency_key: "request-one:started", type: "run.started", payload: btoa(JSON.stringify({ request_id: "request-one" })), occurred_at: "now" },
+        ],
+      });
+    }
+    if (path.includes("/messages")) {
+      messageCalls.push(init);
+      return jsonResponse({ session_id: "session-one", request_id: "request-one", status: "running" }, 202);
+    }
+    return jsonResponse({});
+  }));
+
+  render(<ChatPage identity={identity} />);
+  await waitFor(() => expect(sources).toHaveLength(1));
+  expect(sources[0].url).toContain("/stream?after=0&request_id=request-one");
+  await waitFor(() => expect(messageCalls).toHaveLength(1));
+  expect((messageCalls[0]?.headers as Record<string, string>)["X-Request-ID"]).toBe("request-one");
+  expect(JSON.parse(String(messageCalls[0]?.body))).toEqual({ input: "hello" });
+
+  act(() => sources[0].emit({ event_id: "event-terminal", request_id: "request-one", session_id: "session-one", sequence: 4, type: "run.completed", data: {} }));
+  await waitFor(() => expect(sources[0].closed).toBe(true));
+  expect(await screen.findByText("session-one · completed")).toBeInTheDocument();
 });
 
 test("creates a session and sends a request-scoped message", async () => {

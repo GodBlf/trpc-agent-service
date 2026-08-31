@@ -76,6 +76,82 @@ func TestChatRetryAfterFailureReturnsOriginalRunWithoutDuplicateExecution(t *tes
 	}
 }
 
+func TestChatReplayResumesInterruptedRun(t *testing.T) {
+	tests := []struct {
+		name            string
+		persistStarted  bool
+		wantStartedRuns int
+	}{
+		{name: "after input persistence", persistStarted: false, wantStartedRuns: 1},
+		{name: "after started persistence", persistStarted: true, wantStartedRuns: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runs := make(chan RunnerRequest, 1)
+			client := newChannelTestClient(t, requestCapturingRunner{requests: runs})
+			client.activateApp("app-one", "deploy-one")
+			client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+
+			store, releaseStore, err := client.handler.acquireStore("tenant-one")
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputPayload, err := json.Marshal(map[string]string{
+				"app_id": "app-one", "input": "hello", "request_id": "request-one", "user_id": "developer",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendSessionEvent(context.Background(), SessionEvent{
+				TenantID: "tenant-one", SessionID: "session-one", IdempotencyKey: "request-one:input",
+				Type: "message.input", Payload: inputPayload,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if test.persistStarted {
+				startedPayload, err := json.Marshal(map[string]string{"app_id": "app-one", "request_id": "request-one"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.AppendSessionEvent(context.Background(), SessionEvent{
+					TenantID: "tenant-one", SessionID: "session-one", IdempotencyKey: "request-one:started",
+					Type: "run.started", Payload: startedPayload,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			releaseStore()
+
+			client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-one"}, http.StatusAccepted, nil)
+			select {
+			case request := <-runs:
+				if request.Input != "hello" || request.RequestID != "request-one" {
+					t.Fatalf("Runner request = %#v", request)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("interrupted run was not resumed")
+			}
+			if err := waitForChatEvent(client, "session-one", "run.completed"); err != nil {
+				t.Fatal(err)
+			}
+
+			events := chatEventsForTest(t, client, "session-one")
+			inputs, startedRuns := 0, 0
+			for _, event := range events {
+				switch event.Type {
+				case "message.input":
+					inputs++
+				case "run.started":
+					startedRuns++
+				}
+			}
+			if inputs != 1 || startedRuns != test.wantStartedRuns {
+				t.Fatalf("inputs = %d, started runs = %d, want 1 and %d", inputs, startedRuns, test.wantStartedRuns)
+			}
+		})
+	}
+}
+
 func TestConcurrentChatRetriesShareOneLogicalRun(t *testing.T) {
 	runner := &chatBlockingRunner{started: make(chan struct{}, 1), once: make(chan struct{})}
 	client := newChannelTestClient(t, runner)

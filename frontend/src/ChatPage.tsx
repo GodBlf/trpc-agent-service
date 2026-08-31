@@ -4,6 +4,7 @@ import { APIError, api, type AgentApp, type ChatEvent, type ChatStreamEvent, typ
 import { AsyncState } from "./AsyncState";
 
 type ChatMessageView = { key: string; role: "user" | "assistant"; text: string };
+type ChatRunRecovery = { requestID: string; input: string; terminal?: "completed" | "failed" | "cancelled" };
 
 function chatStorageKey(tenantID: string) {
   return `trpc-chat-session:${tenantID}`;
@@ -39,6 +40,22 @@ function chatMessages(events: ChatEvent[]): ChatMessageView[] {
     }
   }
   return messages;
+}
+
+function latestChatRun(events: ChatEvent[]): ChatRunRecovery | undefined {
+  let run: ChatRunRecovery | undefined;
+  for (const event of events) {
+    const payload = eventPayload(event);
+    const requestID = String(payload.request_id ?? event.idempotency_key.split(":")[0] ?? "");
+    if (event.type === "message.input") {
+      run = { requestID, input: String(payload.input ?? "") };
+    }
+    if (!run || requestID !== run.requestID) continue;
+    if (event.type === "run.completed") run.terminal = "completed";
+    if (event.type === "run.failed") run.terminal = "failed";
+    if (event.type === "run.cancelled") run.terminal = "cancelled";
+  }
+  return run;
 }
 
 export function ChatPage({ identity, initialAppID }: { identity: Identity; initialAppID?: string }) {
@@ -78,7 +95,7 @@ export function ChatPage({ identity, initialAppID }: { identity: Identity; initi
     });
   };
 
-  const loadEvents = async (targetSession: string) => {
+  const loadEvents = async (targetSession: string, restoreActiveRun = false) => {
     const generation = ++eventGeneration.current;
     try {
       const result = await api.chatEvents(targetSession);
@@ -86,6 +103,26 @@ export function ChatPage({ identity, initialAppID }: { identity: Identity; initi
         setEvents(result.items);
         lastSequence.current = result.items.at(-1)?.sequence ?? 0;
         setError(undefined);
+        if (restoreActiveRun) {
+          const run = latestChatRun(result.items);
+          if (run) {
+            setActiveInput(run.input);
+            setActiveRequestID(run.requestID);
+            setRetryCandidate({ input: run.input, requestID: run.requestID, confirmed: true });
+            if (run.terminal) {
+              setStreamState(run.terminal);
+            } else {
+              setStreamState("streaming");
+              seenStreamEvents.current = new Set();
+              openStream(targetSession, run.requestID, 0);
+              if (mutable) {
+                void api.sendChatMessage(targetSession, run.input, run.requestID).catch((caught) => {
+                  setError(caught as APIError);
+                });
+              }
+            }
+          }
+        }
       }
     } catch (caught) {
       if (eventGeneration.current === generation) setError(caught as APIError);
@@ -121,7 +158,7 @@ export function ChatPage({ identity, initialAppID }: { identity: Identity; initi
     if (saved) {
       setSessionID(saved);
       setSessionIDInput(saved);
-      void loadEvents(saved);
+      void loadEvents(saved, true);
       void loadFaults(saved);
     }
     return () => {
@@ -146,7 +183,7 @@ export function ChatPage({ identity, initialAppID }: { identity: Identity; initi
       if (apiError.status === 409) {
         setSessionID(sessionIDInput);
         localStorage.setItem(chatStorageKey(identity.active_tenant_id), sessionIDInput);
-        await loadEvents(sessionIDInput);
+        await loadEvents(sessionIDInput, true);
         return;
       }
       setError(apiError);
@@ -158,10 +195,10 @@ export function ChatPage({ identity, initialAppID }: { identity: Identity; initi
     streamSource.current = undefined;
   };
 
-  const openStream = (targetSession: string, requestID: string) => {
+  const openStream = (targetSession: string, requestID: string, after = lastSequence.current) => {
     closeStream();
     setStreamState("streaming");
-    const source = new EventSource(`/api/v1/chat/sessions/${encodeURIComponent(targetSession)}/stream?after=${lastSequence.current}&request_id=${encodeURIComponent(requestID)}`);
+    const source = new EventSource(`/api/v1/chat/sessions/${encodeURIComponent(targetSession)}/stream?after=${after}&request_id=${encodeURIComponent(requestID)}`);
     streamSource.current = source;
     source.onmessage = (message: MessageEvent<string>) => {
       const envelope = JSON.parse(message.data) as ChatStreamEvent;

@@ -417,6 +417,10 @@ func (h *AdminHandler) handleChatStream(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	requestID := r.URL.Query().Get("request_id")
+	if requestID != "" && !validIdempotencyKey(requestID) {
+		writeError(w, http.StatusBadRequest, "invalid_request_id", "request id must be 1 to 128 printable ASCII characters")
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "stream_unsupported", "streaming is unsupported")
@@ -571,6 +575,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	inputPayload, _ := json.Marshal(map[string]string{
 		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID,
 	})
+	recoveryOptions := options
+	existingInput := false
+	existingStarted := false
 	for _, event := range events {
 		if event.IdempotencyKey != options.requestID+":input" {
 			continue
@@ -579,28 +586,55 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			h.chatMu.Unlock()
 			return chatRunResponse{}, errors.New("idempotency_key_reused")
 		}
-		status := "pending"
 		if chatTerminalEvent(events, options.requestID) != nil {
-			status = chatRunStatus(events, options.requestID)
+			h.chatMu.Unlock()
+			return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: chatRunStatus(events, options.requestID)}, nil
 		}
-		h.chatMu.Unlock()
-		return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: status}, nil
-	}
-	if err := store.AppendSessionEvent(h.chatCtx, SessionEvent{
-		TenantID: options.tenant.TenantID, SessionID: options.sessionID, IdempotencyKey: options.requestID + ":input",
-		Type: "message.input", Payload: inputPayload,
-	}); err != nil {
-		h.chatMu.Unlock()
-		if errors.Is(err, ErrDuplicateEvent) {
-			return chatRunResponse{}, errors.New("idempotency_key_reused")
+		var persistedInput struct {
+			AppID  string `json:"app_id"`
+			Input  string `json:"input"`
+			UserID string `json:"user_id"`
 		}
-		return chatRunResponse{}, errors.New("storage_error")
+		if json.Unmarshal(event.Payload, &persistedInput) != nil || persistedInput.Input == "" {
+			h.chatMu.Unlock()
+			return chatRunResponse{}, errors.New("storage_error")
+		}
+		if persistedInput.AppID != "" {
+			recoveryOptions.appID = persistedInput.AppID
+		}
+		if persistedInput.UserID != "" {
+			recoveryOptions.userID = persistedInput.UserID
+		}
+		recoveryOptions.input = persistedInput.Input
+		options = recoveryOptions
+		existingInput = true
+		break
 	}
-	if err := h.appendChatEvent(h.chatCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":started", "run.started", map[string]string{
-		"app_id": options.appID, "request_id": options.requestID,
-	}); err != nil {
-		h.chatMu.Unlock()
-		return chatRunResponse{}, errors.New("storage_error")
+	for _, event := range events {
+		if event.IdempotencyKey == options.requestID+":started" {
+			existingStarted = true
+			break
+		}
+	}
+	if !existingInput {
+		if err := store.AppendSessionEvent(h.chatCtx, SessionEvent{
+			TenantID: options.tenant.TenantID, SessionID: options.sessionID, IdempotencyKey: options.requestID + ":input",
+			Type: "message.input", Payload: inputPayload,
+		}); err != nil {
+			h.chatMu.Unlock()
+			if errors.Is(err, ErrDuplicateEvent) {
+				return chatRunResponse{}, errors.New("idempotency_key_reused")
+			}
+			return chatRunResponse{}, errors.New("storage_error")
+		}
+	}
+	if !existingStarted {
+		if err := h.appendChatEvent(h.chatCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":started", "run.started", map[string]string{
+			"app_id": options.appID, "request_id": options.requestID,
+		}); err != nil {
+			h.chatMu.Unlock()
+			return chatRunResponse{}, errors.New("storage_error")
+		}
 	}
 	runCtx, cancel := context.WithCancel(h.chatCtx)
 	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input}
