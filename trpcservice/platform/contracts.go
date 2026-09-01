@@ -79,6 +79,7 @@ type DeploymentVersion struct {
 	Number       int            `json:"number"`
 	Config       map[string]any `json:"config"`
 	CreatedAt    time.Time      `json:"created_at"`
+	Active       bool           `json:"-"`
 }
 
 type GatewayRequest struct {

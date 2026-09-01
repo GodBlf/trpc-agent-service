@@ -124,6 +124,13 @@ func (rt *Runtime) Close() error {
 	return nil
 }
 
+func (rt *Runtime) RetireVersion(versionID string) error {
+	if streaming, ok := rt.worker.runner.(interface{ RetireVersion(string) error }); ok {
+		return streaming.RetireVersion(versionID)
+	}
+	return nil
+}
+
 func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request GatewayRequest) (<-chan RuntimeEvent, error) {
 	if tenant.TenantID == "" {
 		return nil, &runtimeError{code: "tenant_context_missing"}

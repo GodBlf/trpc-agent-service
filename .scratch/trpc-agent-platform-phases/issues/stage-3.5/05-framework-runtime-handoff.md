@@ -7,7 +7,7 @@
 **Status:** resolved
 
 - [x] Framework integration tests run without external model credentials.
-- [x] End-to-end coverage includes normal completion, failure, cancellation, retry, and service shutdown.
+- [x] End-to-end coverage includes normal completion, failure, cancellation, retry, history recovery, and service shutdown.
 - [x] Two-Tenant, multi-App, and multi-Deployment Version coverage proves isolation and Runner reuse.
 - [x] Version switching, inactive-version rejection, and resource release are verified.
 - [x] Existing Stage 3 EchoRunner and Mock IM regression tests continue to pass.

@@ -105,6 +105,9 @@ func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) 
 	for _, versions := range p.versions {
 		for _, version := range versions {
 			if version.ID == id {
+				if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
+					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID
+				}
 				return version, true
 			}
 		}
