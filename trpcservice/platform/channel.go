@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	ChannelMock        = "mock"
-	ConversationSingle = "single"
-	ConversationGroup  = "group"
+	ChannelMock             = "mock"
+	ChannelEnterpriseWeChat = "enterprise_wechat"
+	ChannelTelegram         = "telegram"
+	ConversationSingle      = "single"
+	ConversationGroup       = "group"
 )
 
 type ChannelBinding struct {
@@ -30,6 +32,7 @@ type ChannelBinding struct {
 	UserID           string    `json:"external_user_id"`
 	SessionID        string    `json:"session_id"`
 	Secret           string    `json:"secret,omitempty"`
+	Enabled          bool      `json:"enabled"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -75,6 +78,7 @@ type ChannelCoordinator struct {
 	lastSequences    map[string]uint64
 	acceptedMessages map[string]struct{}
 	adapter          ChannelAdapter
+	adapters         map[string]ChannelAdapter
 }
 
 func NewChannelCoordinator(adapter ChannelAdapter) *ChannelCoordinator {
@@ -83,7 +87,19 @@ func NewChannelCoordinator(adapter ChannelAdapter) *ChannelCoordinator {
 		lastSequences:    make(map[string]uint64),
 		acceptedMessages: make(map[string]struct{}),
 		adapter:          adapter,
+		adapters:         map[string]ChannelAdapter{ChannelMock: adapter},
 	}
+}
+
+// RegisterAdapter adds a provider without changing the stable ChannelAdapter
+// contract used by the chat runtime.
+func (c *ChannelCoordinator) RegisterAdapter(channel string, adapter ChannelAdapter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.adapters == nil {
+		c.adapters = make(map[string]ChannelAdapter)
+	}
+	c.adapters[channel] = adapter
 }
 
 func (c *ChannelCoordinator) ConfigureMockFaults(tenantID, sessionID, scenario string) (MockFaultConfiguration, error) {
@@ -103,7 +119,7 @@ func (c *ChannelCoordinator) MockFaults(tenantID, sessionID string) MockFaultCon
 }
 
 func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createChannelBindingRequest) (ChannelBinding, error) {
-	if request.Channel != ChannelMock {
+	if request.Channel != ChannelMock && request.Channel != ChannelEnterpriseWeChat && request.Channel != ChannelTelegram {
 		return ChannelBinding{}, errors.New("platform: unsupported channel")
 	}
 	if request.ConversationType != ConversationSingle && request.ConversationType != ConversationGroup {
@@ -113,9 +129,16 @@ func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createC
 	if sessionID != "" && !validResourceID(sessionID) {
 		return ChannelBinding{}, errors.New("platform: invalid session id")
 	}
-	secretBytes := make([]byte, 32)
-	if _, err := rand.Read(secretBytes); err != nil {
-		return ChannelBinding{}, err
+	secret := strings.TrimSpace(request.Secret)
+	if secret == "" {
+		secretBytes := make([]byte, 32)
+		if _, err := rand.Read(secretBytes); err != nil {
+			return ChannelBinding{}, err
+		}
+		secret = hex.EncodeToString(secretBytes)
+	}
+	if len(secret) < 8 || len(secret) > 512 {
+		return ChannelBinding{}, errors.New("platform: invalid channel secret")
 	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
@@ -124,7 +147,8 @@ func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createC
 	binding := ChannelBinding{
 		ID: "binding-" + hex.EncodeToString(idBytes), TenantID: tenant.TenantID, AppID: request.AppID,
 		Channel: request.Channel, ConversationType: request.ConversationType, ConversationID: request.ConversationID,
-		UserID: request.UserID, SessionID: sessionID, Secret: hex.EncodeToString(secretBytes),
+		UserID: request.UserID, SessionID: sessionID, Secret: secret,
+		Enabled:   true,
 		CreatedAt: time.Now().UTC(),
 	}
 	if binding.SessionID == "" {
@@ -139,6 +163,47 @@ func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createC
 	}
 	c.bindings[binding.ID] = binding
 	return binding, nil
+}
+
+func (c *ChannelCoordinator) UpdateBinding(tenantID, id string, enabled bool) (ChannelBinding, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	binding, ok := c.bindings[id]
+	if !ok || binding.TenantID != tenantID {
+		return ChannelBinding{}, ErrNotFound
+	}
+	binding.Enabled = enabled
+	c.bindings[id] = binding
+	binding.Secret = ""
+	return binding, nil
+}
+
+func (c *ChannelCoordinator) ReplaceSecret(tenantID, id, secret string) (ChannelBinding, error) {
+	secret = strings.TrimSpace(secret)
+	if len(secret) < 8 || len(secret) > 512 {
+		return ChannelBinding{}, errors.New("platform: invalid channel secret")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	binding, ok := c.bindings[id]
+	if !ok || binding.TenantID != tenantID {
+		return ChannelBinding{}, ErrNotFound
+	}
+	binding.Secret = secret
+	c.bindings[id] = binding
+	binding.Secret = ""
+	return binding, nil
+}
+
+func (c *ChannelCoordinator) DeleteBinding(tenantID, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	binding, ok := c.bindings[id]
+	if !ok || binding.TenantID != tenantID {
+		return ErrNotFound
+	}
+	delete(c.bindings, id)
+	return nil
 }
 
 func (c *ChannelCoordinator) Binding(tenantID, id string) (ChannelBinding, bool) {
@@ -179,21 +244,42 @@ func (c *ChannelCoordinator) Receive(ctx context.Context, tenantID string, callb
 	if !ok {
 		return ChannelBinding{}, ChannelMessage{}, ErrNotFound
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.adapter == nil {
+	if !binding.Enabled {
+		return binding, ChannelMessage{}, channelError{code: "channel_disabled"}
+	}
+	return c.receiveForBinding(ctx, binding, callback)
+}
+
+func (c *ChannelCoordinator) ReceiveExternal(ctx context.Context, callback ChannelCallback) (ChannelBinding, ChannelMessage, error) {
+	c.mu.RLock()
+	binding, ok := c.bindings[callback.BindingID]
+	c.mu.RUnlock()
+	if !ok {
+		return ChannelBinding{}, ChannelMessage{}, ErrNotFound
+	}
+	if !binding.Enabled {
+		return binding, ChannelMessage{}, channelError{code: "channel_disabled"}
+	}
+	return c.receiveForBinding(ctx, binding, callback)
+}
+
+func (c *ChannelCoordinator) receiveForBinding(ctx context.Context, binding ChannelBinding, callback ChannelCallback) (ChannelBinding, ChannelMessage, error) {
+	adapter := c.adapterFor(binding.Channel)
+	if adapter == nil {
 		return ChannelBinding{}, ChannelMessage{}, errors.New("platform: channel adapter unavailable")
 	}
 	callback.Channel = binding.Channel
-	callback.Credential = ChannelCredential{TenantID: binding.TenantID, Channel: binding.Channel, Secret: binding.Secret}
+	callback.Credential = ChannelCredential{TenantID: binding.TenantID, Channel: binding.Channel, Secret: binding.Secret, Token: binding.Secret}
 	callback.Scope = binding.SessionID
-	message, err := c.adapter.Receive(ctx, callback)
+	message, err := adapter.Receive(ctx, callback)
 	if err != nil {
 		return binding, message, err
 	}
 	if message.ProviderSequence == 0 {
 		return binding, ChannelMessage{}, channelError{code: "channel_callback_invalid"}
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	messageKey := binding.ID + "\x00" + message.MessageID
 	_, duplicate := c.acceptedMessages[messageKey]
 	if !duplicate && message.ProviderSequence <= c.lastSequences[binding.ID] {
@@ -207,20 +293,37 @@ func (c *ChannelCoordinator) Receive(ctx context.Context, tenantID string, callb
 	}
 	message.AppID = binding.AppID
 	message.SessionID = binding.SessionID
-	message.UserID = binding.UserID
-	message.ConversationID = binding.ConversationID
+	if message.UserID == "" {
+		message.UserID = binding.UserID
+	}
+	if message.ConversationID == "" {
+		message.ConversationID = binding.ConversationID
+	}
 	message.ConversationType = binding.ConversationType
 	return binding, message, nil
 }
 
 func (c *ChannelCoordinator) Send(ctx context.Context, binding ChannelBinding, reply ChannelReply) (ChannelDelivery, error) {
-	if c.adapter == nil {
+	adapter := c.adapterFor(binding.Channel)
+	if adapter == nil {
 		return ChannelDelivery{}, errors.New("platform: channel adapter unavailable")
 	}
 	if _, ok := c.Binding(binding.TenantID, binding.ID); !ok {
 		return ChannelDelivery{}, ErrNotFound
 	}
-	return c.adapter.Send(ctx, binding, reply)
+	return adapter.Send(ctx, binding, reply)
+}
+
+func (c *ChannelCoordinator) adapterFor(channel string) ChannelAdapter {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if adapter, ok := c.adapters[channel]; ok {
+		return adapter
+	}
+	if channel == ChannelMock {
+		return c.adapter
+	}
+	return nil
 }
 
 type mockCallbackRequest struct {

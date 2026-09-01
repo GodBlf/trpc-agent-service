@@ -169,6 +169,8 @@ type ChannelCallback struct {
 	BindingID  string
 	Body       []byte
 	Signature  string
+	Timestamp  string
+	Nonce      string
 	Credential ChannelCredential
 	Scope      string
 }
@@ -177,6 +179,7 @@ type ChannelCredential struct {
 	TenantID string
 	Channel  string
 	Secret   string
+	Token    string
 }
 
 type ChannelSignatureVerifier interface {

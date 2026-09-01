@@ -50,6 +50,20 @@ export interface MockFaultConfiguration {
   timeout_ms: number;
   retry_limit: number;
 }
+export type ChannelProvider = "mock" | "enterprise_wechat" | "telegram";
+export interface ChannelBinding {
+  id: string;
+  tenant_id: string;
+  app_id: string;
+  channel: ChannelProvider;
+  conversation_type: "single" | "group";
+  external_conversation_id: string;
+  external_user_id: string;
+  session_id: string;
+  enabled: boolean;
+  created_at: string;
+  secret?: string;
+}
 
 export class APIError extends Error {
   constructor(
@@ -67,6 +81,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
+  if (response.status === 204) return undefined as T;
   const body = (await response.json()) as T | { error: { code: string; message: string } };
   if (!response.ok) {
     const error = (body as { error?: { code?: string; message?: string } }).error;
@@ -117,4 +132,9 @@ export const api = {
     request<MockFaultConfiguration>("/api/v1/chat/mock/faults", {
       method: "POST", body: JSON.stringify({ scenario, session_id: id }),
     }),
+  bindings: () => request<ListResponse<ChannelBinding>>("/api/v1/chat/bindings"),
+  createBinding: (input: { channel: ChannelProvider; app_id: string; conversation_type: "single" | "group"; external_conversation_id: string; external_user_id: string; secret: string }) =>
+    request<ChannelBinding>("/api/v1/chat/bindings", { method: "POST", body: JSON.stringify(input) }),
+  setBindingEnabled: (id: string, enabled: boolean) => request<ChannelBinding>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }),
+  deleteBinding: (id: string) => request<void>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

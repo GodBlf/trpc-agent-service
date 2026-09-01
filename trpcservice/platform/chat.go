@@ -32,6 +32,7 @@ type createChannelBindingRequest struct {
 	ConversationID   string `json:"external_conversation_id"`
 	UserID           string `json:"external_user_id"`
 	SessionID        string `json:"session_id"`
+	Secret           string `json:"secret,omitempty"`
 }
 
 type sendChatMessageRequest struct {
@@ -86,18 +87,67 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
 			return
 		}
+		if binding.Channel != ChannelMock {
+			binding.Secret = ""
+		}
 		writeJSON(w, http.StatusCreated, binding)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
 	}
 }
 
-func (h *AdminHandler) handleMockChannelCallback(w http.ResponseWriter, r *http.Request) {
+func (h *AdminHandler) handleChannelBindingResource(w http.ResponseWriter, r *http.Request, id string) {
 	tenant, ok := trustedTenant(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
+	if id == "" || !canOperate(tenant.Role) {
+		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
+		return
+	}
+	switch r.Method {
+	case http.MethodPatch:
+		var request struct {
+			Enabled *bool  `json:"enabled"`
+			Secret  string `json:"secret"`
+		}
+		if err := decodeStrict(r, &request); err != nil || (request.Enabled == nil && strings.TrimSpace(request.Secret) == "") {
+			writeError(w, http.StatusBadRequest, "invalid_channel_binding", "enabled or secret is required")
+			return
+		}
+		var binding ChannelBinding
+		var err error
+		if request.Enabled != nil {
+			binding, err = h.channels.UpdateBinding(tenant.TenantID, id, *request.Enabled)
+		} else {
+			binding, err = h.channels.ReplaceSecret(tenant.TenantID, id, request.Secret)
+		}
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, binding)
+	case http.MethodDelete:
+		if err := h.channels.DeleteBinding(tenant.TenantID, id); errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be PATCH or DELETE")
+	}
+}
+
+func (h *AdminHandler) handleMockChannelCallback(w http.ResponseWriter, r *http.Request) {
+	if _, ok := trustedTenant(r); !ok {
+		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+		return
+	}
+	h.handleProviderChannelCallback(w, r, ChannelMock)
+}
+
+func (h *AdminHandler) handleProviderChannelCallback(w http.ResponseWriter, r *http.Request, channel string) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
 		return
@@ -110,13 +160,33 @@ func (h *AdminHandler) handleMockChannelCallback(w http.ResponseWriter, r *http.
 	var envelope struct {
 		BindingID string `json:"binding_id"`
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.BindingID == "" {
+	_ = json.Unmarshal(body, &envelope)
+	if envelope.BindingID == "" {
+		envelope.BindingID = r.URL.Query().Get("binding_id")
+	}
+	if envelope.BindingID == "" {
+		envelope.BindingID = r.Header.Get("X-Channel-Binding-ID")
+	}
+	if envelope.BindingID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_channel_callback", "binding id is required")
 		return
 	}
-	binding, message, err := h.channels.Receive(r.Context(), tenant.TenantID, ChannelCallback{
-		Channel: ChannelMock, BindingID: envelope.BindingID, Body: body, Signature: r.Header.Get("X-Mock-Signature"),
-	})
+	callback := ChannelCallback{
+		Channel: channel, BindingID: envelope.BindingID, Body: body, Signature: callbackSignature(r, channel),
+		Timestamp: r.URL.Query().Get("timestamp"), Nonce: r.URL.Query().Get("nonce"),
+	}
+	var binding ChannelBinding
+	var message ChannelMessage
+	if channel == ChannelMock {
+		tenant, ok := trustedTenant(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+			return
+		}
+		binding, message, err = h.channels.Receive(r.Context(), tenant.TenantID, callback)
+	} else {
+		binding, message, err = h.channels.ReceiveExternal(r.Context(), callback)
+	}
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
 		return
@@ -125,6 +195,7 @@ func (h *AdminHandler) handleMockChannelCallback(w http.ResponseWriter, r *http.
 		writeChannelError(w, err)
 		return
 	}
+	tenant := TenantContext{TenantID: binding.TenantID, UserID: message.UserID, Role: RoleOperator}
 	result, err := h.startChatRun(chatRunOptions{
 		tenant: tenant, appID: binding.AppID, sessionID: binding.SessionID, input: message.Text,
 		requestID: "channel-" + message.MessageID, userID: message.UserID, binding: &binding,
@@ -134,6 +205,19 @@ func (h *AdminHandler) handleMockChannelCallback(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusAccepted, result)
+}
+
+func callbackSignature(r *http.Request, channel string) string {
+	switch channel {
+	case ChannelMock:
+		return r.Header.Get("X-Mock-Signature")
+	case ChannelEnterpriseWeChat:
+		return r.URL.Query().Get("msg_signature")
+	case ChannelTelegram:
+		return r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+	default:
+		return ""
+	}
 }
 
 func (h *AdminHandler) handleMockFaults(w http.ResponseWriter, r *http.Request) {
@@ -857,6 +941,8 @@ func writeChannelError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case "channel_timeout":
 		status = http.StatusGatewayTimeout
+	case "channel_disabled":
+		status = http.StatusConflict
 	}
-	writeError(w, status, code, "Mock IM delivery failed")
+	writeError(w, status, code, "channel delivery failed")
 }

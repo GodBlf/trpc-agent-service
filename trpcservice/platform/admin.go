@@ -171,12 +171,15 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	failureCtx, failureCancel := context.WithCancel(context.Background())
 	chatCtx, chatCancel := context.WithCancel(context.Background())
+	channels := NewChannelCoordinator(NewMockChannel())
+	channels.RegisterAdapter(ChannelEnterpriseWeChat, EnterpriseWeChatChannel{})
+	channels.RegisterAdapter(ChannelTelegram, TelegramChannel{})
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
-		channels: NewChannelCoordinator(NewMockChannel()), activeRuns: make(map[string]activeChatRun),
+		channels: channels, activeRuns: make(map[string]activeChatRun),
 		chatCtx: chatCtx, chatCancel: chatCancel,
 	}
 }
@@ -309,11 +312,19 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleChannelBindings(w, h.trustedRequest(w, r))
 	case "/api/v1/chat/channels/mock/callback":
 		h.handleMockChannelCallback(w, h.trustedRequest(w, r))
+	case "/api/v1/chat/channels/enterprise_wechat/callback":
+		h.handleProviderChannelCallback(w, h.trustedRequest(w, r), ChannelEnterpriseWeChat)
+	case "/api/v1/chat/channels/telegram/callback":
+		h.handleProviderChannelCallback(w, h.trustedRequest(w, r), ChannelTelegram)
 	case "/api/v1/chat/mock/faults":
 		h.handleMockFaults(w, h.trustedRequest(w, r))
 	case "/api/v1/chat/sessions":
 		h.handleChatSessionResource(w, h.trustedRequest(w, r), []string{})
 	default:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/chat/bindings/") {
+			h.handleChannelBindingResource(w, h.trustedRequest(w, r), strings.TrimPrefix(r.URL.Path, "/api/v1/chat/bindings/"))
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/v1/chat/sessions/") {
 			h.handleChatSessionResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/chat/sessions/"), "/"), "/"))
 			return
