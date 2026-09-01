@@ -73,7 +73,7 @@ func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
 }
 
 func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
-	result, err := w.runner.Run(ctx, RunnerRequest{AppID: request.AppID, SessionID: request.SessionID, Input: request.Input, RequestID: request.RequestID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+	result, err := w.runner.Run(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.lastError.Store(true)
@@ -84,6 +84,30 @@ func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (
 	return GatewayResponse{SessionID: request.SessionID, Output: result.Output}, nil
 }
 
+func (w *StatelessWorker) ExecuteEvents(ctx context.Context, request GatewayRequest) (<-chan RuntimeEvent, error) {
+	streaming, ok := w.runner.(StreamingRunnerAdapter)
+	if !ok {
+		events := make(chan RuntimeEvent, 4)
+		go func() {
+			defer close(events)
+			response, err := w.Execute(ctx, request)
+			if err != nil {
+				eventType := "run.failed"
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					eventType = "run.cancelled"
+				}
+				events <- RuntimeEvent{Type: eventType, Data: map[string]string{"request_id": request.RequestID, "error": err.Error()}}
+				return
+			}
+			events <- RuntimeEvent{Type: "message.delta", Data: map[string]string{"request_id": request.RequestID, "delta": response.Output, "output": response.Output}}
+			events <- RuntimeEvent{Type: "message.completed", Data: map[string]string{"request_id": request.RequestID, "output": response.Output}}
+			events <- RuntimeEvent{Type: "run.completed", Data: map[string]string{"request_id": request.RequestID}}
+		}()
+		return events, nil
+	}
+	return streaming.RunEvents(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+}
+
 func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {
 	if runner == nil {
 		runner = EchoRunner{}
@@ -92,6 +116,91 @@ func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLife
 }
 
 func (rt *Runtime) SetWorkerAvailable(available bool) { rt.worker.available.Store(available) }
+
+func (rt *Runtime) Close() error {
+	if streaming, ok := rt.worker.runner.(StreamingRunnerAdapter); ok {
+		return streaming.Close()
+	}
+	return nil
+}
+
+func (rt *Runtime) RetireVersion(versionID string) error {
+	if streaming, ok := rt.worker.runner.(interface{ RetireVersion(string) error }); ok {
+		return streaming.RetireVersion(versionID)
+	}
+	return nil
+}
+
+func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request GatewayRequest) (<-chan RuntimeEvent, error) {
+	if tenant.TenantID == "" {
+		return nil, &runtimeError{code: "tenant_context_missing"}
+	}
+	if !canOperate(tenant.Role) {
+		return nil, &runtimeError{code: "forbidden"}
+	}
+	if !rt.worker.available.Load() {
+		return nil, &runtimeError{code: "worker_unavailable"}
+	}
+	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
+		return nil, &runtimeError{code: "invalid_request"}
+	}
+	deployment, found := rt.platform.activeDeployment(tenant.TenantID, request.AppID)
+	if !found {
+		return nil, &runtimeError{code: "active_deployment_not_found"}
+	}
+	request.TenantID, request.DeploymentID, request.VersionID, request.UserID = tenant.TenantID, deployment.ID, deployment.VersionID, tenant.UserID
+	streamCtx, cancel := context.WithCancel(ctx)
+	var releaseLife func()
+	if rt.life != nil {
+		var ok bool
+		releaseLife, ok = rt.life.Acquire()
+		if !ok {
+			cancel()
+			return nil, &runtimeError{code: "service_closing"}
+		}
+		go func() {
+			select {
+			case <-rt.life.Done():
+				cancel()
+			case <-streamCtx.Done():
+			}
+		}()
+	}
+	releaseGate, err := rt.gates.acquire(streamCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
+	if err != nil {
+		if releaseLife != nil {
+			releaseLife()
+		}
+		cancel()
+		return nil, &runtimeError{code: "request_cancelled", err: err}
+	}
+	events, err := rt.worker.ExecuteEvents(streamCtx, request)
+	if err != nil {
+		releaseGate()
+		if releaseLife != nil {
+			releaseLife()
+		}
+		cancel()
+		return nil, err
+	}
+	output := make(chan RuntimeEvent, 4)
+	go func() {
+		defer close(output)
+		defer releaseGate()
+		if releaseLife != nil {
+			defer releaseLife()
+		}
+		defer cancel()
+		for event := range events {
+			select {
+			case <-streamCtx.Done():
+				return
+			case output <- event:
+			}
+		}
+	}()
+	return output, nil
+}
 
 func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request GatewayRequest) (GatewayResponse, error) {
 	if tenant.TenantID == "" {
@@ -146,6 +255,7 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	counters.active.Add(1)
 	defer rt.global.active.Add(-1)
 	defer counters.active.Add(-1)
+	request.TenantID, request.UserID = tenant.TenantID, tenant.UserID
 	result, err := rt.worker.Execute(runCtx, request)
 	if err != nil {
 		rt.global.failed.Add(1)

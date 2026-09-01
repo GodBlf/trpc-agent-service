@@ -38,7 +38,7 @@ func main() {
 	if err := admin.ConfigureBackendSelections(os.Getenv("TRPC_BACKEND_SELECTIONS")); err != nil && os.Getenv("TRPC_BACKEND_SELECTIONS") != "" {
 		log.Fatalf("backend selections: %v", err)
 	}
-	admin.ConfigureRuntime(platform.EchoRunner{}, life)
+	admin.ConfigureRuntime(platform.NewFrameworkRunnerAdapter(store.DeploymentVersion, nil), life)
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
 	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
 	server := &http.Server{Addr: *addr, Handler: web.NewStage1Handler(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, life, admin)}

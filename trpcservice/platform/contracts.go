@@ -79,11 +79,14 @@ type DeploymentVersion struct {
 	Number       int            `json:"number"`
 	Config       map[string]any `json:"config"`
 	CreatedAt    time.Time      `json:"created_at"`
+	Active       bool           `json:"-"`
 }
 
 type GatewayRequest struct {
+	TenantID     string `json:"-"`
 	AppID        string `json:"app_id"`
 	SessionID    string `json:"session_id"`
+	UserID       string `json:"-"`
 	Input        string `json:"input"`
 	RequestID    string `json:"-"`
 	DeploymentID string `json:"-"`
@@ -123,8 +126,10 @@ type SessionEvent struct {
 }
 
 type RunnerRequest struct {
+	TenantID     string
 	AppID        string
 	SessionID    string
+	UserID       string
 	Input        string
 	RequestID    string
 	DeploymentID string
