@@ -65,7 +65,8 @@ export interface ChannelBinding {
   secret?: string;
 }
 export interface ProviderStatus { provider: string; status: string; last_error?: string }
-export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group" }
+export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group"; enabled: boolean }
+export interface ProviderDelivery { provider: BotRoute["provider"]; external_subject: string; tenant_id: string; app_id: string; request_id: string; status: "accepted" | "retried" | "rejected" | "delivered" | "terminal_failed"; code?: string; attempts: number; updated_at: string }
 
 export class APIError extends Error {
   constructor(
@@ -141,5 +142,9 @@ export const api = {
   deleteBinding: (id: string) => request<void>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "DELETE" }),
   providerStatuses: () => request<ListResponse<ProviderStatus>>("/api/v1/admin/providers/status"),
   providerRoutes: () => request<ListResponse<BotRoute>>("/api/v1/admin/providers/routes"),
+  providerDeliveries: () => request<ListResponse<ProviderDelivery>>("/api/v1/admin/providers/deliveries"),
   createProviderRoute: (route: BotRoute) => request<BotRoute>("/api/v1/admin/providers/routes", { method: "POST", body: JSON.stringify(route) }),
+  updateProviderRoute: (route: BotRoute) => request<BotRoute>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "PATCH", body: JSON.stringify({ tenant_id: route.tenant_id, app_id: route.app_id, conversation_type: route.conversation_type, enabled: route.enabled }) }),
+  deleteProviderRoute: (route: BotRoute) => request<void>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "DELETE" }),
+  replayProviderRoute: (route: BotRoute, text: string) => request<ChatRunResponse>("/api/v1/admin/providers/replay", { method: "POST", body: JSON.stringify({ provider: route.provider, external_subject: route.external_subject, text }) }),
 };

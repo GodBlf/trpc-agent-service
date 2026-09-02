@@ -44,13 +44,13 @@ test("complete Stage 3 chat and Mock IM workflow", async ({ page }, testInfo) =>
   await page.getByLabel("消息内容").fill("hello-stage3");
   await page.getByRole("button", { name: "发送" }).click();
   await expect(page.getByText("hello-stage3", { exact: true })).toBeVisible();
-  await expect(page.getByText("echo:hello-stage3")).toBeVisible();
+  await expect(page.getByText("framework:hello-stage3")).toBeVisible();
   await expect(page.getByText(`${sessionID} · completed`)).toBeVisible();
 
   await page.reload();
   await page.getByRole("button", { name: "Chat" }).click();
   await expect(page.getByText("hello-stage3", { exact: true })).toBeVisible();
-  await expect(page.getByText("echo:hello-stage3")).toBeVisible();
+  await expect(page.getByText("framework:hello-stage3")).toBeVisible();
 
   await page.getByLabel("Mock 故障").selectOption("message_length");
   await page.getByRole("button", { name: "设置故障" }).click();

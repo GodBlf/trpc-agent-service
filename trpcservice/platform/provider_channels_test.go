@@ -5,27 +5,18 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 )
 
-func TestRealChannelBindingSecretIsWriteOnly(t *testing.T) {
+func TestRealProviderBindingsAreRejected(t *testing.T) {
 	client := newChannelTestClient(t, EchoRunner{})
 	client.activateApp("app-one", "deploy-one")
-	var binding ChannelBinding
-	client.post("/api/v1/chat/bindings", `{"channel":"telegram","app_id":"app-one","conversation_type":"single","external_conversation_id":"chat-1","external_user_id":"user-1","secret":"bot-secret"}`, nil, http.StatusCreated, &binding)
-	if binding.Secret != "" || binding.Channel != ChannelTelegram || !binding.Enabled {
-		t.Fatalf("created binding leaked or malformed: %#v", binding)
-	}
-	response := client.do(http.MethodGet, "/api/v1/chat/bindings", "", nil)
+	response := client.do(http.MethodPost, "/api/v1/chat/bindings", `{"channel":"telegram","app_id":"app-one","conversation_type":"single","external_conversation_id":"chat-1","external_user_id":"user-1","secret":"bot-secret"}`, nil)
 	defer response.Body.Close()
-	var listed struct {
-		Items []ChannelBinding `json:"items"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&listed); err != nil || len(listed.Items) != 1 || listed.Items[0].Secret != "" {
-		t.Fatalf("listed bindings = %#v err=%v", listed, err)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("real provider binding status = %d", response.StatusCode)
 	}
 }
 

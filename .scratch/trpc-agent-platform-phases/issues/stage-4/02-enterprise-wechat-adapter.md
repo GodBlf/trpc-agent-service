@@ -4,11 +4,15 @@
 
 **Blocked by:** 01: Shared Channel Configuration And Management
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] WebSocket authentication and Smart Bot frame parsing use BotID/long-connection Secret; traditional self-built-app webhook verification is absent.
-- [ ] Allowlisted external subjects map deterministically to Tenant, Agent App, user, conversation, and stable Session; unmapped and conflicting subjects never invoke Agent.
-- [ ] Agent replies are encoded as Smart Bot response frames with asynchronous delivery and bounded reconnect/backoff.
-- [ ] Text is required for the Stage 4 closed loop; unsupported media returns a stable bounded status.
-- [ ] Duplicate callback IDs, cancellation, timeout, retry, disconnect, and shutdown paths are deterministic and leak-free.
-- [ ] Frame replay tests prove callback to Agent execution to Smart Bot reply while preserving request and tenant identity.
+- [x] WebSocket authentication and Smart Bot frame parsing use BotID/long-connection Secret; traditional self-built-app webhook verification is absent.
+- [x] Allowlisted external subjects map deterministically to Tenant, Agent App, user, conversation, and stable Session; unmapped and conflicting subjects never invoke Agent.
+- [x] Agent replies are encoded as Smart Bot response frames with asynchronous delivery and bounded reconnect/backoff.
+- [x] Text is required for the Stage 4 closed loop; unsupported media returns a stable bounded status.
+- [x] Duplicate callback IDs, cancellation, timeout, retry, disconnect, and shutdown paths are deterministic and leak-free.
+- [x] Frame replay tests prove callback to Agent execution to Smart Bot reply while preserving request and tenant identity.
+
+## Answer
+
+Implemented API-mode Smart Bot subscribe authentication, callback parsing, correlated `aibot_respond_msg` acknowledgements, heartbeat, context cancellation, stale-session rejection, reconnect, duplicate reply recovery, and deterministic local WebSocket replay tests.

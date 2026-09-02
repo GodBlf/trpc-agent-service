@@ -283,6 +283,10 @@ func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.providers = providers
+	if providers != nil {
+		h.channels.RegisterAdapter(ChannelTelegram, TelegramChannel{Sender: providers.sendTelegram})
+		h.channels.RegisterAdapter(ChannelEnterpriseWeChat, EnterpriseWeChatChannel{Sender: providers.sendWeCom})
+	}
 }
 
 func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
@@ -324,8 +328,12 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleMockFaults(w, h.trustedRequest(w, r))
 	case "/api/v1/admin/providers/status":
 		h.handleProviderStatus(w, h.trustedRequest(w, r))
+	case "/api/v1/admin/providers/deliveries":
+		h.handleProviderDeliveries(w, h.trustedRequest(w, r))
 	case "/api/v1/admin/providers/routes":
 		h.handleProviderRoutes(w, h.trustedRequest(w, r))
+	case "/api/v1/admin/providers/replay":
+		h.handleProviderReplay(w, h.trustedRequest(w, r))
 	case "/api/v1/chat/sessions":
 		h.handleChatSessionResource(w, h.trustedRequest(w, r), []string{})
 	default:

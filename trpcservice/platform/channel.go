@@ -34,6 +34,10 @@ type ChannelBinding struct {
 	Secret           string    `json:"secret,omitempty"`
 	Enabled          bool      `json:"enabled"`
 	CreatedAt        time.Time `json:"created_at"`
+	ReplyReference   string    `json:"-"`
+	ProviderSession  string    `json:"-"`
+	PlatformOwned    bool      `json:"-"`
+	ReplayProvider   string    `json:"-"`
 }
 
 type HMACChannelSignature struct{}
@@ -119,7 +123,7 @@ func (c *ChannelCoordinator) MockFaults(tenantID, sessionID string) MockFaultCon
 }
 
 func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createChannelBindingRequest) (ChannelBinding, error) {
-	if request.Channel != ChannelMock && request.Channel != ChannelEnterpriseWeChat && request.Channel != ChannelTelegram {
+	if request.Channel != ChannelMock {
 		return ChannelBinding{}, errors.New("platform: unsupported channel")
 	}
 	if request.ConversationType != ConversationSingle && request.ConversationType != ConversationGroup {
@@ -308,8 +312,10 @@ func (c *ChannelCoordinator) Send(ctx context.Context, binding ChannelBinding, r
 	if adapter == nil {
 		return ChannelDelivery{}, errors.New("platform: channel adapter unavailable")
 	}
-	if _, ok := c.Binding(binding.TenantID, binding.ID); !ok {
-		return ChannelDelivery{}, ErrNotFound
+	if !binding.PlatformOwned {
+		if _, ok := c.Binding(binding.TenantID, binding.ID); !ok {
+			return ChannelDelivery{}, ErrNotFound
+		}
 	}
 	return adapter.Send(ctx, binding, reply)
 }

@@ -66,7 +66,8 @@ func (e EnterpriseWeChatChannel) Send(ctx context.Context, binding ChannelBindin
 	}
 	if e.Sender != nil {
 		if err := e.Sender(ctx, binding, reply); err != nil {
-			return ChannelDelivery{MessageID: reply.MessageID, Status: "failed", Attempts: 1, LastAttempt: time.Now().UTC()}, channelError{code: "channel_unavailable"}
+			code := channelErrorCode(err)
+			return ChannelDelivery{MessageID: reply.MessageID, Status: "failed", Code: code, Attempts: 1, LastAttempt: time.Now().UTC()}, channelError{code: code}
 		}
 	}
 	return ChannelDelivery{MessageID: reply.MessageID, Status: "delivered", Attempts: 1, LastAttempt: time.Now().UTC()}, nil
@@ -102,7 +103,8 @@ type telegramUpdate struct {
 	Message  struct {
 		MessageID int64 `json:"message_id"`
 		Chat      struct {
-			ID int64 `json:"id"`
+			ID   int64  `json:"id"`
+			Type string `json:"type"`
 		} `json:"chat"`
 		From struct {
 			ID int64 `json:"id"`
@@ -140,7 +142,8 @@ func (t TelegramChannel) Send(ctx context.Context, binding ChannelBinding, reply
 	}
 	if t.Sender != nil {
 		if err := t.Sender(ctx, binding, reply); err != nil {
-			return ChannelDelivery{MessageID: reply.MessageID, Status: "failed", Attempts: 1, LastAttempt: time.Now().UTC()}, channelError{code: "channel_unavailable"}
+			code := channelErrorCode(err)
+			return ChannelDelivery{MessageID: reply.MessageID, Status: "failed", Code: code, Attempts: 1, LastAttempt: time.Now().UTC()}, channelError{code: code}
 		}
 	}
 	return ChannelDelivery{MessageID: reply.MessageID, Status: "delivered", Attempts: 1, LastAttempt: time.Now().UTC()}, nil
