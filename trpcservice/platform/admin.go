@@ -154,6 +154,7 @@ type AdminHandler struct {
 	failureCtx               context.Context
 	failureCancel            context.CancelFunc
 	channels                 *ChannelCoordinator
+	providers                *ProviderRuntime
 	chatMu                   sync.Mutex
 	activeRuns               map[string]activeChatRun
 	chatCtx                  context.Context
@@ -172,8 +173,6 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	failureCtx, failureCancel := context.WithCancel(context.Background())
 	chatCtx, chatCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
-	channels.RegisterAdapter(ChannelEnterpriseWeChat, EnterpriseWeChatChannel{})
-	channels.RegisterAdapter(ChannelTelegram, TelegramChannel{})
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
@@ -264,6 +263,9 @@ func (h *AdminHandler) Close() error {
 	h.closing = true
 	h.mu.Unlock()
 	h.chatCancel()
+	if h.providers != nil {
+		h.providers.Close()
+	}
 	h.backends.beginClose()
 	h.migrationCancel()
 	h.migrationWG.Wait()
@@ -275,6 +277,12 @@ func (h *AdminHandler) Close() error {
 		return runtimeErr
 	}
 	return storeErr
+}
+
+func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.providers = providers
 }
 
 func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
@@ -312,12 +320,12 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleChannelBindings(w, h.trustedRequest(w, r))
 	case "/api/v1/chat/channels/mock/callback":
 		h.handleMockChannelCallback(w, h.trustedRequest(w, r))
-	case "/api/v1/chat/channels/enterprise_wechat/callback":
-		h.handleProviderChannelCallback(w, h.trustedRequest(w, r), ChannelEnterpriseWeChat)
-	case "/api/v1/chat/channels/telegram/callback":
-		h.handleProviderChannelCallback(w, h.trustedRequest(w, r), ChannelTelegram)
 	case "/api/v1/chat/mock/faults":
 		h.handleMockFaults(w, h.trustedRequest(w, r))
+	case "/api/v1/admin/providers/status":
+		h.handleProviderStatus(w, h.trustedRequest(w, r))
+	case "/api/v1/admin/providers/routes":
+		h.handleProviderRoutes(w, h.trustedRequest(w, r))
 	case "/api/v1/chat/sessions":
 		h.handleChatSessionResource(w, h.trustedRequest(w, r), []string{})
 	default:

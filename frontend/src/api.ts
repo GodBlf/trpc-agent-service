@@ -64,6 +64,8 @@ export interface ChannelBinding {
   created_at: string;
   secret?: string;
 }
+export interface ProviderStatus { provider: string; status: string; last_error?: string }
+export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group" }
 
 export class APIError extends Error {
   constructor(
@@ -133,8 +135,11 @@ export const api = {
       method: "POST", body: JSON.stringify({ scenario, session_id: id }),
     }),
   bindings: () => request<ListResponse<ChannelBinding>>("/api/v1/chat/bindings"),
-  createBinding: (input: { channel: ChannelProvider; app_id: string; conversation_type: "single" | "group"; external_conversation_id: string; external_user_id: string; secret: string }) =>
+  createBinding: (input: { channel: ChannelProvider; app_id: string; conversation_type: "single" | "group"; external_conversation_id: string; external_user_id: string }) =>
     request<ChannelBinding>("/api/v1/chat/bindings", { method: "POST", body: JSON.stringify(input) }),
   setBindingEnabled: (id: string, enabled: boolean) => request<ChannelBinding>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }),
   deleteBinding: (id: string) => request<void>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  providerStatuses: () => request<ListResponse<ProviderStatus>>("/api/v1/admin/providers/status"),
+  providerRoutes: () => request<ListResponse<BotRoute>>("/api/v1/admin/providers/routes"),
+  createProviderRoute: (route: BotRoute) => request<BotRoute>("/api/v1/admin/providers/routes", { method: "POST", body: JSON.stringify(route) }),
 };

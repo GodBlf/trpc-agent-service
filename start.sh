@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+if [[ -f "$ROOT/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env.local"
+  set +a
+fi
+
 mkdir -p "$ROOT/bin" "$ROOT/data"
 if [[ ! -x "$ROOT/bin/trpc-service" ]]; then
   "$ROOT/build.sh"

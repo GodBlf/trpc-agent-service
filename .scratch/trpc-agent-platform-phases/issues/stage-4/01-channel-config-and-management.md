@@ -1,13 +1,14 @@
-# 01: Shared Channel Configuration And Management
+# 01: Platform Provider Accounts And Bot Tenant Allowlist
 
-**What to build:** Tenant operators can create and manage Enterprise WeChat and Telegram Channel Bindings from the Management Console. Provider selection, webhook settings, enable/disable state, write-only secrets, authorization, tenant isolation, request ID propagation, and a common provider contract are available end to end.
+**What to build:** Platform administrators can configure the two platform-owned Provider Accounts and maintain a server-owned Bot Tenant Allowlist. The Management Console shows provider connection state, enables or disables routing, and maps an external IM subject to one Tenant and Agent App. Traditional WeCom self-built applications are explicitly excluded.
 
 **Blocked by:** Stage 3: Stage 3 Gate And Handoff; Stage 3.5: Framework Runtime Handoff
 
 **Status:** ready-for-agent
 
-- [ ] Authorized roles can create, inspect, update, enable, disable, and delete tenant-owned Channel Bindings for the two supported providers.
-- [ ] Secrets are write-only and never appear in logs, traces, errors, API responses, or rendered UI.
-- [ ] Cross-tenant reads and mutations are rejected consistently by API and UI.
-- [ ] Binding state, webhook information, latest delivery status, and stable provider configuration errors are exposed through the frontend and API.
-- [ ] The shared provider contract preserves tenant, user, session, request, retry, and delivery identity from inbound callback through outbound reply.
+- [ ] Server configuration reads `TRPC_TELEGRAM_BOT_USERNAME`, `TRPC_TELEGRAM_BOT_TOKEN`, `TRPC_WECOM_BOT_ID`, and `TRPC_WECOM_BOT_SECRET` without exposing values.
+- [ ] No WeCom self-built-app credentials or traditional application webhook configuration is accepted or required.
+- [ ] Platform administrators can create, update, disable, and remove allowlist entries; conflicting mappings are rejected atomically.
+- [ ] Tenant users can inspect only mappings and provider status relevant to their Tenant.
+- [ ] Provider Account status distinguishes unconfigured, connecting, connected, disconnected, and stopping.
+- [ ] The shared provider contract preserves Tenant, Agent App, external subject, user, Session, request, retry, and delivery identity.

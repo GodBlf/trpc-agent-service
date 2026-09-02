@@ -43,6 +43,73 @@ type cancelChatRunRequest struct {
 	RequestID string `json:"request_id"`
 }
 
+func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, account string, body []byte) error {
+	if h.providers == nil {
+		return errors.New("provider runtime unavailable")
+	}
+	var subject, userID, text, messageID string
+	switch provider {
+	case ChannelTelegram:
+		var update telegramUpdate
+		if err := json.Unmarshal(body, &update); err != nil || update.UpdateID <= 0 || update.Message.Chat.ID == 0 || update.Message.Text == "" {
+			return errors.New("invalid telegram update")
+		}
+		subject = fmt.Sprint(update.Message.Chat.ID)
+		userID = fmt.Sprint(update.Message.From.ID)
+		text = update.Message.Text
+		messageID = fmt.Sprint(update.Message.MessageID)
+	case ChannelEnterpriseWeChat:
+		var frame struct {
+			ID      string `json:"id"`
+			MsgID   string `json:"msgid"`
+			ChatID  string `json:"chatid"`
+			UserID  string `json:"userid"`
+			Content string `json:"content"`
+			Seq     int64  `json:"seq"`
+			Body    struct {
+				ChatID  string `json:"chatid"`
+				UserID  string `json:"userid"`
+				Content string `json:"content"`
+			} `json:"body"`
+		}
+		if err := json.Unmarshal(body, &frame); err != nil {
+			return errors.New("invalid wecom frame")
+		}
+		subject, userID, text = frame.ChatID, frame.UserID, frame.Content
+		if subject == "" {
+			subject = frame.Body.ChatID
+		}
+		if userID == "" {
+			userID = frame.Body.UserID
+		}
+		if text == "" {
+			text = frame.Body.Content
+		}
+		messageID = frame.MsgID
+		if messageID == "" {
+			messageID = frame.ID
+		}
+		if subject == "" || userID == "" || text == "" || messageID == "" {
+			return errors.New("invalid wecom frame")
+		}
+	default:
+		return errors.New("unsupported provider")
+	}
+	route, ok := h.providers.Routes().Resolve(provider, subject)
+	if !ok {
+		return ErrProviderMessageIgnored
+	}
+	if _, ok := h.platform.app(route.TenantID, route.AppID); !ok {
+		return errors.New("provider route unavailable")
+	}
+	_, err := h.startChatRun(chatRunOptions{
+		tenant: TenantContext{TenantID: route.TenantID, UserID: userID, Role: RoleOperator},
+		appID:  route.AppID, sessionID: providerSessionID(provider, account, subject), input: text,
+		requestID: "channel-" + messageID, userID: userID,
+	})
+	return err
+}
+
 func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := trustedTenant(r)
 	if !ok {
@@ -250,6 +317,76 @@ func (h *AdminHandler) handleMockFaults(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, config)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
+	}
+}
+
+func (h *AdminHandler) handleProviderStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		return
+	}
+	if _, ok := trustedTenant(r); !ok {
+		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+		return
+	}
+	if h.providers == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []BotStatus{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": h.providers.Statuses()})
+}
+
+func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := trustedTenant(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
+		return
+	}
+	if h.providers == nil {
+		writeError(w, http.StatusServiceUnavailable, "provider_unavailable", "provider runtime is unavailable")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items := h.providers.Routes().List()
+		if tenant.Role != RolePlatformAdmin {
+			filtered := items[:0]
+			for _, item := range items {
+				if item.TenantID == tenant.TenantID {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	case http.MethodPost:
+		if tenant.Role != RolePlatformAdmin {
+			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
+			return
+		}
+		var route BotRoute
+		if err := decodeStrict(r, &route); err != nil || (route.Provider != ChannelTelegram && route.Provider != ChannelEnterpriseWeChat) {
+			writeError(w, http.StatusBadRequest, "invalid_provider_route", "provider route is invalid")
+			return
+		}
+		if _, ok := h.platform.app(route.TenantID, route.AppID); !ok {
+			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
+			return
+		}
+		if err := h.providers.Routes().Upsert(route); err != nil {
+			writeError(w, http.StatusConflict, "provider_route_conflict", "provider route conflicts with an existing mapping")
+			return
+		}
+		writeJSON(w, http.StatusCreated, route)
+	case http.MethodDelete:
+		if tenant.Role != RolePlatformAdmin {
+			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
+			return
+		}
+		h.providers.Routes().Delete(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET, POST, or DELETE")
 	}
 }
 

@@ -1,14 +1,14 @@
-# 02: Enterprise WeChat Protocol Adapter And Local Closed Loop
+# 02: WeCom Smart Bot WebSocket Adapter And Local Closed Loop
 
-**What to build:** An Enterprise WeChat webhook can be verified and converted into a tenant-scoped platform request, routed through the existing Runner, and converted back into an Enterprise WeChat reply. Deterministic protocol fixtures provide a complete local callback-to-reply loop without requiring live credentials.
+**What to build:** The WeCom API-mode Smart Bot connects with BotID and long-connection Secret, receives `aibot_msg_callback` frames over WebSocket, routes allowlisted subjects through the existing Runner, and sends `aibot_respond_msg` replies. Deterministic frames provide a local closed loop without live credentials.
 
 **Blocked by:** 01: Shared Channel Configuration And Management
 
 **Status:** ready-for-agent
 
-- [ ] Valid Enterprise WeChat callbacks pass signature verification and invalid or expired callbacks are rejected with stable public errors.
-- [ ] Text callbacks map deterministically to the correct tenant, user, conversation, and Session; duplicate and out-of-order deliveries are handled safely.
-- [ ] Agent events are converted to Enterprise WeChat text replies with asynchronous delivery semantics.
-- [ ] Minimal supported media messages are parsed or rejected with an explicit, bounded limitation.
-- [ ] Timeout, retry, rate-limit, message-length, cancellation, and terminal-failure paths are covered by deterministic protocol replay tests.
-- [ ] End-to-end tests prove callback to Agent execution to Enterprise WeChat reply while preserving request and tenant identity.
+- [ ] WebSocket authentication and Smart Bot frame parsing use BotID/long-connection Secret; traditional self-built-app webhook verification is absent.
+- [ ] Allowlisted external subjects map deterministically to Tenant, Agent App, user, conversation, and stable Session; unmapped and conflicting subjects never invoke Agent.
+- [ ] Agent replies are encoded as Smart Bot response frames with asynchronous delivery and bounded reconnect/backoff.
+- [ ] Text is required for the Stage 4 closed loop; unsupported media returns a stable bounded status.
+- [ ] Duplicate callback IDs, cancellation, timeout, retry, disconnect, and shutdown paths are deterministic and leak-free.
+- [ ] Frame replay tests prove callback to Agent execution to Smart Bot reply while preserving request and tenant identity.
