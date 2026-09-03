@@ -163,7 +163,7 @@ npm run dev
 
 ## 当前实现能力
 
-当前代码已覆盖到 Stage 4 的本地可运行验收范围：
+当前代码已覆盖到 Stage 5 的本地可运行验收范围：
 
 - **多租户管理**：Development Identity、租户切换、Agent 应用、部署版本与状态流转、Gateway/Worker 状态。
 - **存储与数据管理**：租户级 InMemory/Redis/SQLite/PostgreSQL 后端选择、事件回放、迁移与数据检查页面。
@@ -171,10 +171,15 @@ npm run dev
 - **Mock IM 通道**：提供租户/Session 绑定、HMAC 回调验签、用户与会话映射、消息去重、provider sequence 乱序拒绝、回复投递和可配置故障注入。
 - **真实 IM Provider**：Telegram Bot 使用 long polling/`sendMessage`，企微 API 模式智能机器人使用 WebSocket `aibot_subscribe`/`aibot_msg_callback`/`aibot_respond_msg`；两者通过持久化 Bot Tenant Allowlist 进行租户与 Agent App 路由。
 - **SSE 契约**：`event_id`、`request_id`、`session_id`、单调 `sequence`、`type`、`data` 稳定 envelope，覆盖 `run.started`、`message.delta`、`message.completed`、`run.failed`、`run.cancelled`、`run.completed`。
+- **生产身份与授权**：显式 production 模式验证 HS256 JWT 的签名、issuer、audience、expiry 和 subject，并只接受服务端 Identity Directory 中的 Tenant/Role 分配；Management Console 使用短期 HttpOnly Session。
+- **治理与安全**：Tenant/Agent App 策略覆盖 Tool/MCP allowlist、输入输出 Guardrail、危险 Tool 二次确认、外部 IM 用户/会话授权、脱敏、预算和 Tenant 限流，并在 Runner 执行前生效。
+- **审计与可观测性**：提供持久化 Audit Event 查询、Tenant 指标与成本、以及按 `request_id`/`trace_id` 检索的完整平台链路视图；管理界面提供策略、确认、审计和指标/Trace 工作流。
 
 企微不使用自建应用，不接受 CorpID、AgentID、应用 Secret、Access Token、EncodingAESKey 或传统 HTTP 回调配置。真实凭据仅从被忽略的 `.env.local` 读取；自动化验收使用本地协议 fixture，不消费真实消息。
 
-阶段 4 验证命令：
+Stage 5 配置、接口、安全语义与已知限制见 [`docs/stage-5-governance.md`](docs/stage-5-governance.md)。
+
+阶段 5 验证命令：
 
 ```bash
 go test ./...

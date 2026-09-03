@@ -89,6 +89,7 @@ type GatewayRequest struct {
 	UserID       string `json:"-"`
 	Input        string `json:"input"`
 	RequestID    string `json:"-"`
+	TraceID      string `json:"-"`
 	DeploymentID string `json:"-"`
 	VersionID    string `json:"-"`
 }
@@ -132,6 +133,7 @@ type RunnerRequest struct {
 	UserID       string
 	Input        string
 	RequestID    string
+	TraceID      string
 	DeploymentID string
 	VersionID    string
 }
@@ -210,19 +212,20 @@ type StorageAdapter interface {
 }
 
 type AuditEvent struct {
-	ID         string
-	TenantID   string
-	Channel    string
-	UserID     string
-	SessionID  string
-	AgentName  string
-	ToolName   string
-	Decision   string
-	Latency    time.Duration
-	ErrorType  string
-	Cost       float64
-	TraceID    string
-	OccurredAt time.Time
+	ID         string        `json:"id"`
+	TenantID   string        `json:"tenant_id"`
+	Channel    string        `json:"channel,omitempty"`
+	UserID     string        `json:"user_id,omitempty"`
+	SessionID  string        `json:"session_id,omitempty"`
+	AgentName  string        `json:"agent_name,omitempty"`
+	ToolName   string        `json:"tool_name,omitempty"`
+	Decision   string        `json:"decision"`
+	Latency    time.Duration `json:"latency"`
+	ErrorType  string        `json:"error_type,omitempty"`
+	Cost       float64       `json:"cost"`
+	TraceID    string        `json:"trace_id"`
+	RequestID  string        `json:"request_id,omitempty"`
+	OccurredAt time.Time     `json:"occurred_at"`
 }
 
 type AuditSink interface {

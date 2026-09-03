@@ -169,3 +169,25 @@ _Avoid_: WeCom Smart Bot, Provider Account
 **Bot Credential**:
 平台级 Provider Account 的进程启动凭据；本阶段包括 `TRPC_TELEGRAM_BOT_USERNAME`、`TRPC_TELEGRAM_BOT_TOKEN`、`TRPC_WECOM_BOT_ID` 和 `TRPC_WECOM_BOT_SECRET`，只从服务端环境读取，不进入租户绑定或浏览器状态。
 _Avoid_: Tenant Secret, Browser Credential
+
+## Governance And Observability
+
+**Production Identity**:
+生产模式中由 Identity Provider 验证、并与服务端 Tenant/Role 分配绑定的用户身份；原始身份令牌不作为浏览器持久状态。
+_Avoid_: Development Identity, Tenant Context
+
+**Governance Policy**:
+按 Tenant 和 Agent App 隔离、带 revision 的服务端执行策略，定义 Tool/MCP、Guardrail、IM 权限、预算、限流和脱敏规则。
+_Avoid_: Deployment Configuration, Client Policy
+
+**Tool Confirmation**:
+危险 Tool 在产生副作用前创建的 Tenant 隔离审批记录；决定与执行通过 request ID 保持幂等。
+_Avoid_: Approval Workflow, In-Memory Waiter
+
+**Platform Trace**:
+由平台定义的、Tenant 隔离且可按 request ID 或 trace ID 检索的有序执行路径；不暴露上游 runtime telemetry 类型。
+_Avoid_: Audit Event, Application Log
+
+**Governance Center**:
+承载 Governance Policy、Audit Event、Tool Confirmation、预算/限流计数和 Platform Trace 的服务端边界。
+_Avoid_: Framework Runtime, Management Console

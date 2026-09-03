@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import App from "./App";
 
 test("loads the server identity and renders stable console navigation", async () => {
@@ -14,6 +15,27 @@ test("loads the server identity and renders stable console navigation", async ()
   await waitFor(() => expect(screen.getByText("Local Developer")).toBeInTheDocument());
   expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
   expect(screen.getByRole("combobox", { name: "当前租户" })).toHaveValue("tenant-a");
+});
+
+test("exchanges a production token without storing it in the browser", async () => {
+  let authenticated = false;
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.endsWith("/auth/login")) {
+      expect(String(init?.body)).toContain("stage5-token-canary");
+      authenticated = true;
+    }
+    if (!authenticated) return new Response(JSON.stringify({ error: { code: "identity_required", message: "required" } }), { status: 401, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ id: "operator", name: "Operator", active_tenant_id: "tenant-a", active_role: "operator", assignments: [{ tenant_id: "tenant-a", tenant_name: "A", role: "operator" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(await screen.findByLabelText("Identity Token"), "stage5-token-canary");
+  await user.click(screen.getByRole("button", { name: "登录" }));
+  expect(await screen.findByText("Operator")).toBeVisible();
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/auth/login", expect.objectContaining({ method: "POST" }));
+  expect(document.body.textContent).not.toContain("stage5-token-canary");
 });
 
 test("remounts the data page when the active tenant changes", async () => {

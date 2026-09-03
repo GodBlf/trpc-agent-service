@@ -42,6 +42,7 @@ type identityResponse struct {
 	ActiveTenantID string             `json:"active_tenant_id"`
 	ActiveRole     Role               `json:"active_role"`
 	Assignments    []TenantAssignment `json:"assignments"`
+	AuthMode       string             `json:"auth_mode"`
 }
 
 // MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
@@ -131,11 +132,19 @@ type developmentSession struct {
 	lastSeen       time.Time
 }
 
+type productionSession struct {
+	identity identityResponse
+	lastSeen time.Time
+}
+
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
 	platform                 *MemoryPlatform
 	identity                 DevelopmentIdentity
+	identityProvider         IdentityProvider
+	productionSessions       map[string]*productionSession
+	governance               *GovernanceCenter
 	mu                       sync.Mutex
 	sessions                 map[string]*developmentSession
 	runtime                  *Runtime
@@ -162,6 +171,31 @@ type AdminHandler struct {
 	chatWG                   sync.WaitGroup
 }
 
+// ConfigureIdentityProvider enables production identity mode. Development
+// sessions are not consulted while a production provider is configured.
+func (h *AdminHandler) ConfigureIdentityProvider(provider IdentityProvider) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.identityProvider = provider
+	h.sessions = make(map[string]*developmentSession)
+	h.productionSessions = make(map[string]*productionSession)
+	if source, ok := provider.(interface{ Assignments() []TenantAssignment }); ok {
+		for _, assignment := range source.Assignments() {
+			h.platform.seedTenant(assignment)
+		}
+	}
+}
+
+func (h *AdminHandler) ConfigureGovernance(center *GovernanceCenter) {
+	if center == nil {
+		return
+	}
+	h.governance = center
+	if governed, ok := h.runtime.worker.runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
+		governed.SetGovernance(center)
+	}
+}
+
 func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
 	if platform == nil {
 		platform = NewMemoryPlatform()
@@ -175,6 +209,7 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	channels := NewChannelCoordinator(NewMockChannel())
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
+		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
@@ -297,15 +332,38 @@ func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) 
 // admission. It is intended for process composition and deterministic tests.
 func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecycle) {
 	_ = h.runtime.Close()
+	if governed, ok := runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
+		governed.SetGovernance(h.governance)
+	}
 	h.runtime = NewRuntime(h.platform, runner, life)
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	auditWriter := &auditResponseWriter{ResponseWriter: w}
+	w = auditWriter
+	started := time.Now()
+	defer h.auditHTTPRequest(context.Background(), r, auditWriter, started)
 	if isDataPath(r.URL.Path) {
-		h.handleDataResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/"))
+		trusted := h.trustedRequest(w, r)
+		if trusted == nil {
+			return
+		}
+		h.handleDataResource(w, trusted, strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/"))
 		return
 	}
 	switch r.URL.Path {
+	case "/api/v1/auth/login":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+			return
+		}
+		h.handleProductionLogin(w, r)
+	case "/api/v1/auth/logout":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+			return
+		}
+		h.handleProductionLogout(w, r)
 	case "/api/v1/auth/me":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
@@ -319,37 +377,80 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleSwitchTenant(w, r)
 	case "/api/v1/admin/tenants":
-		h.handleTenants(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleTenants(w, trusted)
+		}
 	case "/api/v1/chat/bindings":
-		h.handleChannelBindings(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleChannelBindings(w, trusted)
+		}
 	case "/api/v1/chat/channels/mock/callback":
-		h.handleMockChannelCallback(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleMockChannelCallback(w, trusted)
+		}
 	case "/api/v1/chat/mock/faults":
-		h.handleMockFaults(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleMockFaults(w, trusted)
+		}
 	case "/api/v1/admin/providers/status":
-		h.handleProviderStatus(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleProviderStatus(w, trusted)
+		}
 	case "/api/v1/admin/providers/deliveries":
-		h.handleProviderDeliveries(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleProviderDeliveries(w, trusted)
+		}
 	case "/api/v1/admin/providers/routes":
-		h.handleProviderRoutes(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleProviderRoutes(w, trusted)
+		}
 	case "/api/v1/admin/providers/replay":
-		h.handleProviderReplay(w, h.trustedRequest(w, r))
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleProviderReplay(w, trusted)
+		}
 	case "/api/v1/chat/sessions":
-		h.handleChatSessionResource(w, h.trustedRequest(w, r), []string{})
+		trusted := h.trustedRequest(w, r)
+		if trusted != nil {
+			h.handleChatSessionResource(w, trusted, []string{})
+		}
 	default:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/governance/") {
+			trusted := h.trustedRequest(w, r)
+			if trusted != nil {
+				h.handleGovernance(w, trusted)
+			}
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/v1/chat/bindings/") {
-			h.handleChannelBindingResource(w, h.trustedRequest(w, r), strings.TrimPrefix(r.URL.Path, "/api/v1/chat/bindings/"))
+			trusted := h.trustedRequest(w, r)
+			if trusted != nil {
+				h.handleChannelBindingResource(w, trusted, strings.TrimPrefix(r.URL.Path, "/api/v1/chat/bindings/"))
+			}
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/v1/chat/sessions/") {
-			h.handleChatSessionResource(w, h.trustedRequest(w, r), strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/chat/sessions/"), "/"), "/"))
+			trusted := h.trustedRequest(w, r)
+			if trusted != nil {
+				h.handleChatSessionResource(w, trusted, strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/chat/sessions/"), "/"), "/"))
+			}
 			return
 		}
 		if h.handleAdminResource(w, r) {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/tenants/") {
-			h.handleTenant(w, h.trustedRequest(w, r), strings.TrimPrefix(r.URL.Path, "/api/v1/admin/tenants/"))
+			trusted := h.trustedRequest(w, r)
+			if trusted != nil {
+				h.handleTenant(w, trusted, strings.TrimPrefix(r.URL.Path, "/api/v1/admin/tenants/"))
+			}
 			return
 		}
 		http.NotFound(w, r)
@@ -357,6 +458,20 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *http.Request {
+	h.mu.Lock()
+	provider := h.identityProvider
+	h.mu.Unlock()
+	if provider != nil {
+		identity, err := h.productionIdentity(r, "")
+		if err != nil {
+			status, code, message := identityPublicError(err)
+			writeError(w, status, code, message)
+			return nil
+		}
+		ctx := WithTenantContext(r.Context(), TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		return r.WithContext(ctx)
+	}
 	_, session, ok := h.session(w, r)
 	if !ok {
 		return r
@@ -366,7 +481,9 @@ func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *h
 		return r
 	}
 	identity := h.identitySnapshot()
-	ctx := WithTenantContext(r.Context(), TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
+	tenant := TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role}
+	markAuditIdentity(w, tenant)
+	ctx := WithTenantContext(r.Context(), tenant)
 	return r.WithContext(ctx)
 }
 
@@ -449,6 +566,20 @@ func validDisplayName(name string) bool {
 }
 
 func (h *AdminHandler) handleIdentity(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	provider := h.identityProvider
+	h.mu.Unlock()
+	if provider != nil {
+		identity, err := h.productionIdentity(r, "")
+		if err != nil {
+			status, code, message := identityPublicError(err)
+			writeError(w, status, code, message)
+			return
+		}
+		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		writeJSON(w, http.StatusOK, identity)
+		return
+	}
 	_, session, ok := h.session(w, r)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "development_identity_unavailable", "development identity has no tenant assignments")
@@ -456,9 +587,10 @@ func (h *AdminHandler) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	assignment, _ := h.assignment(session.activeTenantID)
 	identity := h.identitySnapshot()
+	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
 	writeJSON(w, http.StatusOK, identityResponse{
 		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
-		ActiveRole: assignment.Role, Assignments: identity.Assignments,
+		ActiveRole: assignment.Role, Assignments: identity.Assignments, AuthMode: "development",
 	})
 }
 
@@ -470,6 +602,20 @@ func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil || request.TenantID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "tenant_id is required")
+		return
+	}
+	h.mu.Lock()
+	provider := h.identityProvider
+	h.mu.Unlock()
+	if provider != nil {
+		identity, err := h.productionIdentity(r, request.TenantID)
+		if err != nil {
+			status, code, message := identityPublicError(err)
+			writeError(w, status, code, message)
+			return
+		}
+		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		writeJSON(w, http.StatusOK, identity)
 		return
 	}
 	assignment, approved := h.assignment(request.TenantID)
@@ -489,9 +635,10 @@ func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request
 	}
 	h.mu.Unlock()
 	identity := h.identitySnapshot()
+	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
 	writeJSON(w, http.StatusOK, identityResponse{
 		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
-		ActiveRole: assignment.Role, Assignments: identity.Assignments,
+		ActiveRole: assignment.Role, Assignments: identity.Assignments, AuthMode: "development",
 	})
 }
 

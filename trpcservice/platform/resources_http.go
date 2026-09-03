@@ -15,6 +15,9 @@ func (h *AdminHandler) handleAdminResource(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 	trusted := h.trustedRequest(w, r)
+	if trusted == nil {
+		return true
+	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) == 0 {
 		return false

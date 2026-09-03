@@ -10,6 +10,7 @@ import (
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
 )
 
@@ -33,13 +34,14 @@ func DefaultAgentFactory() AgentFactory {
 }
 
 type FrameworkRunnerAdapter struct {
-	resolve func(string) (DeploymentVersion, bool)
-	factory AgentFactory
-	mu      sync.Mutex
-	runners map[string]frameworkrunner.Runner
-	runs    map[string]map[uint64]context.CancelFunc
-	nextRun uint64
-	closed  bool
+	resolve    func(string) (DeploymentVersion, bool)
+	factory    AgentFactory
+	mu         sync.Mutex
+	runners    map[string]frameworkrunner.Runner
+	runs       map[string]map[uint64]context.CancelFunc
+	nextRun    uint64
+	closed     bool
+	governance *GovernanceCenter
 }
 
 func NewFrameworkRunnerAdapter(resolve func(string) (DeploymentVersion, bool), factory AgentFactory) *FrameworkRunnerAdapter {
@@ -69,9 +71,38 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 	if err != nil {
 		return nil, fmt.Errorf("agent_factory: %w", err)
 	}
-	runner := frameworkrunner.NewRunner(version.AgentAppID, agent)
+	options := []frameworkrunner.Option{}
+	if a.governance != nil {
+		options = append(options, frameworkrunner.WithPlugins(&governanceRuntimePlugin{center: a.governance}))
+	}
+	runner := frameworkrunner.NewRunner(version.AgentAppID, agent, options...)
 	a.runners[versionID] = runner
 	return runner, nil
+}
+
+func (a *FrameworkRunnerAdapter) SetGovernance(center *GovernanceCenter) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.governance = center
+}
+
+type governanceRuntimePlugin struct{ center *GovernanceCenter }
+
+func (p *governanceRuntimePlugin) Name() string { return "platform-governance" }
+
+func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
+	registry.BeforeAgent(func(ctx context.Context, _ *frameworkagent.BeforeAgentArgs) (*frameworkagent.BeforeAgentResult, error) {
+		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
+			p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.before_agent", "ok")
+		}
+		return nil, nil
+	})
+	registry.AfterAgent(func(ctx context.Context, _ *frameworkagent.AfterAgentArgs) (*frameworkagent.AfterAgentResult, error) {
+		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
+			p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.after_agent", "ok")
+		}
+		return nil, nil
+	})
 }
 
 func (a *FrameworkRunnerAdapter) Run(ctx context.Context, request RunnerRequest) (RunnerResponse, error) {
@@ -180,7 +211,7 @@ func RunnerIdentityFromContext(ctx context.Context) (RunnerRequest, bool) {
 func runtimeEventData(request RunnerRequest, values map[string]string) map[string]string {
 	data := map[string]string{
 		"tenant_id": request.TenantID, "app_id": request.AppID, "deployment_id": request.DeploymentID,
-		"version_id": request.VersionID, "session_id": request.SessionID, "request_id": request.RequestID,
+		"version_id": request.VersionID, "session_id": request.SessionID, "request_id": request.RequestID, "trace_id": request.TraceID,
 	}
 	for key, value := range values {
 		data[key] = value
