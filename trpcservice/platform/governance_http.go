@@ -58,7 +58,16 @@ func (h *AdminHandler) handleGovernance(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.governance.Confirmations(tenant.TenantID)})
+		confirmations := h.governance.Confirmations(tenant.TenantID)
+		for _, confirmation := range confirmations {
+			if confirmation.Status != ConfirmationExpired || confirmation.SessionID == "" {
+				continue
+			}
+			eventCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			_ = h.appendConfirmationSessionEvent(eventCtx, confirmation)
+			cancel()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": confirmations})
 	case strings.HasPrefix(path, "confirmations/") && strings.HasSuffix(path, "/decision"):
 		h.handleConfirmationDecision(w, r, tenant, strings.TrimSuffix(strings.TrimPrefix(path, "confirmations/"), "/decision"))
 	default:

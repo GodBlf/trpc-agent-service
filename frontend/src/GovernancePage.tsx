@@ -24,6 +24,13 @@ export function GovernancePage({ identity }: { identity: Identity }) {
   const [trace, setTrace] = useState<PlatformTrace>();
   const [traceID, setTraceID] = useState("");
   const [auditDecision, setAuditDecision] = useState("");
+  const [auditFrom, setAuditFrom] = useState("");
+  const [auditTo, setAuditTo] = useState("");
+  const [auditChannel, setAuditChannel] = useState("");
+  const [auditUserID, setAuditUserID] = useState("");
+  const [auditSessionID, setAuditSessionID] = useState("");
+  const [auditAgentName, setAuditAgentName] = useState("");
+  const [auditErrorType, setAuditErrorType] = useState("");
   const [auditRequestID, setAuditRequestID] = useState("");
   const [auditTraceID, setAuditTraceID] = useState("");
   const [status, setStatus] = useState("");
@@ -63,7 +70,11 @@ export function GovernancePage({ identity }: { identity: Identity }) {
   const searchAudits = async () => {
     setStatus("");
     try {
-      setAudits((await api.governanceAudit({ decision: auditDecision, request_id: auditRequestID, trace_id: auditTraceID })).items);
+      setAudits((await api.governanceAudit({
+        from: auditFrom, to: auditTo, channel: auditChannel, user_id: auditUserID,
+        session_id: auditSessionID, agent_name: auditAgentName, decision: auditDecision,
+        error_type: auditErrorType, request_id: auditRequestID, trace_id: auditTraceID,
+      })).items);
     } catch {
       setStatus("审计查询失败");
     }
@@ -107,7 +118,14 @@ export function GovernancePage({ identity }: { identity: Identity }) {
     {view === "审计" && <section className="governance-band">
       <div className="section-toolbar"><strong>Audit Events</strong><span>{audits.length} 条</span></div>
       <div className="audit-filters">
+        <label>开始时间<input value={auditFrom} placeholder="RFC3339" onChange={(event) => setAuditFrom(event.target.value)} /></label>
+        <label>结束时间<input value={auditTo} placeholder="RFC3339" onChange={(event) => setAuditTo(event.target.value)} /></label>
+        <label>Channel<input value={auditChannel} onChange={(event) => setAuditChannel(event.target.value)} /></label>
+        <label>用户 ID<input value={auditUserID} onChange={(event) => setAuditUserID(event.target.value)} /></label>
+        <label>Session ID<input value={auditSessionID} onChange={(event) => setAuditSessionID(event.target.value)} /></label>
+        <label>Agent App<input value={auditAgentName} onChange={(event) => setAuditAgentName(event.target.value)} /></label>
         <label>决策<input value={auditDecision} onChange={(event) => setAuditDecision(event.target.value)} /></label>
+        <label>错误类型<input value={auditErrorType} onChange={(event) => setAuditErrorType(event.target.value)} /></label>
         <label>Request ID<input value={auditRequestID} onChange={(event) => setAuditRequestID(event.target.value)} /></label>
         <label>Trace ID<input value={auditTraceID} onChange={(event) => setAuditTraceID(event.target.value)} /></label>
         <button onClick={() => void searchAudits()}><Search aria-hidden="true" />查询审计</button>

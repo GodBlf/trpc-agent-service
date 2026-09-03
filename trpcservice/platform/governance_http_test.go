@@ -365,6 +365,53 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	}
 }
 
+func TestConfirmationListReconcilesExpiryAndPersistsSessionEvent(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
+	handler.governance.now = func() time.Time { return now }
+	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a"}
+	result, err := handler.governance.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.governance.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"stage5"}`)); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("pending confirmation = %v", err)
+	}
+	now = now.Add(16 * time.Minute)
+	server, client := newHandlerClient(t, handler)
+	defer server.Close()
+	var listed struct {
+		Items []ToolConfirmation `json:"items"`
+	}
+	response, err := client.Get(server.URL + "/api/v1/admin/governance/confirmations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeResponse(t, response, http.StatusOK, &listed)
+	if len(listed.Items) != 1 || listed.Items[0].Status != ConfirmationExpired {
+		t.Fatalf("expired confirmations = %#v", listed.Items)
+	}
+	store, release, err := handler.acquireStore("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListSessionEvents(context.Background(), "tenant-a", "session-a", 0)
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Type == "tool.confirmation.expired" && event.IdempotencyKey == "request-a:confirmation-expired" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expired confirmation Session Event missing: %#v", events)
+	}
+}
+
 func newHandlerClient(t *testing.T, handler *AdminHandler) (*httptest.Server, *http.Client) {
 	t.Helper()
 	server := httptest.NewServer(handler)

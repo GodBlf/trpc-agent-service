@@ -343,7 +343,9 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = auditWriter
 	started := time.Now()
 	defer func() {
-		if err := h.auditHTTPRequest(context.Background(), r, auditWriter, started); err != nil && auditWriter.buffered {
+		auditCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+		defer cancel()
+		if err := h.auditHTTPRequest(auditCtx, r, auditWriter, started); err != nil && auditWriter.buffered && (auditWriter.status == 0 || auditWriter.status < http.StatusBadRequest) {
 			auditWriter.auditUnavailable()
 		}
 		auditWriter.commit()

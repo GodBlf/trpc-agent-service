@@ -73,7 +73,7 @@ func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
 }
 
 func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
-	result, err := w.runner.Run(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+	result, err := w.runner.Run(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision})
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.lastError.Store(true)
@@ -105,7 +105,7 @@ func (w *StatelessWorker) ExecuteEvents(ctx context.Context, request GatewayRequ
 		}()
 		return events, nil
 	}
-	return streaming.RunEvents(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID})
+	return streaming.RunEvents(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision})
 }
 
 func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {

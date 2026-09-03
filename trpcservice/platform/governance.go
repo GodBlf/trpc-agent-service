@@ -191,35 +191,37 @@ type PlatformTrace struct {
 }
 
 type governanceExecution struct {
-	traceID      string
-	appID        string
-	sessionID    string
-	requestID    string
-	provider     string
-	reserved     int64
-	reservedCost float64
-	costPerToken float64
-	toolCosts    map[string]float64
-	toolCost     float64
-	started      time.Time
-	active       bool
-	expired      bool
+	traceID        string
+	appID          string
+	sessionID      string
+	requestID      string
+	provider       string
+	reserved       int64
+	reservedCost   float64
+	costPerToken   float64
+	policyRevision uint64
+	toolCosts      map[string]float64
+	toolCost       float64
+	started        time.Time
+	active         bool
+	expired        bool
 }
 
 type persistedGovernanceExecution struct {
-	TraceID      string             `json:"trace_id"`
-	AppID        string             `json:"app_id"`
-	SessionID    string             `json:"session_id"`
-	RequestID    string             `json:"request_id"`
-	Provider     string             `json:"provider,omitempty"`
-	Reserved     int64              `json:"reserved"`
-	ReservedCost float64            `json:"reserved_cost"`
-	CostPerToken float64            `json:"cost_per_token"`
-	ToolCosts    map[string]float64 `json:"tool_costs,omitempty"`
-	ToolCost     float64            `json:"tool_cost"`
-	Started      time.Time          `json:"started"`
-	Active       bool               `json:"active"`
-	Expired      bool               `json:"expired,omitempty"`
+	TraceID        string             `json:"trace_id"`
+	AppID          string             `json:"app_id"`
+	SessionID      string             `json:"session_id"`
+	RequestID      string             `json:"request_id"`
+	Provider       string             `json:"provider,omitempty"`
+	Reserved       int64              `json:"reserved"`
+	ReservedCost   float64            `json:"reserved_cost"`
+	CostPerToken   float64            `json:"cost_per_token"`
+	PolicyRevision uint64             `json:"policy_revision"`
+	ToolCosts      map[string]float64 `json:"tool_costs,omitempty"`
+	ToolCost       float64            `json:"tool_cost"`
+	Started        time.Time          `json:"started"`
+	Active         bool               `json:"active"`
+	Expired        bool               `json:"expired,omitempty"`
 }
 
 type rateWindow struct {
@@ -324,7 +326,7 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 		center.executions[key] = governanceExecution{
 			traceID: execution.TraceID, appID: execution.AppID, sessionID: execution.SessionID, requestID: execution.RequestID,
 			provider: execution.Provider, reserved: execution.Reserved, reservedCost: execution.ReservedCost,
-			costPerToken: execution.CostPerToken, toolCosts: cloneToolCosts(execution.ToolCosts), toolCost: execution.ToolCost,
+			costPerToken: execution.CostPerToken, policyRevision: execution.PolicyRevision, toolCosts: cloneToolCosts(execution.ToolCosts), toolCost: execution.ToolCost,
 			started: execution.Started, active: execution.Active, expired: execution.Expired,
 		}
 	}
@@ -433,7 +435,13 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 	result := GovernanceResult{Input: request.Input, TraceID: traceID}
 	policy, configured := g.policies[governanceKey(request.TenantID, request.AgentAppID)]
 	result.PolicyRevision = policy.Revision
+	if seen && prior.policyRevision != 0 {
+		result.PolicyRevision = prior.policyRevision
+	}
 	request.PolicyRevision = policy.Revision
+	if seen && prior.policyRevision != 0 {
+		request.PolicyRevision = prior.policyRevision
+	}
 	g.recordTraceLocked(request, traceID, "gateway.receive", "ok", now)
 	if !seen {
 		metrics := g.metrics[request.TenantID]
@@ -481,6 +489,10 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 	if seen && prior.expired {
 		delete(g.executions, key)
 		seen = false
+	}
+	if !seen {
+		result.PolicyRevision = policy.Revision
+		request.PolicyRevision = policy.Revision
 	}
 	if seen && !prior.active {
 		result.Input = redact(request.Input, policy.RedactedPatterns)
@@ -572,7 +584,7 @@ func (g *GovernanceCenter) allowLocked(request GovernanceRequest, result *Govern
 	result.NewExecution = true
 	g.executions[key] = governanceExecution{
 		traceID: result.TraceID, appID: request.AgentAppID, sessionID: request.SessionID, requestID: request.RequestID,
-		provider: request.Channel, reserved: reserved, reservedCost: reservedCost, costPerToken: policy.CostPerToken,
+		provider: request.Channel, reserved: reserved, reservedCost: reservedCost, costPerToken: policy.CostPerToken, policyRevision: policy.Revision,
 		toolCosts: cloneToolCosts(policy.ToolCosts), started: now, active: true,
 	}
 	metrics := g.metrics[request.TenantID]
@@ -586,6 +598,30 @@ func (g *GovernanceCenter) allowLocked(request GovernanceRequest, result *Govern
 }
 
 const governanceReservationTTL = 15 * time.Minute
+
+func (g *GovernanceCenter) reconcileExpiredConfirmationsLocked(tenantID string, now time.Time) bool {
+	changed := false
+	for id, confirmation := range g.confirmations {
+		if tenantID != "" && confirmation.TenantID != tenantID {
+			continue
+		}
+		if !now.Before(confirmation.ExpiresAt) && (confirmation.Status == ConfirmationPending || confirmation.Status == ConfirmationApproved) {
+			confirmation.Status = ConfirmationExpired
+			confirmation.DecidedAt = now
+			confirmation.CompletedAt = now
+			g.confirmations[id] = confirmation
+			g.appendAuditLocked(AuditEvent{
+				TenantID: confirmation.TenantID, UserID: confirmation.UserID, SessionID: confirmation.SessionID,
+				AgentName: confirmation.AgentAppID, ToolName: confirmation.ToolName, Decision: "tool.confirmation.expired",
+				ErrorType: "confirmation_expired", TraceID: confirmation.TraceID, RequestID: confirmation.RequestID,
+				PolicyRevision: confirmation.PolicyRevision, Checkpoint: "tool.before_call", OccurredAt: now,
+			})
+			g.recordTraceLocked(GovernanceRequest{TenantID: confirmation.TenantID, AgentAppID: confirmation.AgentAppID, SessionID: confirmation.SessionID, RequestID: confirmation.RequestID}, confirmation.TraceID, "tool.confirmation", "expired", now)
+			changed = true
+		}
+	}
+	return changed
+}
 
 func (g *GovernanceCenter) reconcileExpiredReservationsLocked(now time.Time) bool {
 	changed := false
@@ -733,13 +769,16 @@ func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request Governance
 		}
 		return &GovernanceError{Code: code, TraceID: traceID}
 	}
+	if request.PolicyRevision != 0 && policy.Revision != request.PolicyRevision {
+		return deny("policy_revision_stale")
+	}
 	if configured && !contains(policy.AllowedTools, toolName) {
 		return deny("tool_not_allowed")
 	}
 	if configured && contains(policy.DangerousTools, toolName) {
 		confirmationID := "confirmation-" + stableID(request.TenantID+"\x00"+request.RequestID+"\x00"+toolName)
 		confirmation, ok := g.confirmations[confirmationID]
-		argumentSummary := "sha256:" + stableID(string(arguments))
+		argumentSummary := argumentSummary(arguments)
 		if !ok {
 			confirmation = ToolConfirmation{
 				ID: confirmationID, TenantID: request.TenantID, AgentAppID: request.AgentAppID, SessionID: request.SessionID,
@@ -891,6 +930,12 @@ func (g *GovernanceCenter) DecideConfirmation(ctx context.Context, tenantID, id,
 func (g *GovernanceCenter) Confirmations(tenantID string) []ToolConfirmation {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	checkpoint := g.snapshotLocked()
+	if g.reconcileExpiredConfirmationsLocked(tenantID, g.now().UTC()) {
+		if err := g.persistLocked(); err != nil {
+			g.restoreLocked(checkpoint)
+		}
+	}
 	result := []ToolConfirmation{}
 	for _, item := range g.confirmations {
 		if item.TenantID == tenantID {
@@ -1061,12 +1106,39 @@ func (g *GovernanceCenter) RecordSpan(request GovernanceRequest, traceID, name, 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	checkpoint := g.snapshotLocked()
-	g.recordTraceLocked(request, traceID, name, status, g.now().UTC())
+	now := g.now().UTC()
+	if status != "ok" && replaceableTraceSpan(name) {
+		trace := g.traces[traceID]
+		replaced := false
+		for index := len(trace.Spans) - 1; index >= 0; index-- {
+			if trace.Spans[index].Name == name && trace.Spans[index].Status == "ok" {
+				trace.Spans[index].Status = status
+				replaced = true
+				break
+			}
+		}
+		if replaced {
+			g.traces[traceID] = trace
+		} else {
+			g.recordTraceLocked(request, traceID, name, status, now)
+		}
+	} else {
+		g.recordTraceLocked(request, traceID, name, status, now)
+	}
 	if err := g.persistLocked(); err != nil {
 		g.restoreLocked(checkpoint)
 		return err
 	}
 	return nil
+}
+
+func replaceableTraceSpan(name string) bool {
+	switch name {
+	case "worker.execute", "agent_factory.resolve", "runner.run":
+		return true
+	default:
+		return false
+	}
 }
 
 // SetPersistencePath changes the local governance snapshot destination while
@@ -1165,7 +1237,7 @@ func (g *GovernanceCenter) persistLocked() error {
 		persistedExecutions[key] = persistedGovernanceExecution{
 			TraceID: execution.traceID, AppID: execution.appID, SessionID: execution.sessionID, RequestID: execution.requestID,
 			Provider: execution.provider, Reserved: execution.reserved, ReservedCost: execution.reservedCost,
-			CostPerToken: execution.costPerToken, ToolCosts: cloneToolCosts(execution.toolCosts), ToolCost: execution.toolCost,
+			CostPerToken: execution.costPerToken, PolicyRevision: execution.policyRevision, ToolCosts: cloneToolCosts(execution.toolCosts), ToolCost: execution.toolCost,
 			Started: execution.started, Active: execution.active, Expired: execution.expired,
 		}
 	}
@@ -1428,6 +1500,10 @@ func newTraceID() string {
 }
 func stableID(value string) string      { sum := sha256Bytes(value); return hex.EncodeToString(sum[:8]) }
 func sha256Bytes(value string) [32]byte { return sha256.Sum256([]byte(value)) }
+func argumentSummary(arguments []byte) string {
+	sum := sha256.Sum256(arguments)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 func confirmationForRequestLocked(items map[string]ToolConfirmation, tenantID, requestID string) string {
 	for _, item := range items {
 		if item.TenantID == tenantID && item.RequestID == requestID {

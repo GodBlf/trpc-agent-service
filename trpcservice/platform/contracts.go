@@ -83,15 +83,16 @@ type DeploymentVersion struct {
 }
 
 type GatewayRequest struct {
-	TenantID     string `json:"-"`
-	AppID        string `json:"app_id"`
-	SessionID    string `json:"session_id"`
-	UserID       string `json:"-"`
-	Input        string `json:"input"`
-	RequestID    string `json:"-"`
-	TraceID      string `json:"-"`
-	DeploymentID string `json:"-"`
-	VersionID    string `json:"-"`
+	TenantID       string `json:"-"`
+	AppID          string `json:"app_id"`
+	SessionID      string `json:"session_id"`
+	UserID         string `json:"-"`
+	Input          string `json:"input"`
+	RequestID      string `json:"-"`
+	TraceID        string `json:"-"`
+	DeploymentID   string `json:"-"`
+	VersionID      string `json:"-"`
+	PolicyRevision uint64 `json:"-"`
 }
 
 type GatewayResponse struct {
@@ -127,15 +128,16 @@ type SessionEvent struct {
 }
 
 type RunnerRequest struct {
-	TenantID     string
-	AppID        string
-	SessionID    string
-	UserID       string
-	Input        string
-	RequestID    string
-	TraceID      string
-	DeploymentID string
-	VersionID    string
+	TenantID       string
+	AppID          string
+	SessionID      string
+	UserID         string
+	Input          string
+	RequestID      string
+	TraceID        string
+	DeploymentID   string
+	VersionID      string
+	PolicyRevision uint64
 }
 
 type RunnerResponse struct {

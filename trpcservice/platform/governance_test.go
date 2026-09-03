@@ -375,6 +375,9 @@ func TestGovernanceCenterAuthorizesActualToolCallAndHashesArguments(t *testing.T
 	if confirmation.ArgumentSummary == "" || strings.Contains(confirmation.ArgumentSummary, "stage5-secret-target") {
 		t.Fatalf("argument summary = %q", confirmation.ArgumentSummary)
 	}
+	if len(confirmation.ArgumentSummary) != len("sha256:")+64 {
+		t.Fatalf("argument summary is not a full SHA-256 digest: %q", confirmation.ArgumentSummary)
+	}
 	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "unknown", nil); !IsGovernanceError(err, "tool_not_allowed") {
 		t.Fatalf("unknown Tool error = %v", err)
 	}
@@ -387,6 +390,26 @@ func containsAuditDecision(events []AuditEvent, decision string) bool {
 		}
 	}
 	return false
+}
+
+func TestGovernanceToolAuthorizationRejectsStaleAdmissionPolicyRevision(t *testing.T) {
+	center := NewGovernanceCenter()
+	policy := TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}}
+	if _, err := center.PutPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", SessionID: "session-a", RequestID: "request-a"}
+	result, err := center.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := center.PutPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	request.PolicyRevision = result.PolicyRevision
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"stage5"}`)); !IsGovernanceError(err, "policy_revision_stale") {
+		t.Fatalf("stale policy authorization = %v", err)
+	}
 }
 
 func TestGovernanceCenterEnforcesBudgetRateAndIMAuthorization(t *testing.T) {

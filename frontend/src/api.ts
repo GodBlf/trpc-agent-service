@@ -70,7 +70,18 @@ export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external
 export interface ProviderDelivery { provider: BotRoute["provider"]; external_subject: string; tenant_id: string; app_id: string; request_id: string; status: "accepted" | "retried" | "rejected" | "delivered" | "terminal_failed"; code?: string; attempts: number; updated_at: string }
 export interface TenantPolicy { tenant_id: string; agent_app_id: string; revision: number; allowed_tools: string[]; allowed_mcp: string[]; dangerous_tools: string[]; denied_input_patterns: string[]; denied_output_patterns: string[]; redacted_patterns: string[]; allowed_im_users: string[]; allowed_im_subjects: string[]; token_budget: number; cost_budget: number; cost_per_token: number; tool_costs: Record<string, number>; estimated_tokens_per_run: number; rate_limit: number; rate_window_seconds: number; updated_at?: string }
 export interface AuditEvent { id: string; tenant_id: string; channel?: string; user_id?: string; session_id?: string; agent_name?: string; tool_name?: string; decision: string; latency: number; error_type?: string; cost: number; trace_id: string; request_id?: string; occurred_at: string; policy_revision?: number; checkpoint?: string; rule?: string; reason?: string }
-export interface AuditFilters { decision?: string; request_id?: string; trace_id?: string }
+export interface AuditFilters {
+  from?: string;
+  to?: string;
+  channel?: string;
+  user_id?: string;
+  session_id?: string;
+  agent_name?: string;
+  decision?: string;
+  error_type?: string;
+  request_id?: string;
+  trace_id?: string;
+}
 export interface MetricsFilters { app_id?: string; provider?: ChannelProvider | ""; from?: string; to?: string }
 export interface TenantMetrics { tenant_id: string; requests: number; active_executions: number; completed_executions: number; failed_executions: number; denied_requests: number; rate_limited_requests: number; tokens: number; cost: number; model_latency_ms: number; tool_latency_ms: number; storage_latency_ms: number; im_delivered: number; im_failed: number; token_budget: number; tokens_remaining: number; cost_budget: number; cost_remaining: number; budget_period_from?: string }
 export interface ToolConfirmation { id: string; tenant_id: string; agent_app_id: string; session_id: string; request_id: string; user_id: string; tool_name: string; argument_summary: string; policy_revision: number; trace_id: string; status: "pending" | "approved" | "rejected" | "expired" | "running" | "completed" | "failed" | "cancelled"; created_at: string; expires_at: string; decided_at?: string; decided_by?: string; invoked_at?: string; completed_at?: string }

@@ -131,7 +131,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 		}
 		err := p.center.AuthorizeTool(ctx, GovernanceRequest{
 			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID,
+			SessionID: request.SessionID, RequestID: request.RequestID, PolicyRevision: request.PolicyRevision,
 		}, request.TraceID, args.ToolName, args.Arguments)
 		if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
 			if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
@@ -147,7 +147,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 		}
 		err := p.center.CompleteTool(ctx, GovernanceRequest{
 			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID,
+			SessionID: request.SessionID, RequestID: request.RequestID, PolicyRevision: request.PolicyRevision,
 		}, request.TraceID, args.ToolName, args.Error)
 		return nil, err
 	})

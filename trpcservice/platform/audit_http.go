@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -72,6 +73,9 @@ func (h *AdminHandler) auditHTTPRequest(ctx context.Context, r *http.Request, re
 		status = http.StatusOK
 	}
 	if r.Method == http.MethodGet && status < http.StatusBadRequest && r.URL.Path != "/api/v1/auth/me" {
+		return nil
+	}
+	if r.Method != http.MethodGet && status < http.StatusBadRequest && strings.HasPrefix(r.URL.Path, "/api/v1/admin/governance/") {
 		return nil
 	}
 	decision := "http.allowed"

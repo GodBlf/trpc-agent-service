@@ -1173,7 +1173,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
 	governanceRequest := h.governanceRequest(options)
 	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
-		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID,
+		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID, PolicyRevision: options.policyRevision,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "confirmation_required") {
@@ -1238,9 +1238,11 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		if runtimeEvent.Type == "run.failed" {
 			if strings.Contains(runtimeEvent.Data["error"], "confirmation_required") {
+				_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
 				h.appendPendingConfirmationEvent(store, options)
 				return
 			}
+			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
 			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"}); err != nil {
 				return
 			}
@@ -1256,6 +1258,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 		if runtimeEvent.Type == "run.cancelled" {
+			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
 			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "cancelled"}); err != nil {
 				return
 			}
@@ -1384,7 +1387,7 @@ func (h *AdminHandler) chatIdentityPayload(options chatRunOptions, values map[st
 func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceRequest {
 	request := GovernanceRequest{
 		TenantID: options.tenant.TenantID, AgentAppID: options.appID, UserID: options.userID,
-		SessionID: options.sessionID, RequestID: options.requestID, Input: options.input,
+		SessionID: options.sessionID, RequestID: options.requestID, Input: options.input, PolicyRevision: options.policyRevision,
 	}
 	if options.binding != nil {
 		request.Channel = options.binding.Channel
@@ -1435,6 +1438,9 @@ func (h *AdminHandler) appendCriticalChatEvent(ctx context.Context, store DataSt
 	for {
 		err := h.appendChatEvent(ctx, store, tenantID, sessionID, idempotencyKey, eventType, payload)
 		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrDuplicateEvent) {
 			return nil
 		}
 		select {

@@ -91,7 +91,10 @@ func NewDeterministicToolAgent(name, toolName string) frameworkagent.Agent {
 	return llmagent.New(name, llmagent.WithModel(modelStub), llmagent.WithTools([]tool.Tool{toolStub}))
 }
 
-func (m *deterministicToolModel) GenerateContent(_ context.Context, request *model.Request) (<-chan *model.Response, error) {
+func (m *deterministicToolModel) GenerateContent(ctx context.Context, request *model.Request) (<-chan *model.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	message := model.Message{
 		Role: model.RoleAssistant,
 		ToolCalls: []model.ToolCall{{
