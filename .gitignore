@@ -3,6 +3,7 @@
 .DS_Store
 *.log
 *.swp
+.env.local
 
 bin/
 dist/

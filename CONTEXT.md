@@ -133,3 +133,39 @@ _Avoid_: tenant_id request field, Production Identity
 **Real IM Provider**:
 通过真实平台协议实现 Channel Adapter 的外部消息提供方；本项目要求的两个实现为 Enterprise WeChat 和 Telegram。
 _Avoid_: Mock IM, Chat Workspace
+
+**IM Simulator**:
+Management Console 中用于模拟外部 IM 入站消息、Session 路由和回复投递的本地验证工具；它验证 Channel Adapter 流程，但不属于 Real IM Provider。
+_Avoid_: Real IM, Chat Workspace
+
+**Bot Tenant Allowlist**:
+将一个真实 IM Bot 的外部用户或群组标识绑定到一个或多个 Tenant 的受控映射，用于多租户 Bot 路由。
+_Avoid_: Tenant Context, User Identity
+
+**Provider Account**:
+平台级外部 IM 账号，例如一个可服务多个 Tenant 的 Telegram Bot 或 WeCom Smart Bot；它拥有 provider 身份和连接状态，但不归属于任一 Tenant。
+_Avoid_: Channel Binding, Agent App
+
+**External IM Subject**:
+Provider Account 中可被路由的外部会话或用户标识；Telegram 群聊使用 `chat_id`，私聊优先使用 `chat_id` 并允许 `user_id` 兜底。
+_Avoid_: Tenant User, Session
+
+**Delivery Status**:
+Channel Adapter 对一次入站、路由或出站处理的稳定结果，例如 delivered、unmapped、duplicate 或 failed。
+_Avoid_: Session Event, Audit Event
+
+**WeCom Smart Bot**:
+企业微信 API 模式的智能机器人，使用 BotID 和长连接 Secret 通过 WebSocket 接收 `aibot_msg_callback` 并发送 `aibot_respond_msg`；它不同于传统企业微信应用回调。
+_Avoid_: WeCom App, WeCom Webhook App
+
+**Provider Transport**:
+Real IM Provider 与平台之间的消息传输方式；本项目的 Telegram 传输为 long polling，WeCom Smart Bot 传输为 WebSocket 长连接。两者都不是传统企微自建应用 webhook。
+_Avoid_: Channel Adapter, Delivery Status
+
+**WeCom App**:
+传统企业微信自建应用及其 CorpID、AgentID、应用 Secret 和 Access Token 体系；本项目 Stage 4 不使用该接入类型。
+_Avoid_: WeCom Smart Bot, Provider Account
+
+**Bot Credential**:
+平台级 Provider Account 的进程启动凭据；本阶段包括 `TRPC_TELEGRAM_BOT_USERNAME`、`TRPC_TELEGRAM_BOT_TOKEN`、`TRPC_WECOM_BOT_ID` 和 `TRPC_WECOM_BOT_SECRET`，只从服务端环境读取，不进入租户绑定或浏览器状态。
+_Avoid_: Tenant Secret, Browser Credential

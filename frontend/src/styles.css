@@ -128,12 +128,17 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .chat-actions > button:not(.primary) { border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 9px 12px; }
 .chat-status { display: flex; align-items: center; gap: 7px; color: #68756f; font-size: 12px; }
 .chat-status svg { width: 15px; }
+.channels-page { display: grid; gap: 16px; }
+.channel-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: end; background: white; border: 1px solid #dce3df; border-radius: 8px; padding: 16px; }
+.channel-form label { display: grid; gap: 6px; color: #68756f; font-size: 12px; }
+.channel-form input, .channel-form select { border: 1px solid #cbd5d0; border-radius: 6px; padding: 8px 10px; background: white; }
+.channel-form button { justify-self: start; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 720px) {
   .app-shell { grid-template-columns: 1fr; padding-bottom: 64px; }
   aside { position: fixed; z-index: 10; bottom: 0; left: 0; right: 0; padding: 6px; }
   .brand { display: none; }
-  nav { margin: 0; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  nav { margin: 0; grid-template-columns: repeat(8, minmax(0, 1fr)); }
   nav button { height: 52px; padding: 4px; justify-content: center; flex-direction: column; gap: 1px; font-size: 10px; }
   nav svg { width: 18px; }
   header { padding: 10px 16px; gap: 12px; flex-wrap: wrap; }
@@ -150,4 +155,5 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
   .chat-page { height: calc(100vh - 220px); min-height: 430px; }
   .chat-toolbar { align-items: stretch; flex-direction: column; }
   .chat-composer { grid-template-columns: 1fr; }
+  .channel-form { grid-template-columns: 1fr; }
 }

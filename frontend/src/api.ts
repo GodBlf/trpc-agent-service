@@ -50,6 +50,23 @@ export interface MockFaultConfiguration {
   timeout_ms: number;
   retry_limit: number;
 }
+export type ChannelProvider = "mock" | "enterprise_wechat" | "telegram";
+export interface ChannelBinding {
+  id: string;
+  tenant_id: string;
+  app_id: string;
+  channel: ChannelProvider;
+  conversation_type: "single" | "group";
+  external_conversation_id: string;
+  external_user_id: string;
+  session_id: string;
+  enabled: boolean;
+  created_at: string;
+  secret?: string;
+}
+export interface ProviderStatus { provider: string; status: string; credential_smoke_status: "not_run" | "unavailable" | "passed"; last_error?: string }
+export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group"; enabled: boolean }
+export interface ProviderDelivery { provider: BotRoute["provider"]; external_subject: string; tenant_id: string; app_id: string; request_id: string; status: "accepted" | "retried" | "rejected" | "delivered" | "terminal_failed"; code?: string; attempts: number; updated_at: string }
 
 export class APIError extends Error {
   constructor(
@@ -67,6 +84,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
+  if (response.status === 204) return undefined as T;
   const body = (await response.json()) as T | { error: { code: string; message: string } };
   if (!response.ok) {
     const error = (body as { error?: { code?: string; message?: string } }).error;
@@ -117,4 +135,16 @@ export const api = {
     request<MockFaultConfiguration>("/api/v1/chat/mock/faults", {
       method: "POST", body: JSON.stringify({ scenario, session_id: id }),
     }),
+  bindings: () => request<ListResponse<ChannelBinding>>("/api/v1/chat/bindings"),
+  createBinding: (input: { channel: ChannelProvider; app_id: string; conversation_type: "single" | "group"; external_conversation_id: string; external_user_id: string }) =>
+    request<ChannelBinding>("/api/v1/chat/bindings", { method: "POST", body: JSON.stringify(input) }),
+  setBindingEnabled: (id: string, enabled: boolean) => request<ChannelBinding>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }),
+  deleteBinding: (id: string) => request<void>(`/api/v1/chat/bindings/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  providerStatuses: () => request<ListResponse<ProviderStatus>>("/api/v1/admin/providers/status"),
+  providerRoutes: () => request<ListResponse<BotRoute>>("/api/v1/admin/providers/routes"),
+  providerDeliveries: () => request<ListResponse<ProviderDelivery>>("/api/v1/admin/providers/deliveries"),
+  createProviderRoute: (route: BotRoute) => request<BotRoute>("/api/v1/admin/providers/routes", { method: "POST", body: JSON.stringify(route) }),
+  updateProviderRoute: (route: BotRoute) => request<BotRoute>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "PATCH", body: JSON.stringify({ tenant_id: route.tenant_id, app_id: route.app_id, conversation_type: route.conversation_type, enabled: route.enabled }) }),
+  deleteProviderRoute: (route: BotRoute) => request<void>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "DELETE" }),
+  replayProviderRoute: (route: BotRoute, text: string) => request<ChatRunResponse>("/api/v1/admin/providers/replay", { method: "POST", body: JSON.stringify({ provider: route.provider, external_subject: route.external_subject, text }) }),
 };

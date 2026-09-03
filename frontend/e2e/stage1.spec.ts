@@ -120,12 +120,12 @@ test("complete Stage 1 management workflow", async ({ page }, testInfo) => {
 
   const first = await createActiveTenantApp(page, suffix, "one", true);
   const firstRun = await runApp(page, first.appId, `session-${suffix}-one`, "hello-one");
-  expect(firstRun).toEqual({ status: 200, body: { session_id: `session-${suffix}-one`, output: "echo:hello-one" } });
+  expect(firstRun).toEqual({ status: 200, body: { session_id: `session-${suffix}-one`, output: "framework:hello-one" } });
   await verifyCompetingActivation(page, first.appId, `candidate-${suffix}-one`);
 
   const second = await createActiveTenantApp(page, suffix, "two");
   const secondRun = await runApp(page, second.appId, `session-${suffix}-two`, "hello-two");
-  expect(secondRun).toEqual({ status: 200, body: { session_id: `session-${suffix}-two`, output: "echo:hello-two" } });
+  expect(secondRun).toEqual({ status: 200, body: { session_id: `session-${suffix}-two`, output: "framework:hello-two" } });
   const crossTenant = await runApp(page, first.appId, `session-${suffix}-cross`, "guess");
   expect(crossTenant.status).toBe(404);
   expect(crossTenant.body.error?.code).toBe("active_deployment_not_found");
