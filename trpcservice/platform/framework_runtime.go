@@ -12,6 +12,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
+	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 type RuntimeEvent struct {
@@ -102,6 +103,17 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 			p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.after_agent", "ok")
 		}
 		return nil, nil
+	})
+	registry.BeforeTool(func(ctx context.Context, args *frameworktool.BeforeToolArgs) (*frameworktool.BeforeToolResult, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		if !ok || p.center == nil {
+			return nil, nil
+		}
+		err := p.center.AuthorizeTool(ctx, GovernanceRequest{
+			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
+			SessionID: request.SessionID, RequestID: request.RequestID,
+		}, request.TraceID, args.ToolName, args.Arguments)
+		return nil, err
 	})
 }
 

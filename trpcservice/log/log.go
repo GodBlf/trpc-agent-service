@@ -2,12 +2,30 @@
 package log
 
 import (
+	"io"
 	"net/url"
 	"sort"
 	"strings"
 )
 
 type Redactor struct{ values []string }
+
+type RedactingWriter struct {
+	destination io.Writer
+	redactor    Redactor
+}
+
+func NewRedactingWriter(destination io.Writer, redactor Redactor) io.Writer {
+	return &RedactingWriter{destination: destination, redactor: redactor}
+}
+
+func (w *RedactingWriter) Write(data []byte) (int, error) {
+	redacted := []byte(w.redactor.Redact(string(data)))
+	if _, err := w.destination.Write(redacted); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
 
 func NewRedactor(secrets, patterns []string) Redactor {
 	seen := map[string]bool{}

@@ -339,10 +339,15 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	auditWriter := &auditResponseWriter{ResponseWriter: w}
+	auditWriter := &auditResponseWriter{ResponseWriter: w, buffered: r.Method != http.MethodGet}
 	w = auditWriter
 	started := time.Now()
-	defer h.auditHTTPRequest(context.Background(), r, auditWriter, started)
+	defer func() {
+		if err := h.auditHTTPRequest(context.Background(), r, auditWriter, started); err != nil && auditWriter.buffered && auditWriter.status < http.StatusBadRequest {
+			auditWriter.auditUnavailable()
+		}
+		auditWriter.commit()
+	}()
 	if isDataPath(r.URL.Path) {
 		trusted := h.trustedRequest(w, r)
 		if trusted == nil {

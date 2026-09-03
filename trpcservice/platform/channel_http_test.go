@@ -128,6 +128,9 @@ func TestMockChannelSignedCallbackRunsAndRepliesWithoutDuplicates(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for callback run")
 	}
+	if err := waitForChatEvent(client, binding.SessionID, "channel.reply"); err != nil {
+		t.Fatal(err)
+	}
 
 	var events struct {
 		Items []SessionEvent `json:"items"`

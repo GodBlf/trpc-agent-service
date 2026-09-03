@@ -45,5 +45,13 @@ test("govern governance decisions and inspect their trace without secret disclos
   await expect(page.getByText("gateway.receive").first()).toBeVisible();
   await expect(page.getByText("policy.evaluate").first()).toBeVisible();
   expect(await page.locator("body").innerText()).not.toContain(secretCanary);
+  const exposedOperationalState = await page.evaluate(async ({ sessionID }) => {
+    const [events, audits] = await Promise.all([
+      fetch(`/api/v1/admin/sessions/${sessionID}/events`).then((response) => response.text()),
+      fetch("/api/v1/admin/governance/audit").then((response) => response.text()),
+    ]);
+    return JSON.stringify({ events, audits, local: { ...localStorage }, session: { ...sessionStorage } });
+  }, { sessionID });
+  expect(exposedOperationalState).not.toContain(secretCanary);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });

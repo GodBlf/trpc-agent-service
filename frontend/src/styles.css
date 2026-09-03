@@ -152,7 +152,7 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .policy-grid label, .trace-toolbar label, .audit-filters label { display: grid; gap: 6px; color: #68756f; font-size: 12px; min-width: 0; }
 .policy-grid input, .policy-grid select, .trace-toolbar input, .audit-filters input { min-width: 0; width: 100%; border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 8px 10px; }
 .row-actions { display: flex; gap: 4px; }
-.metrics-strip { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); border-top: 1px solid #dce3df; border-bottom: 1px solid #dce3df; }
+.metrics-strip { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); overflow-x: auto; border-top: 1px solid #dce3df; border-bottom: 1px solid #dce3df; }
 .metric-item { min-height: 92px; padding: 14px; display: grid; grid-template-columns: 22px 1fr; align-items: center; border-right: 1px solid #dce3df; }
 .metric-item:last-child { border-right: 0; }
 .metric-item svg { width: 18px; color: #36735f; }

@@ -5,16 +5,17 @@ import type { Identity } from "./api";
 
 test("platform administrator can disable and delete a bot tenant route", async () => {
   const route = { provider: "telegram", external_subject: "chat-1", tenant_id: "tenant-one", app_id: "app-one", conversation_type: "single", enabled: true };
+  let replayed = false;
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
     if (path === "/api/v1/chat/bindings") return { ok: true, status: 200, json: async () => ({ items: [] }) };
     if (path === "/api/v1/admin/agent-apps") return { ok: true, status: 200, json: async () => ({ items: [{ id: "app-one", name: "App One" }] }) };
     if (path === "/api/v1/admin/providers/status") return { ok: true, status: 200, json: async () => ({ items: [{ provider: "telegram", status: "connected", credential_smoke_status: "not_run" }] }) };
     if (path === "/api/v1/admin/providers/routes" && !init?.method) return { ok: true, status: 200, json: async () => ({ items: [route] }) };
-    if (path === "/api/v1/admin/providers/deliveries") return { ok: true, status: 200, json: async () => ({ items: [] }) };
+    if (path === "/api/v1/admin/providers/deliveries") return { ok: true, status: 200, json: async () => ({ items: replayed ? [{ provider: "telegram", external_subject: "chat-1", request_id: "channel-replay", status: "delivered", attempts: 1 }] : [] }) };
     if (path.startsWith("/api/v1/admin/providers/routes?") && init?.method === "PATCH") return { ok: true, status: 200, json: async () => ({ ...route, enabled: false }) };
     if (path.startsWith("/api/v1/admin/providers/routes?") && init?.method === "DELETE") return { ok: true, status: 204, json: async () => ({}) };
-    if (path === "/api/v1/admin/providers/replay" && init?.method === "POST") return { ok: true, status: 202, json: async () => ({ session_id: "replay-session", request_id: "channel-replay", status: "running" }) };
+    if (path === "/api/v1/admin/providers/replay" && init?.method === "POST") { replayed = true; return { ok: true, status: 202, json: async () => ({ session_id: "replay-session", request_id: "channel-replay", status: "running" }) }; }
     throw new Error(`unexpected request: ${init?.method ?? "GET"} ${path}`);
   });
   vi.stubGlobal("fetch", fetchMock);

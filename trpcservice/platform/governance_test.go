@@ -3,10 +3,35 @@ package platform
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	center := NewGovernanceCenter()
+	center.path = filepath.Join(blocker, "governance.json")
+	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a"}); err == nil {
+		t.Fatal("policy update succeeded without durable audit")
+	}
+	if _, found := center.Policy("tenant-a", "app-a"); found {
+		t.Fatal("failed policy update remained active in memory")
+	}
+	center.policies[governanceKey("tenant-a", "app-a")] = TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", Revision: 1}
+	_, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Input: "hello"})
+	if !IsGovernanceError(err, "audit_unavailable") {
+		t.Fatalf("evaluate error = %v", err)
+	}
+	if metrics := center.Metrics("tenant-a"); metrics.Requests != 0 || metrics.Active != 0 {
+		t.Fatalf("rolled back metrics = %#v", metrics)
+	}
+}
 
 func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "governance.json")
@@ -21,6 +46,7 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	if err := center.Record(context.Background(), AuditEvent{TenantID: "tenant-a", Decision: "authorization.denied", TraceID: "trace-a"}); err != nil {
 		t.Fatal(err)
 	}
+	center.RecordSpan(GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a"}, "trace-a", "gateway.receive", "ok")
 
 	reloaded, err := NewPersistentGovernanceCenter(path)
 	if err != nil {
@@ -33,6 +59,9 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	audits := reloaded.AuditEvents(AuditQuery{TenantID: "tenant-a", Limit: 10})
 	if len(audits) != 2 || audits[0].Decision != "authorization.denied" {
 		t.Fatalf("audits = %#v", audits)
+	}
+	if trace, found := reloaded.Trace("tenant-a", "trace-a", ""); !found || len(trace.Spans) != 1 {
+		t.Fatalf("trace = %#v, found = %v", trace, found)
 	}
 }
 
@@ -64,7 +93,7 @@ func TestGovernanceCenterEnforcesPolicyBeforeExecutionAndRecordsAudit(t *testing
 	if err != nil || allowed.Input != "hello [REDACTED]" || allowed.TraceID == "" {
 		t.Fatalf("result = %#v, err = %v", allowed, err)
 	}
-	center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-allowed", Output: "done", Tokens: 4})
+	_, _ = center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-allowed", Output: "done", Tokens: 4})
 
 	audits := center.AuditEvents(AuditQuery{TenantID: "tenant-a", Limit: 20})
 	if len(audits) < 3 {
@@ -95,9 +124,12 @@ func TestGovernanceCenterBlocksOutputBeforeCompletionAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := center.Complete(context.Background(), GovernanceCompletion{
+	output, err := center.Complete(context.Background(), GovernanceCompletion{
 		TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Output: "contains forbidden-output",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if output != "[REDACTED]" {
 		t.Fatalf("output = %q", output)
 	}
@@ -163,6 +195,25 @@ func TestGovernanceCenterRequiresDangerousToolConfirmationExactlyOnce(t *testing
 	second, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "admin-a", true)
 	if err != nil || second.DecidedAt != confirmation.DecidedAt {
 		t.Fatalf("idempotent decision = %#v, err = %v", second, err)
+	}
+}
+
+func TestGovernanceCenterAuthorizesActualToolCallAndHashesArguments(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "user-a", SessionID: "session-a", RequestID: "request-a", RequiredTools: []string{"deploy"}}
+	result, _ := center.Evaluate(context.Background(), request)
+	_, _ = center.DecideConfirmation(context.Background(), "tenant-a", result.ConfirmationID, "admin-a", true)
+	arguments := []byte(`{"target":"stage5-secret-target"}`)
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); err != nil {
+		t.Fatal(err)
+	}
+	confirmation := center.Confirmations("tenant-a")[0]
+	if confirmation.ArgumentSummary == "" || strings.Contains(confirmation.ArgumentSummary, "stage5-secret-target") {
+		t.Fatalf("argument summary = %q", confirmation.ArgumentSummary)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "unknown", nil); !IsGovernanceError(err, "tool_not_allowed") {
+		t.Fatalf("unknown Tool error = %v", err)
 	}
 }
 

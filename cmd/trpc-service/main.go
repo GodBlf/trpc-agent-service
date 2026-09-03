@@ -13,11 +13,17 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
+	servicelog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/platform"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
 func main() {
+	redactor := servicelog.NewRedactor([]string{
+		os.Getenv("TRPC_AUTH_HMAC_SECRET"), os.Getenv("TRPC_TELEGRAM_BOT_TOKEN"), os.Getenv("TRPC_WECOM_BOT_SECRET"),
+		os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_BACKEND_SELECTIONS"),
+	}, nil)
+	log.SetOutput(servicelog.NewRedactingWriter(os.Stderr, redactor))
 	defaultAddr := os.Getenv("TRPC_SERVICE_ADDR")
 	if defaultAddr == "" {
 		defaultAddr = ":8080"

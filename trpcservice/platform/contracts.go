@@ -212,20 +212,24 @@ type StorageAdapter interface {
 }
 
 type AuditEvent struct {
-	ID         string        `json:"id"`
-	TenantID   string        `json:"tenant_id"`
-	Channel    string        `json:"channel,omitempty"`
-	UserID     string        `json:"user_id,omitempty"`
-	SessionID  string        `json:"session_id,omitempty"`
-	AgentName  string        `json:"agent_name,omitempty"`
-	ToolName   string        `json:"tool_name,omitempty"`
-	Decision   string        `json:"decision"`
-	Latency    time.Duration `json:"latency"`
-	ErrorType  string        `json:"error_type,omitempty"`
-	Cost       float64       `json:"cost"`
-	TraceID    string        `json:"trace_id"`
-	RequestID  string        `json:"request_id,omitempty"`
-	OccurredAt time.Time     `json:"occurred_at"`
+	ID             string        `json:"id"`
+	TenantID       string        `json:"tenant_id"`
+	Channel        string        `json:"channel,omitempty"`
+	UserID         string        `json:"user_id,omitempty"`
+	SessionID      string        `json:"session_id,omitempty"`
+	AgentName      string        `json:"agent_name,omitempty"`
+	ToolName       string        `json:"tool_name,omitempty"`
+	Decision       string        `json:"decision"`
+	Latency        time.Duration `json:"latency"`
+	ErrorType      string        `json:"error_type,omitempty"`
+	Cost           float64       `json:"cost"`
+	TraceID        string        `json:"trace_id"`
+	RequestID      string        `json:"request_id,omitempty"`
+	OccurredAt     time.Time     `json:"occurred_at"`
+	PolicyRevision uint64        `json:"policy_revision,omitempty"`
+	Checkpoint     string        `json:"checkpoint,omitempty"`
+	Rule           string        `json:"rule,omitempty"`
+	Reason         string        `json:"reason,omitempty"`
 }
 
 type AuditSink interface {

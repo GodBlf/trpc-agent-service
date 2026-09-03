@@ -51,7 +51,9 @@ increasing revision. It contains Tool and MCP allowlists, dangerous Tool names,
 input/output Guardrail patterns, write-only redaction patterns, allowed external
 IM users and subjects, token/cost budgets, estimated reservation size, model
 cost, and a Tenant request-limit window. Requests cannot supply or override this
-policy.
+policy. Updating a policy starts a new budget accounting period and resets that
+Tenant's consumed token/cost balance; metrics expose the period start, limits,
+consumption, and remaining allowance.
 
 The request path is:
 
@@ -81,8 +83,10 @@ All endpoints derive Tenant Context from authentication middleware:
 Audit search supports `from`, `to`, `user_id`, `channel`, `session_id`,
 `agent_name`, `decision`, `error_type`, `request_id`, `trace_id`, `offset`, and
 `limit`; the maximum page size is 200. Audit records are append-only through the
-public API. Policy redaction patterns are write-only and reads return only
-`[REDACTED]` placeholders.
+public API. Successful mutation responses are buffered until their Audit Event
+is durably accepted and otherwise become `503 audit_unavailable`. Policy
+redaction patterns are write-only and reads return only `[REDACTED]`
+placeholders.
 
 ## Audit, Metrics, And Traces
 
@@ -101,7 +105,9 @@ The platform trace model is deliberately independent of upstream telemetry
 types. `trace_id` follows browser/provider ingress, policy, Gateway, Worker,
 AgentFactory, Runner, Tool authorization, storage, and reply. Lookup is
 Tenant-scoped by trace or request ID. This is an equivalent bounded trace model,
-not an OTLP exporter.
+not an OTLP exporter. Each span has a stable span ID and the preceding operation
+as its parent, forming an inspectable causal chain. Trace snapshots persist with
+governance state.
 
 ## Persistence And Limitations
 
@@ -115,4 +121,3 @@ Redaction is applied at platform logs, policy responses, Runner input/output,
 Audit/Trace attributes, public errors, and Provider diagnostics. Explicitly
 clearing an existing write-only redaction pattern is not modeled: a policy
 update containing only placeholders preserves the stored values.
-

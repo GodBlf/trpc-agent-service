@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -86,6 +88,19 @@ func TestBackendAuthorizationDenialProducesAuditEvent(t *testing.T) {
 	}
 }
 
+func TestSuccessfulMutationBecomesAuditUnavailableWhenAuditCannotPersist(t *testing.T) {
+	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RolePlatformAdmin}}})
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler.governance.path = filepath.Join(blocker, "governance.json")
+	server, client := newHandlerClient(t, handler)
+	defer server.Close()
+	response := postJSONWithKey(t, client, server.URL+"/api/v1/admin/tenants", `{"id":"tenant-new","name":"Tenant New"}`, "")
+	assertAPIError(t, response, http.StatusServiceUnavailable, "audit_unavailable")
+}
+
 func TestGovernancePolicyRunsBeforeChatRunnerAndPropagatesTrace(t *testing.T) {
 	runs := make(chan RunnerRequest, 2)
 	client := newChannelTestClient(t, requestCapturingRunner{requests: runs})
@@ -129,6 +144,79 @@ func TestGovernancePolicyRunsBeforeChatRunnerAndPropagatesTrace(t *testing.T) {
 	}
 	t.Fatal("completion audit was not recorded")
 }
+
+func TestStorageStartFailureReleasesGovernanceReservation(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.handler.ConfigureDataStore(&listFailingStore{DataStore: NewInMemoryStore()})
+	client.activateApp("app-one", "deploy-one")
+	_, _ = client.handler.governance.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "app-one", TokenBudget: 1, EstimatedTokensPerRun: 1,
+	})
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+	response := client.do(http.MethodPost, "/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-storage-failure"})
+	assertChannelAPIError(t, response, http.StatusServiceUnavailable, "storage_error")
+	metrics := client.handler.governance.Metrics("tenant-one")
+	if metrics.Active != 0 || metrics.Tokens != 0 || metrics.Failed != 1 {
+		t.Fatalf("metrics after storage failure = %#v", metrics)
+	}
+}
+
+type listFailingStore struct {
+	DataStore
+	calls int
+}
+
+func (s *listFailingStore) ListSessionEvents(ctx context.Context, tenantID, sessionID string, after uint64) ([]SessionEvent, error) {
+	s.calls++
+	if s.calls > 1 {
+		return nil, errors.New("storage unavailable")
+	}
+	return s.DataStore.ListSessionEvents(ctx, tenantID, sessionID, after)
+}
+
+func TestOutputGuardrailBuffersSplitSecretBeforeSessionPersistence(t *testing.T) {
+	client := newChannelTestClient(t, splitSecretRunner{})
+	client.activateApp("app-one", "deploy-one")
+	_, _ = client.handler.governance.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "app-one", DeniedOutputPatterns: []string{"stage5-secret"},
+	})
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-split"}, http.StatusAccepted, nil)
+	if err := waitForChatEvent(client, "session-one", "run.completed"); err != nil {
+		t.Fatal(err)
+	}
+	events := chatEventsForTest(t, client, "session-one")
+	redacted := false
+	for _, event := range events {
+		if bytes.Contains(event.Payload, []byte("stage5-secret")) {
+			t.Fatalf("secret persisted in Session Event: %s", event.Payload)
+		}
+		if bytes.Contains(event.Payload, []byte("[REDACTED]")) {
+			redacted = true
+		}
+	}
+	if !redacted {
+		t.Fatalf("redacted output missing: %#v", events)
+	}
+}
+
+type splitSecretRunner struct{}
+
+func (splitSecretRunner) Run(context.Context, RunnerRequest) (RunnerResponse, error) {
+	return RunnerResponse{Output: "stage5-secret"}, nil
+}
+
+func (splitSecretRunner) RunEvents(_ context.Context, request RunnerRequest) (<-chan RuntimeEvent, error) {
+	events := make(chan RuntimeEvent, 4)
+	events <- RuntimeEvent{Type: "message.delta", Data: map[string]string{"delta": "stage5-"}}
+	events <- RuntimeEvent{Type: "message.delta", Data: map[string]string{"delta": "secret"}}
+	events <- RuntimeEvent{Type: "message.completed", Data: map[string]string{"output": "stage5-secret"}}
+	events <- RuntimeEvent{Type: "run.completed", Data: map[string]string{"request_id": request.RequestID}}
+	close(events)
+	return events, nil
+}
+
+func (splitSecretRunner) Close() error { return nil }
 
 func TestExternalIMUserPolicyDeniesBeforeRunner(t *testing.T) {
 	runs := make(chan RunnerRequest, 2)
@@ -234,6 +322,11 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	decodeResponse(t, response, http.StatusOK, &trace)
 	if trace.TraceID != result.TraceID || len(trace.Spans) == 0 {
 		t.Fatalf("trace = %#v", trace)
+	}
+	for index, span := range trace.Spans {
+		if span.SpanID == "" || index > 0 && span.ParentSpanID != trace.Spans[index-1].SpanID {
+			t.Fatalf("trace parent chain = %#v", trace.Spans)
+		}
 	}
 
 	encoded, _ := json.Marshal(confirmations)

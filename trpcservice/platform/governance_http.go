@@ -91,7 +91,11 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 		}
 		updated, err := h.governance.PutPolicy(r.Context(), policy)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
+			if err.Error() == "invalid_policy" {
+				writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, publicPolicy(updated))
@@ -149,7 +153,7 @@ func (h *AdminHandler) handleConfirmationDecision(w http.ResponseWriter, r *http
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "confirmation_unavailable", "confirmation could not be decided")
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, confirmation)
