@@ -52,6 +52,7 @@ func LoadBotConfig(getenv func(string) string) BotConfig {
 
 type BotRoute struct {
 	Provider         string `json:"provider"`
+	ProviderAccount  string `json:"provider_account,omitempty"`
 	ExternalSubject  string `json:"external_subject"`
 	TenantID         string `json:"tenant_id"`
 	AppID            string `json:"app_id"`

@@ -118,6 +118,9 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 	if len(first) != 1 || first[0].Type != "run.failed" || !strings.Contains(first[0].Data["error"], "confirmation_required") {
 		t.Fatalf("first Tool run events = %#v", first)
 	}
+	if metrics := center.Metrics("tenant-one"); metrics.Active != 1 || metrics.Failed != 0 || metrics.Completed != 0 {
+		t.Fatalf("confirmation reservation was reconciled too early: %#v", metrics)
+	}
 	confirmations := center.Confirmations("tenant-one")
 	if len(confirmations) != 1 || confirmations[0].ToolName != "deploy" {
 		t.Fatalf("pending confirmations = %#v", confirmations)
@@ -132,6 +135,9 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 	confirmations = center.Confirmations("tenant-one")
 	if len(confirmations) != 1 || confirmations[0].Status != ConfirmationCompleted {
 		t.Fatalf("completed confirmations = %#v", confirmations)
+	}
+	if metrics := center.Metrics("tenant-one"); metrics.Active != 0 || metrics.Failed != 0 || metrics.Completed != 1 {
+		t.Fatalf("approved retry accounting = %#v", metrics)
 	}
 }
 
@@ -253,6 +259,31 @@ func TestFrameworkRunnerAdapterCloseCancelsActiveRun(t *testing.T) {
 	if !ok || runtimeEvent.Type != "run.cancelled" {
 		t.Fatalf("close event = %#v, want run.cancelled", runtimeEvent)
 	}
+}
+
+func TestFrameworkRunnerAdapterCancellationDoesNotLeakWithoutReader(t *testing.T) {
+	platform := activeTestPlatform(t)
+	adapter := NewFrameworkRunnerAdapter(platform.DeploymentVersion, func(_ context.Context, _ DeploymentVersion) (frameworkagent.Agent, error) {
+		return blockingAgent{}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	events, err := adapter.RunEvents(ctx, RunnerRequest{TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", SessionID: "session-one", UserID: "user-one", Input: "hello", RequestID: "request-one", VersionID: "deploy-one-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		adapter.mu.Lock()
+		remaining := len(adapter.runs["deploy-one-v1"])
+		adapter.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("cancelled run remained registered; events = %#v", events)
 }
 
 func TestFrameworkRunnerAdapterRetiresInactiveVersion(t *testing.T) {

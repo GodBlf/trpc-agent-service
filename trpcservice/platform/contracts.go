@@ -11,9 +11,40 @@ import (
 // TenantContext is the trusted tenant identity attached by an ingress
 // middleware. It is deliberately not constructible from a client request.
 type TenantContext struct {
-	TenantID string
-	UserID   string
-	Role     Role
+	TenantID    string
+	UserID      string
+	Role        Role
+	Assignments []TenantAssignment
+}
+
+// AllowsTenant reports whether this trusted identity may access tenantID.
+// Contexts created by older in-process callers may omit Assignments; those
+// contexts remain scoped to their active TenantID only.
+func (t TenantContext) AllowsTenant(tenantID string) bool {
+	if tenantID == "" {
+		return false
+	}
+	if len(t.Assignments) == 0 {
+		return t.TenantID == tenantID
+	}
+	for _, assignment := range t.Assignments {
+		if assignment.TenantID == tenantID {
+			return true
+		}
+	}
+	return false
+}
+
+func (t TenantContext) AssignmentFor(tenantID string) (TenantAssignment, bool) {
+	if len(t.Assignments) == 0 && t.TenantID == tenantID {
+		return TenantAssignment{TenantID: tenantID, Role: t.Role}, true
+	}
+	for _, assignment := range t.Assignments {
+		if assignment.TenantID == tenantID {
+			return assignment, true
+		}
+	}
+	return TenantAssignment{}, false
 }
 
 // TenantIDFromContext is a convenience for ports that only need the boundary
@@ -83,21 +114,25 @@ type DeploymentVersion struct {
 }
 
 type GatewayRequest struct {
-	TenantID       string `json:"-"`
-	AppID          string `json:"app_id"`
-	SessionID      string `json:"session_id"`
-	UserID         string `json:"-"`
-	Input          string `json:"input"`
-	RequestID      string `json:"-"`
-	TraceID        string `json:"-"`
-	DeploymentID   string `json:"-"`
-	VersionID      string `json:"-"`
-	PolicyRevision uint64 `json:"-"`
+	TenantID        string `json:"-"`
+	AppID           string `json:"app_id"`
+	SessionID       string `json:"session_id"`
+	UserID          string `json:"-"`
+	Channel         string `json:"-"`
+	ExternalSubject string `json:"-"`
+	Input           string `json:"input"`
+	RequestID       string `json:"-"`
+	TraceID         string `json:"-"`
+	DeploymentID    string `json:"-"`
+	VersionID       string `json:"-"`
+	PolicyRevision  uint64 `json:"-"`
 }
 
 type GatewayResponse struct {
-	SessionID string `json:"session_id"`
-	Output    string `json:"output"`
+	SessionID   string `json:"session_id"`
+	Output      string `json:"output"`
+	UsageTokens int64  `json:"-"`
+	UsageKnown  bool   `json:"-"`
 }
 
 type Gateway interface {
@@ -128,20 +163,26 @@ type SessionEvent struct {
 }
 
 type RunnerRequest struct {
-	TenantID       string
-	AppID          string
-	SessionID      string
-	UserID         string
-	Input          string
-	RequestID      string
-	TraceID        string
-	DeploymentID   string
-	VersionID      string
-	PolicyRevision uint64
+	TenantID         string
+	AppID            string
+	SessionID        string
+	UserID           string
+	Channel          string
+	ProviderAccount  string
+	ConversationType string
+	ExternalSubject  string
+	Input            string
+	RequestID        string
+	TraceID          string
+	DeploymentID     string
+	VersionID        string
+	PolicyRevision   uint64
 }
 
 type RunnerResponse struct {
-	Output string
+	Output      string
+	UsageTokens int64
+	UsageKnown  bool
 }
 
 // RunnerAdapter is the platform boundary around trpc-agent-go's runner.Runner.

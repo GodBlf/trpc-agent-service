@@ -204,6 +204,37 @@ func TestGovernanceCenterEnforcesPolicyBeforeExecutionAndRecordsAudit(t *testing
 	}
 }
 
+func TestGovernanceCenterFailsClosedWithoutPolicy(t *testing.T) {
+	center := NewGovernanceCenter()
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Input: "hello", RequiredTools: []string{"search"}}
+
+	if _, err := center.Evaluate(context.Background(), request); !IsGovernanceError(err, "policy_unavailable") {
+		t.Fatalf("missing-policy evaluation error = %v", err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, "trace-a", "search", nil); !IsGovernanceError(err, "policy_unavailable") {
+		t.Fatalf("missing-policy Tool error = %v", err)
+	}
+}
+
+func TestGovernanceCenterEnforcesProviderAccountAndConversationType(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedProviderAccounts: []string{"bot-a"}, AllowedConversationTypes: []string{ConversationSingle},
+	})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", Channel: ChannelTelegram, ProviderAccount: "bot-b", ConversationType: ConversationSingle, RequestID: "request-account", Input: "hello"}
+	if _, err := center.Evaluate(context.Background(), request); !IsGovernanceError(err, "provider_account_denied") {
+		t.Fatalf("provider account error = %v", err)
+	}
+	request.RequestID, request.ProviderAccount, request.ConversationType = "request-conversation", "bot-a", ConversationGroup
+	if _, err := center.Evaluate(context.Background(), request); !IsGovernanceError(err, "conversation_type_denied") {
+		t.Fatalf("conversation type error = %v", err)
+	}
+	request.RequestID, request.ConversationType = "request-allowed", ConversationSingle
+	if _, err := center.Evaluate(context.Background(), request); err != nil {
+		t.Fatalf("allowed request error = %v", err)
+	}
+}
+
 func TestGovernanceCenterBlocksOutputBeforeCompletionAudit(t *testing.T) {
 	center := NewGovernanceCenter()
 	_, err := center.PutPolicy(context.Background(), TenantPolicy{
@@ -492,6 +523,9 @@ func TestGovernanceMetricsQueryUsesBoundedAppProviderAndTimeDimensions(t *testin
 	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
 	center := NewGovernanceCenter()
 	center.now = func() time.Time { return now }
+	for _, appID := range []string{"app-a", "app-b"} {
+		_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: appID})
+	}
 	for _, request := range []GovernanceRequest{
 		{TenantID: "tenant-a", AgentAppID: "app-a", Channel: ChannelTelegram, RequestID: "request-a", Input: "hello"},
 		{TenantID: "tenant-a", AgentAppID: "app-b", Channel: ChannelEnterpriseWeChat, RequestID: "request-b", Input: "hello"},

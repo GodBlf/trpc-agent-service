@@ -124,6 +124,10 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		h.providers.recordRejected(provider, subject, requestID, "disabled", route)
 		return ErrProviderMessageIgnored
 	}
+	if route.ProviderAccount != "" && route.ProviderAccount != account {
+		h.providers.recordRejected(provider, subject, requestID, "provider_account_denied", route)
+		return ErrProviderMessageIgnored
+	}
 	if rejectionCode != "" {
 		h.providers.recordRejected(provider, subject, requestID, rejectionCode, route)
 		return ErrProviderMessageIgnored
@@ -134,7 +138,7 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 	}
 	binding := ChannelBinding{
 		TenantID: route.TenantID, AppID: route.AppID, Channel: provider,
-		ConversationType: route.ConversationType, ConversationID: subject, UserID: userID,
+		ProviderAccount: account, ConversationType: route.ConversationType, ConversationID: subject, UserID: userID,
 		SessionID: providerSessionID(provider, account, subject), Enabled: true, PlatformOwned: true, ReplyReference: replyReference, ProviderSession: providerSession,
 	}
 	if replay, _ := ctx.Value(providerReplayContextKey{}).(bool); replay {
@@ -155,12 +159,12 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		requestID: requestID, userID: userID, binding: &binding,
 	})
 	if err != nil {
-		h.providers.releaseInbound(route, messageID)
 		var governanceErr *GovernanceError
 		if errors.As(err, &governanceErr) {
 			h.providers.recordRejected(provider, subject, requestID, governanceErr.Code, route)
 			return ErrProviderMessageIgnored
 		}
+		h.providers.releaseInbound(route, messageID)
 		h.providers.recordDelivery(ChannelBinding{Channel: route.Provider, ConversationID: route.ExternalSubject, TenantID: route.TenantID, AppID: route.AppID}, ChannelReply{MessageID: requestID}, "terminal_failed", "runner_unavailable", 0)
 	} else if result.Status == "completed" {
 		h.redeliverProviderReply(binding, requestID)
@@ -220,10 +224,6 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
 		return
 	}
-	if tenant.Role != RolePlatformAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
-		return
-	}
 	if h.providers == nil {
 		writeError(w, http.StatusServiceUnavailable, "provider_unavailable", "provider runtime is unavailable")
 		return
@@ -235,6 +235,19 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 	}
 	if err := decodeStrict(r, &request); err != nil || request.ExternalSubject == "" || strings.TrimSpace(request.Text) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_provider_replay", "provider, subject, and text are required")
+		return
+	}
+	if request.Provider != ChannelTelegram && request.Provider != ChannelEnterpriseWeChat {
+		writeError(w, http.StatusBadRequest, "invalid_provider_replay", "provider is unsupported")
+		return
+	}
+	route, found := h.providers.Routes().Lookup(request.Provider, request.ExternalSubject)
+	if !found || !route.Enabled || !tenantCanSee(tenant, route.TenantID) {
+		writeError(w, http.StatusNotFound, "provider_route_not_found", "enabled provider route was not found")
+		return
+	}
+	if !tenantAllowsPlatformAdmin(tenant, route.TenantID) {
+		writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 		return
 	}
 	sequence := time.Now().UnixNano()
@@ -263,9 +276,6 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 			"cmd": "aibot_msg_callback", "headers": map[string]string{"req_id": newRequestID()}, "provider_session_id": "local-replay",
 			"body": map[string]any{"msgid": messageID, "aibotid": account, "chatid": request.ExternalSubject, "chattype": ConversationGroup, "from": map[string]string{"userid": "replay-user"}, "msgtype": "text", "text": map[string]string{"content": request.Text}},
 		})
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_provider_replay", "provider is unsupported")
-		return
 	}
 	ctx := context.WithValue(r.Context(), providerReplayContextKey{}, true)
 	if err := h.ProcessProviderMessage(ctx, request.Provider, account, body); err != nil {
@@ -506,21 +516,19 @@ func (h *AdminHandler) handleProviderStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	items := h.providers.Statuses()
-	if tenant.Role != RolePlatformAdmin {
-		visible := make(map[string]struct{})
-		for _, route := range h.providers.Routes().List() {
-			if route.TenantID == tenant.TenantID {
-				visible[route.Provider] = struct{}{}
-			}
+	visible := make(map[string]struct{})
+	for _, route := range h.providers.Routes().List() {
+		if tenantCanSee(tenant, route.TenantID) {
+			visible[route.Provider] = struct{}{}
 		}
-		filtered := items[:0]
-		for _, item := range items {
-			if _, ok := visible[item.Provider]; ok {
-				filtered = append(filtered, item)
-			}
-		}
-		items = filtered
 	}
+	filtered := items[:0]
+	for _, item := range items {
+		if _, ok := visible[item.Provider]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	items = filtered
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
@@ -538,11 +546,14 @@ func (h *AdminHandler) handleProviderDeliveries(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusOK, map[string]any{"items": []ProviderDelivery{}})
 		return
 	}
-	tenantID := tenant.TenantID
-	if tenant.Role == RolePlatformAdmin {
-		tenantID = ""
+	items := h.providers.Deliveries("")
+	filtered := items[:0]
+	for _, item := range items {
+		if tenantCanSee(tenant, item.TenantID) {
+			filtered = append(filtered, item)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.providers.Deliveries(tenantID)})
+	writeJSON(w, http.StatusOK, map[string]any{"items": filtered})
 }
 
 func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Request) {
@@ -558,24 +569,22 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 	switch r.Method {
 	case http.MethodGet:
 		items := h.providers.Routes().List()
-		if tenant.Role != RolePlatformAdmin {
-			filtered := items[:0]
-			for _, item := range items {
-				if item.TenantID == tenant.TenantID {
-					filtered = append(filtered, item)
-				}
+		filtered := items[:0]
+		for _, item := range items {
+			if tenantCanSee(tenant, item.TenantID) {
+				filtered = append(filtered, item)
 			}
-			items = filtered
 		}
+		items = filtered
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
-		if tenant.Role != RolePlatformAdmin {
-			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
-			return
-		}
 		var route BotRoute
 		if err := decodeStrict(r, &route); err != nil || (route.Provider != ChannelTelegram && route.Provider != ChannelEnterpriseWeChat) {
 			writeError(w, http.StatusBadRequest, "invalid_provider_route", "provider route is invalid")
+			return
+		}
+		if !tenantAllowsPlatformAdmin(tenant, route.TenantID) {
+			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
 		if _, ok := h.platform.app(route.TenantID, route.AppID); !ok {
@@ -589,13 +598,15 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		route.Enabled = true
 		writeJSON(w, http.StatusCreated, route)
 	case http.MethodPatch:
-		if tenant.Role != RolePlatformAdmin {
+		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
 		var request struct {
 			TenantID         string `json:"tenant_id"`
 			AppID            string `json:"app_id"`
+			ProviderAccount  string `json:"provider_account"`
 			ConversationType string `json:"conversation_type"`
 			Enabled          *bool  `json:"enabled"`
 		}
@@ -603,12 +614,16 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadRequest, "invalid_provider_route", "provider route update is invalid")
 			return
 		}
+		if request.ProviderAccount == "" {
+			request.ProviderAccount = existing.ProviderAccount
+		}
 		if _, ok := h.platform.app(request.TenantID, request.AppID); !ok {
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
 		route, err := h.providers.Routes().Update(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"), BotRoute{
 			TenantID: request.TenantID, AppID: request.AppID, ConversationType: request.ConversationType, Enabled: *request.Enabled,
+			ProviderAccount: request.ProviderAccount,
 		})
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "provider_route_not_found", "provider route was not found")
@@ -620,7 +635,8 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		writeJSON(w, http.StatusOK, route)
 	case http.MethodDelete:
-		if tenant.Role != RolePlatformAdmin {
+		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
@@ -1034,9 +1050,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	started := false
 	defer func() {
 		if !started && governanceResult.NewExecution {
-			_, _ = h.governance.Complete(context.Background(), GovernanceCompletion{
-				TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "storage_error", NoUsage: true,
-			})
+			completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, "storage_error", false))
 		}
 	}()
 	if options.binding != nil {
@@ -1174,6 +1188,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	governanceRequest := h.governanceRequest(options)
 	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
 		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID, PolicyRevision: options.policyRevision,
+		Channel: options.provider(), ExternalSubject: optionsExternalSubject(options),
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "confirmation_required") {
@@ -1183,13 +1198,18 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		if spanErr := h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "error"); spanErr != nil {
 			return
 		}
-		if _, completeErr := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"}); completeErr != nil {
+		cancelled := err.Error() == "request_cancelled" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		errorType := "runner_failed"
+		if cancelled {
+			errorType = "cancelled"
+		}
+		if _, completeErr := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, errorType, cancelled)); completeErr != nil {
 			return
 		}
 		h.appendCurrentConfirmationEvent(store, options)
 		eventType := "run.failed"
 		code := "runner_failed"
-		if err.Error() == "request_cancelled" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if cancelled {
 			eventType = "run.cancelled"
 			code = "cancelled"
 		}
@@ -1210,8 +1230,13 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	bufferOutput := h.governance.RequiresBufferedOutput(options.tenant.TenantID, options.appID)
 	outputBlocked := false
 	sawCompleted := false
+	var usageTokens int64
+	var usageKnown bool
 	deltaNumber := 0
 	for runtimeEvent := range events {
+		if tokens, known := runtimeUsage(runtimeEvent.Data); known {
+			usageTokens, usageKnown = tokens, true
+		}
 		if runtimeEvent.Type == "message.delta" {
 			delta := runtimeEvent.Data["delta"]
 			output += delta
@@ -1243,7 +1268,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 				return
 			}
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
-			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"}); err != nil {
+			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "runner_failed", false)); err != nil {
 				return
 			}
 			h.appendCurrentConfirmationEvent(store, options)
@@ -1259,7 +1284,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		if runtimeEvent.Type == "run.cancelled" {
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
-			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "cancelled"}); err != nil {
+			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
 				return
 			}
 			h.appendCurrentConfirmationEvent(store, options)
@@ -1274,11 +1299,25 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 	}
+	if ctx.Err() != nil {
+		_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
+		if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
+			return
+		}
+		h.appendCurrentConfirmationEvent(store, options)
+		if options.binding != nil && options.binding.PlatformOwned && h.providers != nil {
+			h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, "cancelled")
+		}
+		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.cancelled", h.chatIdentityPayload(options, map[string]string{"error": "run cancelled"}))
+		cancel()
+		return
+	}
 	errorType := ""
 	if outputBlocked {
 		errorType = "output_guardrail"
 	}
-	output, err = h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, Output: output, ErrorType: errorType})
+	output, err = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, output, usageTokens, usageKnown, errorType, false))
 	if err != nil {
 		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
 		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "audit unavailable"}))
@@ -1394,6 +1433,8 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		if options.binding.ReplayProvider != "" {
 			request.Channel = options.binding.ReplayProvider
 		}
+		request.ProviderAccount = options.binding.ProviderAccount
+		request.ConversationType = options.binding.ConversationType
 		request.ExternalSubject = options.binding.ConversationID
 	}
 	if deployment, ok := h.platform.activeDeployment(options.tenant.TenantID, options.appID); ok {
@@ -1403,6 +1444,35 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		}
 	}
 	return request
+}
+
+func (h *AdminHandler) governanceCompletion(options chatRunOptions, output string, tokens int64, usageKnown bool, errorType string, cancelled bool) GovernanceCompletion {
+	completion := GovernanceCompletion{
+		TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID,
+		UserID: options.userID, SessionID: options.sessionID, Output: output, Tokens: tokens,
+		NoUsage: !usageKnown, ErrorType: errorType, Cancelled: cancelled,
+	}
+	request := h.governanceRequest(options)
+	completion.Channel, completion.ExternalSubject = request.Channel, request.ExternalSubject
+	return completion
+}
+
+func optionsExternalSubject(options chatRunOptions) string {
+	if options.binding == nil {
+		return ""
+	}
+	return options.binding.ConversationID
+}
+
+func runtimeUsage(data map[string]string) (int64, bool) {
+	if data == nil || data["usage_known"] != "true" {
+		return 0, false
+	}
+	tokens, err := strconv.ParseInt(data["usage_tokens"], 10, 64)
+	if err != nil || tokens < 0 {
+		return 0, false
+	}
+	return tokens, true
 }
 
 func configStrings(config map[string]any, key string) []string {

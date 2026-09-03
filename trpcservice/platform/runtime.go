@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,7 +74,7 @@ func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
 }
 
 func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
-	result, err := w.runner.Run(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision})
+	result, err := w.runner.Run(ctx, runnerRequestFromGateway(request))
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.lastError.Store(true)
@@ -81,7 +82,12 @@ func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (
 		return GatewayResponse{}, err
 	}
 	w.lastError.Store(false)
-	return GatewayResponse{SessionID: request.SessionID, Output: result.Output}, nil
+	return GatewayResponse{
+		SessionID:   request.SessionID,
+		Output:      result.Output,
+		UsageTokens: result.UsageTokens,
+		UsageKnown:  result.UsageKnown,
+	}, nil
 }
 
 func (w *StatelessWorker) ExecuteEvents(ctx context.Context, request GatewayRequest) (<-chan RuntimeEvent, error) {
@@ -96,16 +102,29 @@ func (w *StatelessWorker) ExecuteEvents(ctx context.Context, request GatewayRequ
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					eventType = "run.cancelled"
 				}
-				events <- RuntimeEvent{Type: eventType, Data: map[string]string{"request_id": request.RequestID, "error": err.Error()}}
+				events <- RuntimeEvent{Type: eventType, Data: runtimeEventData(runnerRequestFromGateway(request), map[string]string{"error": err.Error()})}
 				return
 			}
-			events <- RuntimeEvent{Type: "message.delta", Data: map[string]string{"request_id": request.RequestID, "delta": response.Output, "output": response.Output}}
-			events <- RuntimeEvent{Type: "message.completed", Data: map[string]string{"request_id": request.RequestID, "output": response.Output}}
-			events <- RuntimeEvent{Type: "run.completed", Data: map[string]string{"request_id": request.RequestID}}
+			data := runtimeEventData(runnerRequestFromGateway(request), map[string]string{"delta": response.Output, "output": response.Output})
+			if response.UsageKnown {
+				data["usage_known"] = "true"
+				data["usage_tokens"] = strconv.FormatInt(response.UsageTokens, 10)
+			}
+			events <- RuntimeEvent{Type: "message.delta", Data: data}
+			events <- RuntimeEvent{Type: "message.completed", Data: data}
+			events <- RuntimeEvent{Type: "run.completed", Data: runtimeEventData(runnerRequestFromGateway(request), data)}
 		}()
 		return events, nil
 	}
-	return streaming.RunEvents(ctx, RunnerRequest{TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID, Input: request.Input, RequestID: request.RequestID, TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision})
+	return streaming.RunEvents(ctx, runnerRequestFromGateway(request))
+}
+
+func runnerRequestFromGateway(request GatewayRequest) RunnerRequest {
+	return RunnerRequest{
+		TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID,
+		Channel: request.Channel, ExternalSubject: request.ExternalSubject, Input: request.Input, RequestID: request.RequestID,
+		TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision,
+	}
 }
 
 func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {
@@ -166,6 +185,7 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}()
 	}
+	streamCtx = context.WithValue(streamCtx, governanceExternalCompletionContextKey{}, true)
 	releaseGate, err := rt.gates.acquire(streamCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
 	if err != nil {
 		if releaseLife != nil {
@@ -275,9 +295,6 @@ func (rt *Runtime) Status() []RuntimeComponentStatus {
 }
 
 func (rt *Runtime) StatusFor(tenant TenantContext) []RuntimeComponentStatus {
-	if tenant.Role == RolePlatformAdmin {
-		return rt.Status()
-	}
 	return rt.status(rt.countersFor(tenant.TenantID))
 }
 

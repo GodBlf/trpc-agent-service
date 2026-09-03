@@ -8,6 +8,7 @@ type View = "策略" | "确认" | "审计" | "指标与成本";
 const emptyPolicy = (appID = ""): TenantPolicy => ({
   tenant_id: "", agent_app_id: appID, revision: 0, allowed_tools: [], allowed_mcp: [], dangerous_tools: [],
   denied_input_patterns: [], denied_output_patterns: [], redacted_patterns: [], allowed_im_users: [], allowed_im_subjects: [],
+  allowed_provider_accounts: [], allowed_conversation_types: [],
   token_budget: 0, cost_budget: 0, cost_per_token: 0, tool_costs: {}, estimated_tokens_per_run: 0, rate_limit: 0, rate_window_seconds: 60,
 });
 
@@ -105,6 +106,8 @@ export function GovernancePage({ identity }: { identity: Identity }) {
         <ListField label="替换敏感模式" value={policy.redacted_patterns.filter((item) => item !== "[REDACTED]")} onChange={(value) => setPolicy({ ...policy, redacted_patterns: list(value) })} />
         <ListField label="允许的 IM 用户" value={policy.allowed_im_users} onChange={(value) => setPolicy({ ...policy, allowed_im_users: list(value) })} />
         <ListField label="允许的 IM 会话" value={policy.allowed_im_subjects} onChange={(value) => setPolicy({ ...policy, allowed_im_subjects: list(value) })} />
+        <ListField label="允许的 Provider Account" value={policy.allowed_provider_accounts} onChange={(value) => setPolicy({ ...policy, allowed_provider_accounts: list(value) })} />
+        <ListField label="允许的会话类型" value={policy.allowed_conversation_types} onChange={(value) => setPolicy({ ...policy, allowed_conversation_types: list(value) })} />
         <NumberField label="Token 预算" value={policy.token_budget} onChange={(value) => setPolicy({ ...policy, token_budget: value })} />
         <NumberField label="成本预算" value={policy.cost_budget} step="0.01" onChange={(value) => setPolicy({ ...policy, cost_budget: value })} />
         <NumberField label="每 Token 成本" value={policy.cost_per_token} step="0.0001" onChange={(value) => setPolicy({ ...policy, cost_per_token: value })} />

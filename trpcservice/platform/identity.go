@@ -277,7 +277,7 @@ func (h *AdminHandler) handleProductionLogin(w http.ResponseWriter, r *http.Requ
 	}
 	h.productionSessions[sessionToken] = &productionSession{identity: identity, lastSeen: h.nowForIdentity()}
 	h.mu.Unlock()
-	markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+	markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole, Assignments: append([]TenantAssignment(nil), identity.Assignments...)})
 	http.SetCookie(w, &http.Cookie{Name: "trpc_auth_session", Value: sessionToken, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: int(productionSessionMaxAge.Seconds())})
 	writeJSON(w, http.StatusOK, identity)
 }

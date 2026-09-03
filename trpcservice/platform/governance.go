@@ -20,57 +20,67 @@ import (
 )
 
 type TenantPolicy struct {
-	TenantID              string             `json:"tenant_id"`
-	AgentAppID            string             `json:"agent_app_id"`
-	Revision              uint64             `json:"revision"`
-	AllowedTools          []string           `json:"allowed_tools"`
-	AllowedMCP            []string           `json:"allowed_mcp"`
-	DangerousTools        []string           `json:"dangerous_tools"`
-	DeniedInputPatterns   []string           `json:"denied_input_patterns"`
-	DeniedOutputPatterns  []string           `json:"denied_output_patterns"`
-	RedactedPatterns      []string           `json:"redacted_patterns"`
-	AllowedIMUsers        []string           `json:"allowed_im_users"`
-	AllowedIMSubjects     []string           `json:"allowed_im_subjects"`
-	TokenBudget           int64              `json:"token_budget"`
-	CostBudget            float64            `json:"cost_budget"`
-	CostPerToken          float64            `json:"cost_per_token"`
-	ToolCosts             map[string]float64 `json:"tool_costs"`
-	EstimatedTokensPerRun int64              `json:"estimated_tokens_per_run"`
-	RateLimit             int                `json:"rate_limit"`
-	RateWindowSeconds     int                `json:"rate_window_seconds"`
-	UpdatedAt             time.Time          `json:"updated_at"`
+	TenantID                 string             `json:"tenant_id"`
+	AgentAppID               string             `json:"agent_app_id"`
+	Revision                 uint64             `json:"revision"`
+	AllowedTools             []string           `json:"allowed_tools"`
+	AllowedMCP               []string           `json:"allowed_mcp"`
+	DangerousTools           []string           `json:"dangerous_tools"`
+	DeniedInputPatterns      []string           `json:"denied_input_patterns"`
+	DeniedOutputPatterns     []string           `json:"denied_output_patterns"`
+	RedactedPatterns         []string           `json:"redacted_patterns"`
+	AllowedIMUsers           []string           `json:"allowed_im_users"`
+	AllowedIMSubjects        []string           `json:"allowed_im_subjects"`
+	AllowedProviderAccounts  []string           `json:"allowed_provider_accounts"`
+	AllowedConversationTypes []string           `json:"allowed_conversation_types"`
+	TokenBudget              int64              `json:"token_budget"`
+	CostBudget               float64            `json:"cost_budget"`
+	CostPerToken             float64            `json:"cost_per_token"`
+	ToolCosts                map[string]float64 `json:"tool_costs"`
+	EstimatedTokensPerRun    int64              `json:"estimated_tokens_per_run"`
+	RateLimit                int                `json:"rate_limit"`
+	RateWindowSeconds        int                `json:"rate_window_seconds"`
+	UpdatedAt                time.Time          `json:"updated_at"`
 }
 
 type GovernanceRequest struct {
-	TenantID        string
-	AgentAppID      string
-	UserID          string
-	SessionID       string
-	RequestID       string
-	Channel         string
-	ExternalSubject string
-	Input           string
-	RequiredTools   []string
-	RequiredMCP     []string
-	PolicyRevision  uint64
+	TenantID         string
+	AgentAppID       string
+	UserID           string
+	SessionID        string
+	RequestID        string
+	Channel          string
+	ProviderAccount  string
+	ConversationType string
+	ExternalSubject  string
+	Input            string
+	RequiredTools    []string
+	RequiredMCP      []string
+	PolicyRevision   uint64
 }
 
 type GovernanceResult struct {
-	Input          string `json:"-"`
-	TraceID        string `json:"trace_id"`
-	PolicyRevision uint64 `json:"policy_revision"`
-	ConfirmationID string `json:"confirmation_id,omitempty"`
-	NewExecution   bool   `json:"-"`
+	Input           string `json:"-"`
+	TraceID         string `json:"trace_id"`
+	PolicyRevision  uint64 `json:"policy_revision"`
+	ConfirmationID  string `json:"confirmation_id,omitempty"`
+	NewExecution    bool   `json:"-"`
+	ExecutionActive bool   `json:"-"`
 }
 
 type GovernanceCompletion struct {
-	TenantID   string
-	AgentAppID string
-	RequestID  string
-	Output     string
-	Tokens     int64
-	ErrorType  string
-	NoUsage    bool
+	TenantID        string
+	AgentAppID      string
+	RequestID       string
+	UserID          string
+	SessionID       string
+	Channel         string
+	ExternalSubject string
+	Output          string
+	Tokens          int64
+	ErrorType       string
+	NoUsage         bool
+	Cancelled       bool
 }
 
 type GovernanceError struct {
@@ -191,37 +201,43 @@ type PlatformTrace struct {
 }
 
 type governanceExecution struct {
-	traceID        string
-	appID          string
-	sessionID      string
-	requestID      string
-	provider       string
-	reserved       int64
-	reservedCost   float64
-	costPerToken   float64
-	policyRevision uint64
-	toolCosts      map[string]float64
-	toolCost       float64
-	started        time.Time
-	active         bool
-	expired        bool
+	traceID         string
+	appID           string
+	sessionID       string
+	requestID       string
+	userID          string
+	channel         string
+	externalSubject string
+	provider        string
+	reserved        int64
+	reservedCost    float64
+	costPerToken    float64
+	policyRevision  uint64
+	toolCosts       map[string]float64
+	toolCost        float64
+	started         time.Time
+	active          bool
+	expired         bool
 }
 
 type persistedGovernanceExecution struct {
-	TraceID        string             `json:"trace_id"`
-	AppID          string             `json:"app_id"`
-	SessionID      string             `json:"session_id"`
-	RequestID      string             `json:"request_id"`
-	Provider       string             `json:"provider,omitempty"`
-	Reserved       int64              `json:"reserved"`
-	ReservedCost   float64            `json:"reserved_cost"`
-	CostPerToken   float64            `json:"cost_per_token"`
-	PolicyRevision uint64             `json:"policy_revision"`
-	ToolCosts      map[string]float64 `json:"tool_costs,omitempty"`
-	ToolCost       float64            `json:"tool_cost"`
-	Started        time.Time          `json:"started"`
-	Active         bool               `json:"active"`
-	Expired        bool               `json:"expired,omitempty"`
+	TraceID         string             `json:"trace_id"`
+	AppID           string             `json:"app_id"`
+	SessionID       string             `json:"session_id"`
+	RequestID       string             `json:"request_id"`
+	UserID          string             `json:"user_id,omitempty"`
+	Channel         string             `json:"channel,omitempty"`
+	ExternalSubject string             `json:"external_subject,omitempty"`
+	Provider        string             `json:"provider,omitempty"`
+	Reserved        int64              `json:"reserved"`
+	ReservedCost    float64            `json:"reserved_cost"`
+	CostPerToken    float64            `json:"cost_per_token"`
+	PolicyRevision  uint64             `json:"policy_revision"`
+	ToolCosts       map[string]float64 `json:"tool_costs,omitempty"`
+	ToolCost        float64            `json:"tool_cost"`
+	Started         time.Time          `json:"started"`
+	Active          bool               `json:"active"`
+	Expired         bool               `json:"expired,omitempty"`
 }
 
 type rateWindow struct {
@@ -325,6 +341,7 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 	for key, execution := range snapshot.Executions {
 		center.executions[key] = governanceExecution{
 			traceID: execution.TraceID, appID: execution.AppID, sessionID: execution.SessionID, requestID: execution.RequestID,
+			userID: execution.UserID, channel: execution.Channel, externalSubject: execution.ExternalSubject,
 			provider: execution.Provider, reserved: execution.Reserved, reservedCost: execution.ReservedCost,
 			costPerToken: execution.CostPerToken, policyRevision: execution.PolicyRevision, toolCosts: cloneToolCosts(execution.ToolCosts), toolCost: execution.ToolCost,
 			started: execution.Started, active: execution.Active, expired: execution.Expired,
@@ -351,6 +368,17 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 func governanceKey(tenantID, appID string) string    { return tenantID + "\x00" + appID }
 func executionKey(tenantID, requestID string) string { return tenantID + "\x00" + requestID }
 
+const governanceCleanupTimeout = 2 * time.Second
+
+func completeGovernance(ctx context.Context, center *GovernanceCenter, completion GovernanceCompletion) (string, error) {
+	if center == nil {
+		return "", nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), governanceCleanupTimeout)
+	defer cancel()
+	return center.Complete(cleanupCtx, completion)
+}
+
 func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (TenantPolicy, error) {
 	if err := ctx.Err(); err != nil {
 		return TenantPolicy{}, err
@@ -372,6 +400,13 @@ func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (
 	policy.DangerousTools = normalizedValues(policy.DangerousTools)
 	policy.AllowedIMUsers = normalizedValues(policy.AllowedIMUsers)
 	policy.AllowedIMSubjects = normalizedValues(policy.AllowedIMSubjects)
+	policy.AllowedProviderAccounts = normalizedValues(policy.AllowedProviderAccounts)
+	policy.AllowedConversationTypes = normalizedValues(policy.AllowedConversationTypes)
+	for _, conversationType := range policy.AllowedConversationTypes {
+		if conversationType != ConversationSingle && conversationType != ConversationGroup {
+			return TenantPolicy{}, errors.New("invalid_policy")
+		}
+	}
 	policy.DeniedInputPatterns = normalizedPatterns(policy.DeniedInputPatterns)
 	policy.DeniedOutputPatterns = normalizedPatterns(policy.DeniedOutputPatterns)
 	policy.RedactedPatterns = normalizedPatterns(policy.RedactedPatterns)
@@ -432,7 +467,7 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 	if traceID == "" {
 		traceID = newTraceID()
 	}
-	result := GovernanceResult{Input: request.Input, TraceID: traceID}
+	result := GovernanceResult{Input: request.Input, TraceID: traceID, ExecutionActive: seen && prior.active}
 	policy, configured := g.policies[governanceKey(request.TenantID, request.AgentAppID)]
 	result.PolicyRevision = policy.Revision
 	if seen && prior.policyRevision != 0 {
@@ -473,18 +508,7 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 		return result, &GovernanceError{Code: code, TraceID: traceID, ConfirmationID: result.ConfirmationID}
 	}
 	if !configured {
-		if seen && !prior.expired {
-			return result, nil
-		}
-		if seen && prior.expired {
-			delete(g.executions, key)
-			seen = false
-		}
-		if err := g.allowLocked(request, &result, key, now, 0, 0, TenantPolicy{}); err != nil {
-			g.restoreLocked(checkpoint)
-			return result, &GovernanceError{Code: "audit_unavailable", TraceID: traceID}
-		}
-		return result, nil
+		return deny("policy_unavailable", "policy.unavailable")
 	}
 	if seen && prior.expired {
 		delete(g.executions, key)
@@ -522,6 +546,14 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 		}
 		if len(policy.AllowedIMSubjects) > 0 && !contains(policy.AllowedIMSubjects, request.ExternalSubject) {
 			return deny("im_subject_denied", "im_subject.denied")
+		}
+		if request.Channel == ChannelTelegram || request.Channel == ChannelEnterpriseWeChat {
+			if len(policy.AllowedProviderAccounts) > 0 && !contains(policy.AllowedProviderAccounts, request.ProviderAccount) {
+				return deny("provider_account_denied", "provider_account.denied")
+			}
+			if len(policy.AllowedConversationTypes) > 0 && !contains(policy.AllowedConversationTypes, request.ConversationType) {
+				return deny("conversation_type_denied", "conversation_type.denied")
+			}
 		}
 	}
 	if prior.active {
@@ -582,8 +614,10 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 
 func (g *GovernanceCenter) allowLocked(request GovernanceRequest, result *GovernanceResult, key string, now time.Time, reserved int64, reservedCost float64, policy TenantPolicy) error {
 	result.NewExecution = true
+	result.ExecutionActive = true
 	g.executions[key] = governanceExecution{
 		traceID: result.TraceID, appID: request.AgentAppID, sessionID: request.SessionID, requestID: request.RequestID,
+		userID: request.UserID, channel: request.Channel, externalSubject: request.ExternalSubject,
 		provider: request.Channel, reserved: reserved, reservedCost: reservedCost, costPerToken: policy.CostPerToken, policyRevision: policy.Revision,
 		toolCosts: cloneToolCosts(policy.ToolCosts), started: now, active: true,
 	}
@@ -640,7 +674,8 @@ func (g *GovernanceCenter) reconcileExpiredReservationsLocked(now time.Time) boo
 		g.metrics[metrics.TenantID] = metrics
 		g.recordMetricSampleLocked(metrics.TenantID, execution.appID, execution.provider, now, TenantMetrics{Active: -1, Failed: 1})
 		request := GovernanceRequest{
-			TenantID: metrics.TenantID, AgentAppID: execution.appID, SessionID: execution.sessionID, RequestID: execution.requestID,
+			TenantID: metrics.TenantID, AgentAppID: execution.appID, UserID: execution.userID, SessionID: execution.sessionID,
+			RequestID: execution.requestID, Channel: execution.channel, ExternalSubject: execution.externalSubject,
 		}
 		g.appendAuditLocked(auditForRequest(request, execution.traceID, "reservation.expired", "reservation_expired", now))
 		g.recordTraceLocked(request, execution.traceID, "runner.complete", "expired", now)
@@ -674,8 +709,11 @@ func (g *GovernanceCenter) Complete(ctx context.Context, completion GovernanceCo
 	}
 	output = redact(output, policy.RedactedPatterns)
 	tokens := completion.Tokens
-	if tokens <= 0 && !completion.NoUsage {
+	if completion.ErrorType != "storage_error" && (completion.NoUsage || tokens <= 0) {
 		tokens = estimateTokens(output)
+		if tokens < execution.reserved {
+			tokens = execution.reserved
+		}
 	}
 	g.usedTokens[completion.TenantID] += tokens
 	executionCost := float64(tokens)*execution.costPerToken + execution.toolCost
@@ -687,7 +725,10 @@ func (g *GovernanceCenter) Complete(ctx context.Context, completion GovernanceCo
 	metrics.Cost += executionCost
 	metrics.ModelLatencyMS += g.now().Sub(execution.started).Milliseconds()
 	decision := "run.completed"
-	if completion.ErrorType != "" {
+	if completion.Cancelled {
+		metrics.Failed++
+		decision = "run.cancelled"
+	} else if completion.ErrorType != "" {
 		metrics.Failed++
 		decision = "run.failed"
 	} else {
@@ -695,18 +736,41 @@ func (g *GovernanceCenter) Complete(ctx context.Context, completion GovernanceCo
 	}
 	g.metrics[completion.TenantID] = metrics
 	delta := TenantMetrics{Active: -1, Tokens: tokens, Cost: executionCost, ModelLatencyMS: g.now().Sub(execution.started).Milliseconds()}
-	if completion.ErrorType != "" {
+	if completion.Cancelled || completion.ErrorType != "" {
 		delta.Failed = 1
 	} else {
 		delta.Completed = 1
 	}
 	g.recordMetricSampleLocked(completion.TenantID, completion.AgentAppID, execution.provider, g.now().UTC(), delta)
-	request := GovernanceRequest{TenantID: completion.TenantID, AgentAppID: completion.AgentAppID, RequestID: completion.RequestID}
-	audit := auditForRequest(request, execution.traceID, decision, completion.ErrorType, g.now().UTC())
+	userID, sessionID, channel, externalSubject := execution.userID, execution.sessionID, execution.channel, execution.externalSubject
+	if userID == "" {
+		userID = completion.UserID
+	}
+	if sessionID == "" {
+		sessionID = completion.SessionID
+	}
+	if channel == "" {
+		channel = completion.Channel
+	}
+	if externalSubject == "" {
+		externalSubject = completion.ExternalSubject
+	}
+	request := GovernanceRequest{TenantID: completion.TenantID, AgentAppID: completion.AgentAppID, UserID: userID, SessionID: sessionID, RequestID: completion.RequestID, Channel: channel, ExternalSubject: externalSubject}
+	auditErrorType := completion.ErrorType
+	if completion.Cancelled && auditErrorType == "" {
+		auditErrorType = "cancelled"
+	}
+	audit := auditForRequest(request, execution.traceID, decision, auditErrorType, g.now().UTC())
 	audit.Cost = executionCost
 	audit.Latency = g.now().Sub(execution.started)
 	g.appendAuditLocked(audit)
-	g.recordTraceLocked(request, execution.traceID, "runner.complete", map[bool]string{true: "error", false: "ok"}[completion.ErrorType != ""], g.now().UTC())
+	traceStatus := "ok"
+	if completion.Cancelled {
+		traceStatus = "cancelled"
+	} else if completion.ErrorType != "" {
+		traceStatus = "error"
+	}
+	g.recordTraceLocked(request, execution.traceID, "runner.complete", traceStatus, g.now().UTC())
 	if err := g.persistLocked(); err != nil {
 		g.restoreLocked(checkpoint)
 		return completion.Output, err
@@ -772,10 +836,13 @@ func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request Governance
 	if request.PolicyRevision != 0 && policy.Revision != request.PolicyRevision {
 		return deny("policy_revision_stale")
 	}
-	if configured && !contains(policy.AllowedTools, toolName) {
+	if !configured {
+		return deny("policy_unavailable")
+	}
+	if !contains(policy.AllowedTools, toolName) {
 		return deny("tool_not_allowed")
 	}
-	if configured && contains(policy.DangerousTools, toolName) {
+	if contains(policy.DangerousTools, toolName) {
 		confirmationID := "confirmation-" + stableID(request.TenantID+"\x00"+request.RequestID+"\x00"+toolName)
 		confirmation, ok := g.confirmations[confirmationID]
 		argumentSummary := argumentSummary(arguments)
@@ -1236,7 +1303,8 @@ func (g *GovernanceCenter) persistLocked() error {
 	for key, execution := range g.executions {
 		persistedExecutions[key] = persistedGovernanceExecution{
 			TraceID: execution.traceID, AppID: execution.appID, SessionID: execution.sessionID, RequestID: execution.requestID,
-			Provider: execution.provider, Reserved: execution.reserved, ReservedCost: execution.reservedCost,
+			UserID: execution.userID, Channel: execution.channel, ExternalSubject: execution.externalSubject, Provider: execution.provider,
+			Reserved: execution.reserved, ReservedCost: execution.reservedCost,
 			CostPerToken: execution.costPerToken, PolicyRevision: execution.policyRevision, ToolCosts: cloneToolCosts(execution.toolCosts), ToolCost: execution.toolCost,
 			Started: execution.started, Active: execution.active, Expired: execution.expired,
 		}
@@ -1480,6 +1548,8 @@ func clonePolicy(policy TenantPolicy) TenantPolicy {
 	policy.ToolCosts = cloneToolCosts(policy.ToolCosts)
 	policy.AllowedIMUsers = append([]string{}, policy.AllowedIMUsers...)
 	policy.AllowedIMSubjects = append([]string{}, policy.AllowedIMSubjects...)
+	policy.AllowedProviderAccounts = append([]string{}, policy.AllowedProviderAccounts...)
+	policy.AllowedConversationTypes = append([]string{}, policy.AllowedConversationTypes...)
 	return policy
 }
 func cloneToolCosts(costs map[string]float64) map[string]float64 {

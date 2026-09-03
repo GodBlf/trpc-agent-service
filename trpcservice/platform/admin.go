@@ -127,6 +127,19 @@ func (p *MemoryPlatform) listTenants() []Tenant {
 	return items
 }
 
+func (p *MemoryPlatform) listTenantsFor(tenant TenantContext) []Tenant {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	items := make([]Tenant, 0, len(tenant.Assignments))
+	for _, candidate := range p.tenants {
+		if tenantCanSee(tenant, candidate.ID) {
+			items = append(items, candidate)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items
+}
+
 type developmentSession struct {
 	activeTenantID string
 	lastSeen       time.Time
@@ -475,8 +488,9 @@ func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *h
 			writeError(w, status, code, message)
 			return nil
 		}
-		ctx := WithTenantContext(r.Context(), TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
-		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		tenant := TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole, Assignments: append([]TenantAssignment(nil), identity.Assignments...)}
+		ctx := WithTenantContext(r.Context(), tenant)
+		markAuditIdentity(w, tenant)
 		return r.WithContext(ctx)
 	}
 	_, session, ok := h.session(w, r)
@@ -488,7 +502,7 @@ func (h *AdminHandler) trustedRequest(w http.ResponseWriter, r *http.Request) *h
 		return r
 	}
 	identity := h.identitySnapshot()
-	tenant := TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role}
+	tenant := TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role, Assignments: append([]TenantAssignment(nil), identity.Assignments...)}
 	markAuditIdentity(w, tenant)
 	ctx := WithTenantContext(r.Context(), tenant)
 	return r.WithContext(ctx)
@@ -502,16 +516,7 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		if trusted.Role == RolePlatformAdmin {
-			writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listTenants()})
-			return
-		}
-		tenant, exists := h.platform.tenant(trusted.TenantID)
-		items := []Tenant{}
-		if exists {
-			items = append(items, tenant)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listTenantsFor(trusted)})
 	case http.MethodPost:
 		if trusted.Role != RolePlatformAdmin {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
@@ -551,7 +556,7 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 		return
 	}
-	if trusted.Role != RolePlatformAdmin && trusted.TenantID != id {
+	if !tenantCanSee(trusted, id) {
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
@@ -583,7 +588,7 @@ func (h *AdminHandler) handleIdentity(w http.ResponseWriter, r *http.Request) {
 			writeError(w, status, code, message)
 			return
 		}
-		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole, Assignments: append([]TenantAssignment(nil), identity.Assignments...)})
 		writeJSON(w, http.StatusOK, identity)
 		return
 	}
@@ -594,7 +599,7 @@ func (h *AdminHandler) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	assignment, _ := h.assignment(session.activeTenantID)
 	identity := h.identitySnapshot()
-	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
+	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role, Assignments: append([]TenantAssignment(nil), identity.Assignments...)})
 	writeJSON(w, http.StatusOK, identityResponse{
 		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
 		ActiveRole: assignment.Role, Assignments: identity.Assignments, AuthMode: "development",
@@ -621,7 +626,7 @@ func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request
 			writeError(w, status, code, message)
 			return
 		}
-		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole})
+		markAuditIdentity(w, TenantContext{TenantID: identity.ActiveTenantID, UserID: identity.ID, Role: identity.ActiveRole, Assignments: append([]TenantAssignment(nil), identity.Assignments...)})
 		writeJSON(w, http.StatusOK, identity)
 		return
 	}
@@ -642,7 +647,7 @@ func (h *AdminHandler) handleSwitchTenant(w http.ResponseWriter, r *http.Request
 	}
 	h.mu.Unlock()
 	identity := h.identitySnapshot()
-	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role})
+	markAuditIdentity(w, TenantContext{TenantID: assignment.TenantID, UserID: identity.ID, Role: assignment.Role, Assignments: append([]TenantAssignment(nil), identity.Assignments...)})
 	writeJSON(w, http.StatusOK, identityResponse{
 		ID: identity.ID, Name: identity.Name, ActiveTenantID: assignment.TenantID,
 		ActiveRole: assignment.Role, Assignments: identity.Assignments, AuthMode: "development",

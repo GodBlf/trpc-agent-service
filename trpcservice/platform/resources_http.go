@@ -48,6 +48,22 @@ func trustedTenant(r *http.Request) (TenantContext, bool) {
 func canMutate(role Role) bool  { return role == RolePlatformAdmin || role == RoleTenantAdmin }
 func canOperate(role Role) bool { return canMutate(role) || role == RoleOperator }
 
+func tenantAllowsPlatformAdmin(tenant TenantContext, tenantID string) bool {
+	if tenant.Role != RolePlatformAdmin {
+		return false
+	}
+	return tenantID == "" || tenant.AllowsTenant(tenantID)
+}
+
+// tenantCanSee keeps ordinary tenant roles on their active tenant while a
+// platform administrator may inspect any tenant explicitly assigned to them.
+func tenantCanSee(tenant TenantContext, tenantID string) bool {
+	if tenantID == tenant.TenantID && tenant.AllowsTenant(tenantID) {
+		return true
+	}
+	return tenant.Role == RolePlatformAdmin && tenant.AllowsTenant(tenantID)
+}
+
 func (h *AdminHandler) handleAgentApps(w http.ResponseWriter, r *http.Request, parts []string) {
 	tenant, ok := trustedTenant(r)
 	if !ok {

@@ -149,8 +149,11 @@ func TestGovernancePolicyRunsBeforeChatRunnerAndPropagatesTrace(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		audits := client.handler.governance.AuditEvents(AuditQuery{TenantID: "tenant-one", RequestID: "request-allowed"})
-		if len(audits) >= 2 {
-			trace, found := client.handler.governance.Trace("tenant-one", audits[0].TraceID, "")
+		for _, audit := range audits {
+			if audit.Decision != "run.completed" {
+				continue
+			}
+			trace, found := client.handler.governance.Trace("tenant-one", audit.TraceID, "")
 			if !found || trace.RequestID != "request-allowed" {
 				t.Fatalf("trace = %#v, found = %v", trace, found)
 			}
@@ -259,6 +262,46 @@ func TestExternalIMUserPolicyDeniesBeforeRunner(t *testing.T) {
 	deliveries := runtime.Deliveries("tenant-one")
 	if len(deliveries) != 1 || deliveries[0].Code != "im_user_denied" || deliveries[0].Status != "rejected" {
 		t.Fatalf("deliveries = %#v", deliveries)
+	}
+}
+
+func TestProviderRouteAccountAndMissingPolicyFailClosedBeforeRunner(t *testing.T) {
+	runs := make(chan RunnerRequest, 1)
+	client := newChannelTestClientWithoutPolicy(t, requestCapturingRunner{requests: runs}, DevelopmentIdentity{
+		ID:   "developer",
+		Name: "Developer",
+		Assignments: []TenantAssignment{
+			{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin},
+		},
+	})
+	client.activateApp("app-one", "deploy-one")
+	routes := NewBotTenantAllowlist()
+	if err := routes.Upsert(BotRoute{Provider: ChannelTelegram, ProviderAccount: "bot-a", ExternalSubject: "123", TenantID: "tenant-one", AppID: "app-one", ConversationType: ConversationSingle}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := NewProviderRuntime(BotConfig{}, routes, nil)
+	client.handler.ConfigureProviderRuntime(runtime)
+	body := []byte(`{"update_id":7,"message":{"message_id":9,"chat":{"id":123},"from":{"id":456},"text":"hello"}}`)
+
+	if err := client.handler.ProcessProviderMessage(context.Background(), ChannelTelegram, "bot-b", body); !errors.Is(err, ErrProviderMessageIgnored) {
+		t.Fatalf("provider account error = %v", err)
+	}
+	deliveries := runtime.Deliveries("tenant-one")
+	if len(deliveries) != 1 || deliveries[0].Code != "provider_account_denied" || deliveries[0].Status != "rejected" {
+		t.Fatalf("provider account deliveries = %#v", deliveries)
+	}
+
+	if err := client.handler.ProcessProviderMessage(context.Background(), ChannelTelegram, "bot-a", body); !errors.Is(err, ErrProviderMessageIgnored) {
+		t.Fatalf("missing-policy error = %v", err)
+	}
+	deliveries = runtime.Deliveries("tenant-one")
+	if len(deliveries) != 1 || deliveries[0].Code != "policy_unavailable" || deliveries[0].Status != "rejected" {
+		t.Fatalf("missing-policy deliveries = %#v", deliveries)
+	}
+	select {
+	case request := <-runs:
+		t.Fatalf("closed request reached Runner: %#v", request)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 
