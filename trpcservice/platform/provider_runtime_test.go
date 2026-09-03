@@ -126,6 +126,46 @@ func TestProviderStatusIsFilteredByTenantRoutes(t *testing.T) {
 	}
 }
 
+func TestMalformedProviderMessagesAreRejectedWithoutRunnerExecution(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	runtime := NewProviderRuntime(BotConfig{}, nil, nil)
+	client.handler.ConfigureProviderRuntime(runtime)
+	if err := client.handler.ProcessProviderMessage(context.Background(), ChannelTelegram, "bot", []byte(`{"update_id":41,"message":{}}`)); !errors.Is(err, ErrProviderMessageIgnored) {
+		t.Fatalf("telegram error = %v", err)
+	}
+	if err := client.handler.ProcessProviderMessage(context.Background(), ChannelEnterpriseWeChat, "bot", []byte(`{"cmd":"aibot_msg_callback","body":{}}`)); !errors.Is(err, ErrProviderMessageIgnored) {
+		t.Fatalf("wecom error = %v", err)
+	}
+	deliveries := runtime.Deliveries("")
+	if len(deliveries) != 2 {
+		t.Fatalf("deliveries = %#v", deliveries)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Status != "rejected" || delivery.Code != "callback_invalid" || delivery.RequestID == "" {
+			t.Fatalf("invalid delivery = %#v", delivery)
+		}
+	}
+}
+
+func TestTelegramPollAdvancesOffsetForMalformedUpdate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := NewProviderRuntime(BotConfig{TelegramToken: "redacted"}, nil, func(_ context.Context, _ string, _ string, _ []byte) error {
+		cancel()
+		return ErrProviderMessageIgnored
+	})
+	runtime.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `{"ok":true,"result":[{"update_id":17,"message":{}}]}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewBufferString(body)), Header: make(http.Header)}, nil
+	})}
+	offset := int64(0)
+	if err := runtime.pollTelegram(ctx, &offset); !errors.Is(err, context.Canceled) {
+		t.Fatalf("poll error = %v", err)
+	}
+	if offset != 18 {
+		t.Fatalf("offset = %d", offset)
+	}
+}
+
 func TestProviderInboundReservationCanBeReleasedAfterStartupFailure(t *testing.T) {
 	runtime := NewProviderRuntime(BotConfig{}, nil, nil)
 	route := BotRoute{Provider: ChannelTelegram, ExternalSubject: "chat-one"}

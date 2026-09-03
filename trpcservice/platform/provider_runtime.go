@@ -249,9 +249,10 @@ func (a *BotTenantAllowlist) persistLocked() error {
 }
 
 type BotStatus struct {
-	Provider string `json:"provider"`
-	Status   string `json:"status"`
-	LastErr  string `json:"last_error,omitempty"`
+	Provider              string `json:"provider"`
+	Status                string `json:"status"`
+	LastErr               string `json:"last_error,omitempty"`
+	CredentialSmokeStatus string `json:"credential_smoke_status"`
 }
 
 type ProviderDelivery struct {
@@ -424,7 +425,7 @@ func (p *ProviderRuntime) releaseInbound(route BotRoute, messageID string) {
 func (p *ProviderRuntime) setStatus(provider, status string, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	value := BotStatus{Provider: provider, Status: status}
+	value := BotStatus{Provider: provider, Status: status, CredentialSmokeStatus: "not_run"}
 	if err != nil {
 		value.LastErr = "provider connection unavailable"
 	}
@@ -444,10 +445,10 @@ func (p *ProviderRuntime) Start(parent context.Context) {
 	telegramEnabled := p.config.TelegramToken != "" && p.processor != nil
 	wecomEnabled := p.config.WeComBotID != "" && p.config.WeComSecret != "" && p.processor != nil
 	if !telegramEnabled {
-		p.statuses[ChannelTelegram] = BotStatus{Provider: ChannelTelegram, Status: ProviderUnconfigured}
+		p.statuses[ChannelTelegram] = BotStatus{Provider: ChannelTelegram, Status: ProviderUnconfigured, CredentialSmokeStatus: "not_run"}
 	}
 	if !wecomEnabled {
-		p.statuses[ChannelEnterpriseWeChat] = BotStatus{Provider: ChannelEnterpriseWeChat, Status: ProviderUnconfigured}
+		p.statuses[ChannelEnterpriseWeChat] = BotStatus{Provider: ChannelEnterpriseWeChat, Status: ProviderUnconfigured, CredentialSmokeStatus: "not_run"}
 	}
 	if telegramEnabled {
 		p.wg.Add(1)
@@ -472,7 +473,7 @@ func (p *ProviderRuntime) Close() {
 	}
 	p.started = false
 	for provider := range p.statuses {
-		p.statuses[provider] = BotStatus{Provider: provider, Status: ProviderStopping}
+		p.statuses[provider] = BotStatus{Provider: provider, Status: ProviderStopping, CredentialSmokeStatus: "not_run"}
 	}
 	cancel := p.cancel
 	p.cancel = nil

@@ -12,7 +12,7 @@ Stage 4 adds a WeCom API-mode Smart Bot WebSocket adapter and a Telegram long-po
 - `cd frontend && npm run typecheck && npm test && npm run build`
 - `cd frontend && npm run test:e2e`
 
-The provider tests cover WeCom subscription authentication and ACK correlation, Telegram update parsing and bounded retry, tenant-scoped allowlist selection, duplicate suppression through Session idempotency, bounded text limits, explicit unsupported-media outcomes, context cancellation, and callback-to-Runner-to-provider-reply routing. Provider credentials are process-only and never enter Channel Bindings. Desktop and mobile Playwright flows cover route creation, local protocol replay, disable, latest delivery status, and deletion. Credential smoke tests are optional and must be reported as unavailable or not run, never passed, without current evidence.
+The provider tests cover WeCom subscription authentication and ACK correlation, Telegram update parsing and bounded retry, tenant-scoped allowlist selection, duplicate suppression through Session idempotency, bounded text limits, explicit unsupported-media outcomes, context cancellation, and callback-to-Runner-to-provider-reply routing. Provider credentials are process-only and never enter Channel Bindings. Desktop and mobile Playwright flows cover route creation, local protocol replay, disable, latest delivery status, and deletion. Credential smoke tests are optional and must be reported as unavailable or not run, never passed, without current evidence. The provider status API and console expose this non-secret state as `credential_smoke_status`; this implementation records `not_run` because live credentials are deliberately not exercised by CI.
 
 ## Known Limitations
 

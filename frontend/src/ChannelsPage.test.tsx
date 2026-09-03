@@ -9,7 +9,7 @@ test("platform administrator can disable and delete a bot tenant route", async (
     const path = String(input);
     if (path === "/api/v1/chat/bindings") return { ok: true, status: 200, json: async () => ({ items: [] }) };
     if (path === "/api/v1/admin/agent-apps") return { ok: true, status: 200, json: async () => ({ items: [{ id: "app-one", name: "App One" }] }) };
-    if (path === "/api/v1/admin/providers/status") return { ok: true, status: 200, json: async () => ({ items: [{ provider: "telegram", status: "connected" }] }) };
+    if (path === "/api/v1/admin/providers/status") return { ok: true, status: 200, json: async () => ({ items: [{ provider: "telegram", status: "connected", credential_smoke_status: "not_run" }] }) };
     if (path === "/api/v1/admin/providers/routes" && !init?.method) return { ok: true, status: 200, json: async () => ({ items: [route] }) };
     if (path === "/api/v1/admin/providers/deliveries") return { ok: true, status: 200, json: async () => ({ items: [] }) };
     if (path.startsWith("/api/v1/admin/providers/routes?") && init?.method === "PATCH") return { ok: true, status: 200, json: async () => ({ ...route, enabled: false }) };
@@ -20,6 +20,8 @@ test("platform administrator can disable and delete a bot tenant route", async (
   vi.stubGlobal("fetch", fetchMock);
   const identity: Identity = { id: "admin", name: "Admin", active_tenant_id: "tenant-one", active_role: "platform_admin", assignments: [] };
   render(<ChannelsPage identity={identity} />);
+
+  expect(await screen.findByText("凭据 Smoke：not_run")).toBeInTheDocument();
 
   await userEvent.click(await screen.findByRole("button", { name: "重放 chat-1 测试消息" }));
   await userEvent.type(screen.getByLabelText("消息内容"), "hello replay");

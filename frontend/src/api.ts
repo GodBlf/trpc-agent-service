@@ -64,7 +64,7 @@ export interface ChannelBinding {
   created_at: string;
   secret?: string;
 }
-export interface ProviderStatus { provider: string; status: string; last_error?: string }
+export interface ProviderStatus { provider: string; status: string; credential_smoke_status: "not_run" | "unavailable" | "passed"; last_error?: string }
 export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group"; enabled: boolean }
 export interface ProviderDelivery { provider: BotRoute["provider"]; external_subject: string; tenant_id: string; app_id: string; request_id: string; status: "accepted" | "retried" | "rejected" | "delivered" | "terminal_failed"; code?: string; attempts: number; updated_at: string }
 

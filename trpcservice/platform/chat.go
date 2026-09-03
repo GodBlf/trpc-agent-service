@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -56,7 +57,8 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 	case ChannelTelegram:
 		var update telegramUpdate
 		if err := json.Unmarshal(body, &update); err != nil || update.UpdateID <= 0 || update.Message.MessageID <= 0 || update.Message.Chat.ID == 0 {
-			return errors.New("invalid telegram update")
+			h.recordInvalidProviderMessage(provider, body)
+			return ErrProviderMessageIgnored
 		}
 		subject = fmt.Sprint(update.Message.Chat.ID)
 		userID = fmt.Sprint(update.Message.From.ID)
@@ -91,7 +93,8 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 			} `json:"body"`
 		}
 		if err := json.Unmarshal(body, &frame); err != nil || frame.Command != "aibot_msg_callback" {
-			return errors.New("invalid wecom frame")
+			h.recordInvalidProviderMessage(provider, body)
+			return ErrProviderMessageIgnored
 		}
 		if frame.Body.MessageType != "text" {
 			rejectionCode = "unsupported_media"
@@ -101,7 +104,8 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 			subject = userID
 		}
 		if subject == "" || userID == "" || messageID == "" || replyReference == "" || frame.Body.BotID != account || (rejectionCode == "" && text == "") {
-			return errors.New("invalid wecom frame")
+			h.recordInvalidProviderMessage(provider, body)
+			return ErrProviderMessageIgnored
 		}
 	default:
 		return errors.New("unsupported provider")
@@ -157,6 +161,15 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		h.redeliverProviderReply(binding, requestID)
 	}
 	return err
+}
+
+func (h *AdminHandler) recordInvalidProviderMessage(provider string, body []byte) {
+	if h.providers == nil {
+		return
+	}
+	digest := sha256.Sum256(body)
+	key := hex.EncodeToString(digest[:])[:16]
+	h.providers.recordRejected(provider, "invalid:"+key, "channel-invalid-"+key, "callback_invalid", BotRoute{})
 }
 
 func (h *AdminHandler) redeliverProviderReply(binding ChannelBinding, requestID string) {
