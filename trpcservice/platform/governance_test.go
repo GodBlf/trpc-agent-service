@@ -16,7 +16,7 @@ func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	center := NewGovernanceCenter()
-	center.path = filepath.Join(blocker, "governance.json")
+	center.SetPersistencePath(filepath.Join(blocker, "governance.json"))
 	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a"}); err == nil {
 		t.Fatal("policy update succeeded without durable audit")
 	}
@@ -30,6 +30,26 @@ func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 	}
 	if metrics := center.Metrics("tenant-a"); metrics.Requests != 0 || metrics.Active != 0 {
 		t.Fatalf("rolled back metrics = %#v", metrics)
+	}
+}
+
+func TestGovernanceRecordSpanReportsPersistenceFailure(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	center := NewGovernanceCenter()
+	center.SetPersistencePath(filepath.Join(blocker, "governance.json"))
+
+	err := center.RecordSpan(
+		GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a"},
+		"trace-a", "gateway.receive", "ok",
+	)
+	if err == nil {
+		t.Fatal("trace span succeeded without durable persistence")
+	}
+	if trace, found := center.Trace("tenant-a", "trace-a", ""); found || len(trace.Spans) != 0 {
+		t.Fatalf("failed trace write remained active in memory: %#v", trace)
 	}
 }
 
@@ -65,13 +85,41 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	}
 }
 
+func TestGovernanceCenterEncryptsRedactionPatternsAtRest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "governance.json")
+	center, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const canary = "stage5-redaction-canary"
+	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", RedactedPatterns: []string{canary}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, persistedPath := range []string{path, path + ".key"} {
+		data, err := os.ReadFile(persistedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), canary) {
+			t.Fatalf("redaction secret persisted in plaintext at %s", persistedPath)
+		}
+	}
+	reloaded, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, _ := reloaded.FilterOutput("tenant-a", "app-a", "value="+canary); output != "value=[REDACTED]" {
+		t.Fatalf("reloaded redaction output = %q", output)
+	}
+}
+
 func TestGovernanceCenterEnforcesPolicyBeforeExecutionAndRecordsAudit(t *testing.T) {
 	center := NewGovernanceCenter()
 	policy, err := center.PutPolicy(context.Background(), TenantPolicy{
 		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"search"}, AllowedMCP: []string{"calendar"},
 		DeniedInputPatterns: []string{"blocked"}, RedactedPatterns: []string{"canary-secret"},
 		AllowedIMUsers: []string{"user-a"}, AllowedIMSubjects: []string{"chat-a"},
-		TokenBudget: 100, CostBudget: 1, CostPerToken: 0.01, EstimatedTokensPerRun: 10, RateLimit: 2, RateWindowSeconds: 60,
+		TokenBudget: 100, CostBudget: 1, CostPerToken: 0.01, ToolCosts: map[string]float64{"search": 0}, EstimatedTokensPerRun: 10, RateLimit: 2, RateWindowSeconds: 60,
 	})
 	if err != nil || policy.Revision != 1 {
 		t.Fatalf("policy = %#v, err = %v", policy, err)
@@ -180,21 +228,43 @@ func TestGovernanceCenterRequiresDangerousToolConfirmationExactlyOnce(t *testing
 	}
 	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "user-a", SessionID: "session-a", RequestID: "request-a", RequiredTools: []string{"deploy"}, Input: "ship"}
 	result, err := center.Evaluate(context.Background(), request)
-	var governanceErr *GovernanceError
-	if !errors.As(err, &governanceErr) || governanceErr.Code != "confirmation_required" || result.ConfirmationID == "" {
+	if err != nil || result.TraceID == "" {
 		t.Fatalf("result = %#v, err = %v", result, err)
 	}
-	confirmation, err := center.DecideConfirmation(context.Background(), "tenant-a", result.ConfirmationID, "admin-a", true)
+	arguments := []byte(`{"target":"stage5-secret-target"}`)
+	err = center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments)
+	var governanceErr *GovernanceError
+	if !errors.As(err, &governanceErr) || governanceErr.Code != "confirmation_required" || governanceErr.ConfirmationID == "" {
+		t.Fatalf("Tool authorization error = %#v", governanceErr)
+	}
+	pending := center.Confirmations("tenant-a")[0]
+	if pending.ArgumentSummary == "" || strings.Contains(pending.ArgumentSummary, "stage5-secret-target") {
+		t.Fatalf("unsafe pending argument summary = %q", pending.ArgumentSummary)
+	}
+	confirmation, err := center.DecideConfirmation(context.Background(), "tenant-a", governanceErr.ConfirmationID, "admin-a", true)
 	if err != nil || confirmation.Status != ConfirmationApproved {
 		t.Fatalf("confirmation = %#v, err = %v", confirmation, err)
 	}
-	result, err = center.Evaluate(context.Background(), request)
-	if err != nil || result.ConfirmationID != confirmation.ID {
-		t.Fatalf("approved result = %#v, err = %v", result, err)
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); err != nil {
+		t.Fatalf("approved Tool was not authorized: %v", err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); !IsGovernanceError(err, "confirmation_consumed") {
+		t.Fatalf("second Tool invocation error = %v", err)
 	}
 	second, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "admin-a", true)
 	if err != nil || second.DecidedAt != confirmation.DecidedAt {
 		t.Fatalf("idempotent decision = %#v, err = %v", second, err)
+	}
+	if err := center.CompleteTool(context.Background(), request, result.TraceID, "deploy", nil); err != nil {
+		t.Fatal(err)
+	}
+	completed := center.Confirmations("tenant-a")[0]
+	if completed.Status != ConfirmationCompleted || completed.CompletedAt.IsZero() {
+		t.Fatalf("completed confirmation = %#v", completed)
+	}
+	audits := center.AuditEvents(AuditQuery{TenantID: "tenant-a", RequestID: "request-a", Limit: 20})
+	if !containsAuditDecision(audits, "tool.completed") {
+		t.Fatalf("Tool completion audit missing: %#v", audits)
 	}
 }
 
@@ -203,11 +273,8 @@ func TestGovernanceCenterAuthorizesActualToolCallAndHashesArguments(t *testing.T
 	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
 	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "user-a", SessionID: "session-a", RequestID: "request-a", RequiredTools: []string{"deploy"}}
 	result, _ := center.Evaluate(context.Background(), request)
-	_, _ = center.DecideConfirmation(context.Background(), "tenant-a", result.ConfirmationID, "admin-a", true)
 	arguments := []byte(`{"target":"stage5-secret-target"}`)
-	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); err != nil {
-		t.Fatal(err)
-	}
+	_ = center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments)
 	confirmation := center.Confirmations("tenant-a")[0]
 	if confirmation.ArgumentSummary == "" || strings.Contains(confirmation.ArgumentSummary, "stage5-secret-target") {
 		t.Fatalf("argument summary = %q", confirmation.ArgumentSummary)
@@ -215,6 +282,15 @@ func TestGovernanceCenterAuthorizesActualToolCallAndHashesArguments(t *testing.T
 	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "unknown", nil); !IsGovernanceError(err, "tool_not_allowed") {
 		t.Fatalf("unknown Tool error = %v", err)
 	}
+}
+
+func containsAuditDecision(events []AuditEvent, decision string) bool {
+	for _, event := range events {
+		if event.Decision == decision {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGovernanceCenterEnforcesBudgetRateAndIMAuthorization(t *testing.T) {
@@ -246,5 +322,98 @@ func TestGovernanceCenterEnforcesBudgetRateAndIMAuthorization(t *testing.T) {
 	_, err = center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", Channel: ChannelTelegram, UserID: "allowed", RequestID: "four", Input: "hello"})
 	if !IsGovernanceError(err, "budget_exceeded") {
 		t.Fatalf("budget error = %v", err)
+	}
+}
+
+func TestGovernanceCenterReconcilesExpiredReservationExactlyOnce(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	center := NewGovernanceCenter()
+	center.now = func() time.Time { return now }
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", TokenBudget: 1, EstimatedTokensPerRun: 1,
+	})
+	if _, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Input: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(16 * time.Minute)
+	if _, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-two", Input: "two"}); err != nil {
+		t.Fatalf("expired reservation still consumed budget: %v", err)
+	}
+	metrics := center.Metrics("tenant-a")
+	if metrics.Active != 1 || metrics.Failed != 1 {
+		t.Fatalf("reconciled metrics = %#v", metrics)
+	}
+	if audits := center.AuditEvents(AuditQuery{TenantID: "tenant-a", Decision: "reservation.expired", Limit: 10}); len(audits) != 1 {
+		t.Fatalf("reservation expiry audits = %#v", audits)
+	}
+}
+
+func TestGovernancePolicyUpdatePreservesTenantUsage(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", TokenBudget: 100, CostPerToken: 0.5})
+	_, _ = center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Input: "hello"})
+	_, _ = center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Tokens: 10})
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-b", TokenBudget: 100, CostPerToken: 0.5})
+	if metrics := center.Metrics("tenant-a"); metrics.Tokens != 10 || metrics.Cost != 5 {
+		t.Fatalf("policy update reset tenant usage: %#v", metrics)
+	}
+}
+
+func TestGovernanceMetricsQueryUsesBoundedAppProviderAndTimeDimensions(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	center := NewGovernanceCenter()
+	center.now = func() time.Time { return now }
+	for _, request := range []GovernanceRequest{
+		{TenantID: "tenant-a", AgentAppID: "app-a", Channel: ChannelTelegram, RequestID: "request-a", Input: "hello"},
+		{TenantID: "tenant-a", AgentAppID: "app-b", Channel: ChannelEnterpriseWeChat, RequestID: "request-b", Input: "hello"},
+	} {
+		if _, err := center.Evaluate(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := center.Complete(context.Background(), GovernanceCompletion{TenantID: request.TenantID, AgentAppID: request.AgentAppID, RequestID: request.RequestID, Tokens: 4}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metrics, err := center.QueryMetrics(MetricsQuery{
+		TenantID: "tenant-a", AgentAppID: "app-a", Provider: ChannelTelegram,
+		From: now.Add(-time.Hour), To: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Requests != 1 || metrics.Completed != 1 || metrics.Tokens != 4 {
+		t.Fatalf("filtered metrics = %#v", metrics)
+	}
+	if _, err := center.QueryMetrics(MetricsQuery{TenantID: "tenant-a", From: now.Add(-32 * 24 * time.Hour), To: now}); err == nil {
+		t.Fatal("unbounded metrics range was accepted")
+	}
+}
+
+func TestGovernanceCenterReservesAndAttributesConfiguredToolCost(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"search", "unknown"},
+		TokenBudget: 100, CostBudget: 5, CostPerToken: 1, EstimatedTokensPerRun: 1, ToolCosts: map[string]float64{"search": 2},
+	})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", SessionID: "session-a", RequestID: "request-a", RequiredTools: []string{"search"}, Input: "hello"}
+	result, err := center.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "search", []byte(`{"query":"safe"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.CompleteTool(context.Background(), request, result.TraceID, "search", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Tokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := center.Metrics("tenant-a"); metrics.Cost != 3 {
+		t.Fatalf("model and Tool cost = %v, want 3", metrics.Cost)
+	}
+	_, err = center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-b", RequiredTools: []string{"unknown"}, Input: "hello"})
+	if !IsGovernanceError(err, "tool_pricing_unknown") {
+		t.Fatalf("unknown Tool pricing error = %v", err)
 	}
 }

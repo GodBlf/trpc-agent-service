@@ -50,10 +50,12 @@ Example identity directory:
 increasing revision. It contains Tool and MCP allowlists, dangerous Tool names,
 input/output Guardrail patterns, write-only redaction patterns, allowed external
 IM users and subjects, token/cost budgets, estimated reservation size, model
-cost, and a Tenant request-limit window. Requests cannot supply or override this
-policy. Updating a policy starts a new budget accounting period and resets that
-Tenant's consumed token/cost balance; metrics expose the period start, limits,
-consumption, and remaining allowance.
+cost, per-Tool costs, and a Tenant request-limit window. When a monetary budget
+is active, every declared Tool must have an explicit price (zero is allowed),
+so unknown pricing cannot silently bypass the budget. Requests cannot supply or override this
+policy. Updating an Agent App policy preserves the Tenant's already-accounted
+token/cost usage, so a policy revision cannot reset or bypass a Tenant budget.
+Metrics expose the period start, limits, consumption, and remaining allowance.
 
 The request path is:
 
@@ -63,11 +65,14 @@ identity -> tenant/app route -> IM authorization -> Tool/MCP and Guardrail polic
          -> output Guardrail/redaction -> Session storage -> Channel reply
 ```
 
-Dangerous Tool requests create a durable confirmation before execution. An
+Dangerous Tool requests create a durable confirmation in the framework
+`BeforeTool` callback, after the real arguments are available and before the
+Tool can execute. The record contains only a SHA-256 argument summary. An
 operator or administrator in the same Tenant approves or rejects it, then the
-client retries with the same request ID. Idempotent evaluation and decision
-handling ensure the approved execution starts at most once. Confirmations
-expire after 15 minutes. No suspended goroutine is used as the record of truth.
+client retries with the same request ID. Approval is atomically consumed and
+the `AfterTool` callback records completed, failed, or cancelled state and real
+Tool latency. Confirmations expire after 15 minutes. No suspended goroutine is
+used as the record of truth.
 
 ## Management APIs
 
@@ -75,7 +80,7 @@ All endpoints derive Tenant Context from authentication middleware:
 
 - `GET|POST|PUT /api/v1/admin/governance/policy`
 - `GET /api/v1/admin/governance/audit`
-- `GET /api/v1/admin/governance/metrics`
+- `GET /api/v1/admin/governance/metrics?app_id=...&provider=...&from=...&to=...`
 - `GET /api/v1/admin/governance/traces?trace_id=...&request_id=...`
 - `GET /api/v1/admin/governance/confirmations`
 - `POST /api/v1/admin/governance/confirmations/{id}/decision`
@@ -99,7 +104,10 @@ Tenant metrics expose request, active/completed/failed/denied/rate-limited
 execution counters, token and cost totals, model/Tool/storage latency, and IM
 delivery totals. The deterministic Runner estimates token usage when upstream
 usage metadata is absent. Budgets use per-request reservations so concurrent
-runs cannot collectively start beyond the configured allowance.
+runs cannot collectively start beyond the configured allowance. Reservations
+that remain active for 15 minutes are reconciled exactly once before the next
+admission decision. Metric samples use only bounded Tenant, Agent App, and
+provider dimensions; queries default to 24 hours and reject ranges over 31 days.
 
 The platform trace model is deliberately independent of upstream telemetry
 types. `trace_id` follows browser/provider ingress, policy, Gateway, Worker,
@@ -116,6 +124,12 @@ governance state.
 tokens survive restart. This local file is appropriate for deterministic
 acceptance but is not a distributed control-plane store; multi-node policy
 distribution and globally shared counters remain Stage 6/production work.
+
+Write-only redaction patterns are AES-GCM encrypted in the governance snapshot.
+The adjacent `<TRPC_GOVERNANCE_PATH>.key` file is generated with mode `0600` and
+must be backed up and protected together with the snapshot; losing it makes the
+encrypted redaction configuration unreadable. Legacy plaintext snapshots are
+read for compatibility and migrate to encrypted form on the next write.
 
 Redaction is applied at platform logs, policy responses, Runner input/output,
 Audit/Trace attributes, public errors, and Provider diagnostics. Explicitly

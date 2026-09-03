@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	serviceagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
@@ -30,6 +31,19 @@ type AgentFactory func(context.Context, DeploymentVersion) (frameworkagent.Agent
 
 func DefaultAgentFactory() AgentFactory {
 	return func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
+		if toolName, _ := version.Config["deterministic_tool_call"].(string); toolName != "" {
+			declared := false
+			for _, candidate := range configStrings(version.Config, "tools") {
+				if candidate == toolName {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				return nil, fmt.Errorf("deterministic Tool %q is not declared", toolName)
+			}
+			return serviceagent.NewDeterministicToolAgent(version.AgentAppID, toolName), nil
+		}
 		return serviceagent.NewDeterministicAgent(version.AgentAppID), nil
 	}
 }
@@ -94,13 +108,17 @@ func (p *governanceRuntimePlugin) Name() string { return "platform-governance" }
 func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 	registry.BeforeAgent(func(ctx context.Context, _ *frameworkagent.BeforeAgentArgs) (*frameworkagent.BeforeAgentResult, error) {
 		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
-			p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.before_agent", "ok")
+			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.before_agent", "ok"); err != nil {
+				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
+			}
 		}
 		return nil, nil
 	})
 	registry.AfterAgent(func(ctx context.Context, _ *frameworkagent.AfterAgentArgs) (*frameworkagent.AfterAgentResult, error) {
 		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
-			p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.after_agent", "ok")
+			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID}, request.TraceID, "plugin.after_agent", "ok"); err != nil {
+				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
+			}
 		}
 		return nil, nil
 	})
@@ -113,6 +131,17 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
 			SessionID: request.SessionID, RequestID: request.RequestID,
 		}, request.TraceID, args.ToolName, args.Arguments)
+		return nil, err
+	})
+	registry.AfterTool(func(ctx context.Context, args *frameworktool.AfterToolArgs) (*frameworktool.AfterToolResult, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		if !ok || p.center == nil {
+			return nil, nil
+		}
+		err := p.center.CompleteTool(ctx, GovernanceRequest{
+			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
+			SessionID: request.SessionID, RequestID: request.RequestID,
+		}, request.TraceID, args.ToolName, args.Error)
 		return nil, err
 	})
 }
@@ -195,6 +224,21 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 				content := eventContent(upstreamEvent)
 				if content == "" {
 					continue
+				}
+				// The upstream function-call processor surfaces BeforeTool plugin
+				// failures as a model-visible completed message. Stop here so a
+				// pending confirmation cannot be mistaken for a successful run.
+				if !upstreamEvent.Response.IsPartial && strings.HasPrefix(content, "tool callback error:") {
+					if !a.emit(runCtx, results, RuntimeEvent{Type: "run.failed", Data: runtimeEventData(request, map[string]string{"error": content})}) {
+						return
+					}
+					// The framework may still be unwinding its flow after the
+					// callback error. Cancel and drain its event channel before
+					// releasing the request ID so an approved retry can start.
+					cancel()
+					for range upstream {
+					}
+					return
 				}
 				eventType := "message.delta"
 				if !upstreamEvent.Response.IsPartial {

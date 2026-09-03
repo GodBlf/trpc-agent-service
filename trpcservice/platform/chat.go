@@ -1005,6 +1005,16 @@ type activeChatRun struct {
 	input  string
 }
 
+func (o chatRunOptions) provider() string {
+	if o.binding == nil {
+		return ""
+	}
+	if o.binding.ReplayProvider != "" {
+		return o.binding.ReplayProvider
+	}
+	return o.binding.Channel
+}
+
 func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, error) {
 	if !canOperate(options.tenant.Role) {
 		return chatRunResponse{}, errors.New("forbidden")
@@ -1030,11 +1040,13 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 	}()
 	if options.binding != nil {
-		h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "channel.callback", "ok")
+		if err := h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "channel.callback", "ok"); err != nil {
+			return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
+		}
 	}
 	storageStarted := time.Now()
 	store, release, err := h.acquireStore(options.tenant.TenantID)
-	h.governance.RecordStorageLatency(options.tenant.TenantID, time.Since(storageStarted))
+	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	if err != nil {
 		return chatRunResponse{}, errors.New("storage_error")
 	}
@@ -1058,8 +1070,11 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		h.chatMu.Unlock()
 		return chatRunResponse{}, errors.New("storage_error")
 	}
-	h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.read", "ok")
-	h.governance.RecordStorageLatency(options.tenant.TenantID, time.Since(storageStarted))
+	if err := h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.read", "ok"); err != nil {
+		h.chatMu.Unlock()
+		return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
+	}
+	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	inputPayload, _ := json.Marshal(map[string]string{
 		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID, "trace_id": options.traceID,
 	})
@@ -1131,7 +1146,10 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			return chatRunResponse{}, errors.New("storage_error")
 		}
 	}
-	h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.write", "ok")
+	if err := h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.write", "ok"); err != nil {
+		h.chatMu.Unlock()
+		return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
+	}
 	runCtx, cancel := context.WithCancel(h.chatCtx)
 	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input}
 	h.chatWG.Add(1)
@@ -1158,8 +1176,17 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID,
 	})
 	if err != nil {
-		h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "error")
-		_, _ = h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"})
+		if strings.Contains(err.Error(), "confirmation_required") {
+			h.appendPendingConfirmationEvent(store, options)
+			return
+		}
+		if spanErr := h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "error"); spanErr != nil {
+			return
+		}
+		if _, completeErr := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"}); completeErr != nil {
+			return
+		}
+		h.appendCurrentConfirmationEvent(store, options)
 		eventType := "run.failed"
 		code := "runner_failed"
 		if err.Error() == "request_cancelled" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1174,9 +1201,11 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		cancel()
 		return
 	}
-	h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "ok")
-	h.governance.RecordSpan(governanceRequest, options.traceID, "agent_factory.resolve", "ok")
-	h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "ok")
+	for _, spanName := range []string{"worker.execute", "agent_factory.resolve", "runner.run"} {
+		if err := h.governance.RecordSpan(governanceRequest, options.traceID, spanName, "ok"); err != nil {
+			return
+		}
+	}
 	var output string
 	bufferOutput := h.governance.RequiresBufferedOutput(options.tenant.TenantID, options.appID)
 	outputBlocked := false
@@ -1208,7 +1237,14 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			output, outputBlocked = h.governance.FilterOutput(options.tenant.TenantID, options.appID, output)
 		}
 		if runtimeEvent.Type == "run.failed" {
-			_, _ = h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"})
+			if strings.Contains(runtimeEvent.Data["error"], "confirmation_required") {
+				h.appendPendingConfirmationEvent(store, options)
+				return
+			}
+			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "runner_failed"}); err != nil {
+				return
+			}
+			h.appendCurrentConfirmationEvent(store, options)
 			if options.binding != nil && options.binding.PlatformOwned && h.providers != nil {
 				h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, "runner_failed")
 			}
@@ -1220,7 +1256,10 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 		if runtimeEvent.Type == "run.cancelled" {
-			_, _ = h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "cancelled"})
+			if _, err := h.governance.Complete(context.Background(), GovernanceCompletion{TenantID: options.tenant.TenantID, AgentAppID: options.appID, RequestID: options.requestID, ErrorType: "cancelled"}); err != nil {
+				return
+			}
+			h.appendCurrentConfirmationEvent(store, options)
 			if options.binding != nil && options.binding.PlatformOwned && h.providers != nil {
 				h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, "cancelled")
 			}
@@ -1254,8 +1293,10 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	if options.binding != nil {
 		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: output})
 		if err == nil {
-			h.governance.RecordDelivery(options.tenant.TenantID, true)
-			h.governance.RecordSpan(governanceRequest, options.traceID, "channel.reply", "ok")
+			h.governance.RecordDeliveryFor(options.tenant.TenantID, options.appID, options.provider(), true)
+			if err := h.governance.RecordSpan(governanceRequest, options.traceID, "channel.reply", "ok"); err != nil {
+				return
+			}
 			if options.binding.PlatformOwned && options.binding.ReplayProvider != "" && h.providers != nil {
 				h.providers.recordDelivery(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, "delivered", "", delivery.Attempts)
 			}
@@ -1263,8 +1304,10 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 				"message_id": delivery.MessageID, "text": output, "status": delivery.Status,
 			}))
 		} else {
-			h.governance.RecordDelivery(options.tenant.TenantID, false)
-			h.governance.RecordSpan(governanceRequest, options.traceID, "channel.reply", "error")
+			h.governance.RecordDeliveryFor(options.tenant.TenantID, options.appID, options.provider(), false)
+			if spanErr := h.governance.RecordSpan(governanceRequest, options.traceID, "channel.reply", "error"); spanErr != nil {
+				return
+			}
 			if options.binding.PlatformOwned && h.providers != nil {
 				h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, channelErrorCode(err))
 			}
@@ -1281,9 +1324,38 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		cancel()
 		return
 	}
+	h.appendCurrentConfirmationEvent(store, options)
 	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
 	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
 	cancelTerminal()
+}
+
+func (h *AdminHandler) appendPendingConfirmationEvent(store DataStore, options chatRunOptions) {
+	confirmation, found := h.governance.ConfirmationForRequest(options.tenant.TenantID, options.requestID)
+	if !found {
+		return
+	}
+	payload := h.chatIdentityPayload(options, map[string]string{
+		"confirmation_id": confirmation.ID, "tool_name": confirmation.ToolName,
+		"argument_summary": confirmation.ArgumentSummary, "status": string(confirmation.Status),
+	})
+	pendingCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+	_ = h.appendCriticalChatEvent(pendingCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":confirmation-pending", "tool.confirmation.pending", payload)
+	cancel()
+}
+
+func (h *AdminHandler) appendCurrentConfirmationEvent(store DataStore, options chatRunOptions) {
+	confirmation, found := h.governance.ConfirmationForRequest(options.tenant.TenantID, options.requestID)
+	if !found || confirmation.Status == ConfirmationPending {
+		return
+	}
+	payload := h.chatIdentityPayload(options, map[string]string{
+		"confirmation_id": confirmation.ID, "tool_name": confirmation.ToolName,
+		"argument_summary": confirmation.ArgumentSummary, "status": string(confirmation.Status),
+	})
+	eventCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+	_ = h.appendCriticalChatEvent(eventCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":confirmation-"+string(confirmation.Status), "tool.confirmation."+string(confirmation.Status), payload)
+	cancel()
 }
 
 func providerDeliveryBinding(binding ChannelBinding) ChannelBinding {
@@ -1398,6 +1470,11 @@ func chatTerminalEvent(events []SessionEvent, requestID string) *SessionEvent {
 func chatRunStatus(events []SessionEvent, requestID string) string {
 	terminal := chatTerminalEvent(events, requestID)
 	if terminal == nil {
+		for _, event := range events {
+			if event.IdempotencyKey == requestID+":confirmation-pending" {
+				return "pending"
+			}
+		}
 		return "running"
 	}
 	switch terminal.Type {

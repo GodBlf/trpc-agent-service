@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,7 +27,21 @@ func (h *AdminHandler) handleGovernance(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 			return
 		}
-		writeJSON(w, http.StatusOK, h.governance.Metrics(tenant.TenantID))
+		from, fromErr := parseOptionalRFC3339(r.URL.Query().Get("from"))
+		to, toErr := parseOptionalRFC3339(r.URL.Query().Get("to"))
+		if fromErr != nil || toErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_metrics_query", "metrics query is invalid")
+			return
+		}
+		metrics, err := h.governance.QueryMetrics(MetricsQuery{
+			TenantID: tenant.TenantID, AgentAppID: strings.TrimSpace(r.URL.Query().Get("app_id")),
+			Provider: strings.TrimSpace(r.URL.Query().Get("provider")), From: from, To: to,
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_metrics_query", "metrics query is invalid")
+			return
+		}
+		writeJSON(w, http.StatusOK, metrics)
 	case path == "traces":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
@@ -49,6 +64,13 @@ func (h *AdminHandler) handleGovernance(w http.ResponseWriter, r *http.Request) 
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func parseOptionalRFC3339(value string) (time.Time, error) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, value)
 }
 
 func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Request, tenant TenantContext) {
@@ -156,5 +178,23 @@ func (h *AdminHandler) handleConfirmationDecision(w http.ResponseWriter, r *http
 		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
+	if err := h.appendConfirmationSessionEvent(r.Context(), confirmation); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_error", "confirmation event could not be persisted")
+		return
+	}
 	writeJSON(w, http.StatusOK, confirmation)
+}
+
+func (h *AdminHandler) appendConfirmationSessionEvent(ctx context.Context, confirmation ToolConfirmation) error {
+	store, release, err := h.acquireStore(confirmation.TenantID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	payload := map[string]string{
+		"tenant_id": confirmation.TenantID, "app_id": confirmation.AgentAppID, "session_id": confirmation.SessionID,
+		"request_id": confirmation.RequestID, "trace_id": confirmation.TraceID, "confirmation_id": confirmation.ID,
+		"tool_name": confirmation.ToolName, "argument_summary": confirmation.ArgumentSummary, "status": string(confirmation.Status),
+	}
+	return h.appendCriticalChatEvent(ctx, store, confirmation.TenantID, confirmation.SessionID, confirmation.RequestID+":confirmation-"+string(confirmation.Status), "tool.confirmation."+string(confirmation.Status), payload)
 }

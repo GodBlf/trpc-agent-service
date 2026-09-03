@@ -94,7 +94,7 @@ func TestSuccessfulMutationBecomesAuditUnavailableWhenAuditCannotPersist(t *test
 	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	handler.governance.path = filepath.Join(blocker, "governance.json")
+	handler.governance.SetPersistencePath(filepath.Join(blocker, "governance.json"))
 	server, client := newHandlerClient(t, handler)
 	defer server.Close()
 	response := postJSONWithKey(t, client, server.URL+"/api/v1/admin/tenants", `{"id":"tenant-new","name":"Tenant New"}`, "")
@@ -246,7 +246,7 @@ func TestExternalIMUserPolicyDeniesBeforeRunner(t *testing.T) {
 	}
 }
 
-func TestDeploymentToolPolicyAndDangerousConfirmationGateRunner(t *testing.T) {
+func TestDeploymentToolPolicyGatesDeclarationsWithoutPreflightConfirmation(t *testing.T) {
 	runs := make(chan RunnerRequest, 2)
 	client := newChannelTestClient(t, requestCapturingRunner{requests: runs})
 	client.post("/api/v1/admin/agent-apps", `{"id":"app-one","name":"App"}`, nil, http.StatusCreated, nil)
@@ -262,26 +262,14 @@ func TestDeploymentToolPolicyAndDangerousConfirmationGateRunner(t *testing.T) {
 	assertChannelAPIError(t, response, http.StatusForbidden, "tool_not_allowed")
 
 	_, _ = client.handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-one", AllowedTools: []string{"deploy"}, AllowedMCP: []string{"calendar"}, DangerousTools: []string{"deploy"}})
-	response = client.do(http.MethodPost, "/api/v1/chat/sessions/session-one/messages", `{"input":"ship"}`, map[string]string{"X-Request-ID": "request-confirm"})
-	var pending struct {
-		Error          errorBody `json:"error"`
-		ConfirmationID string    `json:"confirmation_id"`
-		TraceID        string    `json:"trace_id"`
-	}
-	decodeResponse(t, response, http.StatusConflict, &pending)
-	if pending.Error.Code != "confirmation_required" || pending.ConfirmationID == "" || pending.TraceID == "" {
-		t.Fatalf("pending = %#v", pending)
-	}
-	var confirmation ToolConfirmation
-	client.post("/api/v1/admin/governance/confirmations/"+pending.ConfirmationID+"/decision", `{"approve":true}`, nil, http.StatusOK, &confirmation)
 	client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"ship"}`, map[string]string{"X-Request-ID": "request-confirm"}, http.StatusAccepted, nil)
 	select {
 	case request := <-runs:
-		if request.TraceID != pending.TraceID || request.Input != "ship" {
+		if request.TraceID == "" || request.Input != "ship" {
 			t.Fatalf("Runner request = %#v", request)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("approved Tool request did not reach Runner")
+		t.Fatal("allowed Tool declaration did not reach Runner")
 	}
 	select {
 	case request := <-runs:
@@ -293,7 +281,12 @@ func TestDeploymentToolPolicyAndDangerousConfirmationGateRunner(t *testing.T) {
 func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
 	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
-	result, _ := handler.governance.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a", Input: "ship", RequiredTools: []string{"deploy"}})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a", Input: "ship", RequiredTools: []string{"deploy"}}
+	result, _ := handler.governance.Evaluate(context.Background(), request)
+	var pendingErr *GovernanceError
+	if err := handler.governance.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"production"}`)); !errors.As(err, &pendingErr) || pendingErr.ConfirmationID == "" {
+		t.Fatalf("pending Tool confirmation error = %v", err)
+	}
 	server, client := newHandlerClient(t, handler)
 	defer server.Close()
 
@@ -302,11 +295,11 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	}
 	response, _ := client.Get(server.URL + "/api/v1/admin/governance/confirmations")
 	decodeResponse(t, response, http.StatusOK, &confirmations)
-	if len(confirmations.Items) != 1 || confirmations.Items[0].ID != result.ConfirmationID {
+	if len(confirmations.Items) != 1 || confirmations.Items[0].ID != pendingErr.ConfirmationID {
 		t.Fatalf("confirmations = %#v", confirmations.Items)
 	}
 	var decided ToolConfirmation
-	requireJSONResponse(t, client, server.URL+"/api/v1/admin/governance/confirmations/"+result.ConfirmationID+"/decision", `{"approve":true}`, "", http.StatusOK, &decided)
+	requireJSONResponse(t, client, server.URL+"/api/v1/admin/governance/confirmations/"+pendingErr.ConfirmationID+"/decision", `{"approve":true}`, "", http.StatusOK, &decided)
 	if decided.Status != ConfirmationApproved {
 		t.Fatalf("decision = %#v", decided)
 	}
@@ -317,6 +310,8 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	if metrics.Requests == 0 {
 		t.Fatalf("metrics = %#v", metrics)
 	}
+	response, _ = client.Get(server.URL + "/api/v1/admin/governance/metrics?from=2026-01-01T00:00:00Z&to=2026-03-15T00:00:00Z")
+	assertAPIError(t, response, http.StatusBadRequest, "invalid_metrics_query")
 	var trace PlatformTrace
 	response, _ = client.Get(server.URL + "/api/v1/admin/governance/traces?trace_id=" + result.TraceID)
 	decodeResponse(t, response, http.StatusOK, &trace)

@@ -17,16 +17,28 @@ test("govern governance decisions and inspect their trace without secret disclos
     };
     await request("/api/v1/admin/agent-apps", { id: appID, name: `Stage 5 ${suffix}` });
     await request("/api/v1/admin/deployments", { id: deploymentID, agent_app_id: appID });
-    const version = await request(`/api/v1/admin/deployments/${deploymentID}/versions`, { config: { runner: "framework", tools: ["deploy"] } }, { "Idempotency-Key": `stage5-${suffix}` });
+    await request(`/api/v1/admin/deployments/${deploymentID}/versions`, { config: { runner: "framework", tools: ["deploy"], deterministic_tool_call: "deploy" } }, { "Idempotency-Key": `stage5-${suffix}` });
+    const versionResponse = await fetch(`/api/v1/admin/deployments/${deploymentID}/versions`);
+    const versionList = await versionResponse.json() as { items: { id: string }[] };
+    const version = versionList.items[0];
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "published", version_id: version.id });
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "active" });
-    await request("/api/v1/admin/governance/policy", { agent_app_id: appID, allowed_tools: ["deploy"], dangerous_tools: ["deploy"], redacted_patterns: [secretCanary], token_budget: 100, estimated_tokens_per_run: 5, rate_limit: 10, rate_window_seconds: 60 });
+    await request("/api/v1/admin/governance/policy", { agent_app_id: appID, allowed_tools: ["deploy"], dangerous_tools: ["deploy"], redacted_patterns: [secretCanary], token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60 });
     await request("/api/v1/chat/sessions", { app_id: appID, session_id: sessionID });
-    return request(`/api/v1/chat/sessions/${sessionID}/messages`, { input: `release ${secretCanary}` }, { "X-Request-ID": requestID });
+    await request(`/api/v1/chat/sessions/${sessionID}/messages`, { input: `release ${secretCanary}` }, { "X-Request-ID": requestID });
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const response = await fetch("/api/v1/admin/governance/confirmations");
+      const payload = await response.json() as { items: { request_id: string; confirmation_id?: string; id: string; trace_id: string; status: string }[] };
+      const item = payload.items.find((candidate) => candidate.request_id === requestID && candidate.status === "pending");
+      if (item) return item;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("confirmation was not created by actual Tool invocation");
   }, { appID, deploymentID, sessionID, requestID, secretCanary, suffix });
 
-  expect(String(pending.confirmation_id)).not.toBe("");
+  expect(String(pending.id)).not.toBe("");
   expect(String(pending.trace_id)).not.toBe("");
+  await page.reload();
   await page.getByRole("button", { name: "治理观测" }).click();
   await page.getByRole("button", { name: "确认" }).click();
   const confirmationRow = page.getByText(requestID).locator("xpath=ancestor::tr");
@@ -37,8 +49,13 @@ test("govern governance decisions and inspect their trace without secret disclos
   await page.evaluate(async ({ sessionID, requestID, secretCanary }) => {
     const response = await fetch(`/api/v1/chat/sessions/${sessionID}/messages`, { method: "POST", headers: { "Content-Type": "application/json", "X-Request-ID": requestID }, body: JSON.stringify({ input: `release ${secretCanary}` }) });
     if (!response.ok) throw new Error(`retry: ${response.status}`);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const events = await fetch(`/api/v1/admin/sessions/${sessionID}/events`).then((item) => item.json()) as { items: { type: string; idempotency_key: string }[] };
+      if (events.items.some((item) => item.type === "run.completed" && (item.idempotency_key === `${requestID}:terminal` || item.idempotency_key === `${requestID}:run-completed`))) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("approved Tool request did not complete");
   }, { sessionID, requestID, secretCanary });
-  await page.waitForTimeout(100);
   await page.getByRole("button", { name: "指标与成本" }).click();
   await page.getByLabel("Request 或 Trace ID").fill(String(pending.trace_id));
   await page.getByRole("button", { name: "查询 Trace" }).click();

@@ -8,7 +8,7 @@ type View = "策略" | "确认" | "审计" | "指标与成本";
 const emptyPolicy = (appID = ""): TenantPolicy => ({
   tenant_id: "", agent_app_id: appID, revision: 0, allowed_tools: [], allowed_mcp: [], dangerous_tools: [],
   denied_input_patterns: [], denied_output_patterns: [], redacted_patterns: [], allowed_im_users: [], allowed_im_subjects: [],
-  token_budget: 0, cost_budget: 0, cost_per_token: 0, estimated_tokens_per_run: 0, rate_limit: 0, rate_window_seconds: 60,
+  token_budget: 0, cost_budget: 0, cost_per_token: 0, tool_costs: {}, estimated_tokens_per_run: 0, rate_limit: 0, rate_window_seconds: 60,
 });
 
 export function GovernancePage({ identity }: { identity: Identity }) {
@@ -18,6 +18,9 @@ export function GovernancePage({ identity }: { identity: Identity }) {
   const [audits, setAudits] = useState<AuditEvent[]>([]);
   const [confirmations, setConfirmations] = useState<ToolConfirmation[]>([]);
   const [metrics, setMetrics] = useState<TenantMetrics>();
+	const [metricsAppID, setMetricsAppID] = useState("");
+	const [metricsProvider, setMetricsProvider] = useState("");
+	const [metricsHours, setMetricsHours] = useState(24);
   const [trace, setTrace] = useState<PlatformTrace>();
   const [traceID, setTraceID] = useState("");
   const [auditDecision, setAuditDecision] = useState("");
@@ -44,6 +47,7 @@ export function GovernancePage({ identity }: { identity: Identity }) {
     catch { setPolicy(emptyPolicy(appID)); }
   };
   const list = (value: string) => value.split(",").map((item) => item.trim()).filter(Boolean);
+	const costs = (value: string) => Object.fromEntries(value.split(",").map((item) => item.trim().split("=")).filter(([name, cost]) => name && cost !== undefined && Number.isFinite(Number(cost))).map(([name, cost]) => [name, Number(cost)]));
   const save = async () => {
     try { const updated = await api.saveGovernancePolicy(policy); setPolicy(updated); setStatus(`策略 revision ${updated.revision} 已生效`); }
     catch { setStatus("策略保存失败"); }
@@ -64,6 +68,13 @@ export function GovernancePage({ identity }: { identity: Identity }) {
       setStatus("审计查询失败");
     }
   };
+	const refreshMetrics = async () => {
+		setStatus("");
+		const to = new Date();
+		const from = new Date(to.getTime() - metricsHours * 60 * 60 * 1000);
+		try { setMetrics(await api.governanceMetrics({ app_id: metricsAppID, provider: metricsProvider as "" | "mock" | "enterprise_wechat" | "telegram", from: from.toISOString(), to: to.toISOString() })); }
+		catch { setStatus("指标查询失败"); }
+	};
 
   if (failed) return <AsyncState kind="error" />;
   return <div className="governance-page">
@@ -86,12 +97,13 @@ export function GovernancePage({ identity }: { identity: Identity }) {
         <NumberField label="Token 预算" value={policy.token_budget} onChange={(value) => setPolicy({ ...policy, token_budget: value })} />
         <NumberField label="成本预算" value={policy.cost_budget} step="0.01" onChange={(value) => setPolicy({ ...policy, cost_budget: value })} />
         <NumberField label="每 Token 成本" value={policy.cost_per_token} step="0.0001" onChange={(value) => setPolicy({ ...policy, cost_per_token: value })} />
+		<ListField label="Tool 成本" value={Object.entries(policy.tool_costs).map(([name, cost]) => `${name}=${cost}`)} onChange={(value) => setPolicy({ ...policy, tool_costs: costs(value) })} />
         <NumberField label="单次预留 Token" value={policy.estimated_tokens_per_run} onChange={(value) => setPolicy({ ...policy, estimated_tokens_per_run: value })} />
         <NumberField label="每窗口请求数" value={policy.rate_limit} onChange={(value) => setPolicy({ ...policy, rate_limit: value })} />
         <NumberField label="限流窗口秒数" value={policy.rate_window_seconds} onChange={(value) => setPolicy({ ...policy, rate_window_seconds: value })} />
       </div>
     </section>}
-    {view === "确认" && <section className="governance-band"><div className="section-toolbar"><strong>危险 Tool 确认</strong></div>{confirmations.length === 0 ? <AsyncState kind="empty" /> : <div className="table-wrap"><table><thead><tr><th>Tool</th><th>Request</th><th>状态</th><th>过期时间</th><th>操作</th></tr></thead><tbody>{confirmations.map((item) => <tr key={item.id}><td>{item.tool_name}</td><td><code>{item.request_id}</code></td><td><span className={`status ${item.status}`}>{item.status}</span></td><td>{item.expires_at}</td><td><div className="row-actions"><button className="icon-button" title="批准" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, true)}><Check /></button><button className="icon-button" title="拒绝" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, false)}><X /></button></div></td></tr>)}</tbody></table></div>}</section>}
+    {view === "确认" && <section className="governance-band"><div className="section-toolbar"><strong>危险 Tool 确认</strong></div>{confirmations.length === 0 ? <AsyncState kind="empty" /> : <div className="table-wrap"><table><thead><tr><th>Tool</th><th>参数摘要</th><th>Request</th><th>状态</th><th>过期时间</th><th>操作</th></tr></thead><tbody>{confirmations.map((item) => <tr key={item.id}><td>{item.tool_name}</td><td><code>{item.argument_summary}</code></td><td><code>{item.request_id}</code></td><td><span className={`status ${item.status}`}>{item.status}</span></td><td>{item.expires_at}</td><td><div className="row-actions"><button className="icon-button" title="批准" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, true)}><Check /></button><button className="icon-button" title="拒绝" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, false)}><X /></button></div></td></tr>)}</tbody></table></div>}</section>}
     {view === "审计" && <section className="governance-band">
       <div className="section-toolbar"><strong>Audit Events</strong><span>{audits.length} 条</span></div>
       <div className="audit-filters">
@@ -103,7 +115,14 @@ export function GovernancePage({ identity }: { identity: Identity }) {
       {audits.length === 0 ? <AsyncState kind="empty" /> : <div className="table-wrap"><table><thead><tr><th>决策</th><th>检查点</th><th>规则/错误</th><th>用户</th><th>Request</th><th>Trace</th><th>成本</th></tr></thead><tbody>{audits.map((item) => <tr key={item.id}><td>{item.decision}</td><td>{item.checkpoint || "-"}</td><td>{item.rule || item.error_type || "-"}</td><td>{item.user_id || "-"}</td><td><code>{item.request_id || "-"}</code></td><td><code>{item.trace_id}</code></td><td>{item.cost}</td></tr>)}</tbody></table></div>}
     </section>}
     {view === "指标与成本" && <section className="governance-band">
-      <div className="metrics-strip"><Metric icon={<ShieldCheck />} label="请求" value={metrics?.requests ?? 0} /><Metric icon={<Check />} label="完成" value={metrics?.completed_executions ?? 0} /><Metric icon={<X />} label="拒绝" value={metrics?.denied_requests ?? 0} /><Metric icon={<Gauge />} label="Tokens" value={metrics?.tokens ?? 0} /><Metric icon={<Gauge />} label="剩余 Tokens" value={metrics?.tokens_remaining ?? 0} /><Metric icon={<Gauge />} label="成本" value={metrics?.cost ?? 0} /><Metric icon={<Gauge />} label="剩余成本" value={metrics?.cost_remaining ?? 0} /></div>
+		<div className="metrics-filters">
+			<label>Agent 应用<select value={metricsAppID} onChange={(event) => setMetricsAppID(event.target.value)}><option value="">全部</option>{apps.map((app) => <option value={app.id} key={app.id}>{app.name}</option>)}</select></label>
+			<label>Provider<select value={metricsProvider} onChange={(event) => setMetricsProvider(event.target.value)}><option value="">全部</option><option value="mock">Mock IM</option><option value="enterprise_wechat">Enterprise WeChat</option><option value="telegram">Telegram</option></select></label>
+			<label>时间窗<select value={metricsHours} onChange={(event) => setMetricsHours(Number(event.target.value))}><option value={1}>最近 1 小时</option><option value={24}>最近 24 小时</option><option value={168}>最近 7 天</option><option value={720}>最近 30 天</option></select></label>
+			<button onClick={() => void refreshMetrics()}><Search aria-hidden="true" />查询指标</button>
+		</div>
+      <div className="metrics-strip"><Metric icon={<ShieldCheck />} label="请求" value={metrics?.requests ?? 0} /><Metric icon={<Gauge />} label="执行中" value={metrics?.active_executions ?? 0} /><Metric icon={<Check />} label="完成" value={metrics?.completed_executions ?? 0} /><Metric icon={<X />} label="失败" value={metrics?.failed_executions ?? 0} /><Metric icon={<X />} label="拒绝" value={metrics?.denied_requests ?? 0} /><Metric icon={<Gauge />} label="限流" value={metrics?.rate_limited_requests ?? 0} /><Metric icon={<Gauge />} label="模型延迟 ms" value={metrics?.model_latency_ms ?? 0} /><Metric icon={<Gauge />} label="Tool 延迟 ms" value={metrics?.tool_latency_ms ?? 0} /><Metric icon={<Gauge />} label="存储延迟 ms" value={metrics?.storage_latency_ms ?? 0} /><Metric icon={<Check />} label="IM 成功" value={metrics?.im_delivered ?? 0} /><Metric icon={<X />} label="IM 失败" value={metrics?.im_failed ?? 0} /><Metric icon={<Gauge />} label="Tokens" value={metrics?.tokens ?? 0} /><Metric icon={<Gauge />} label="剩余 Tokens" value={metrics?.tokens_remaining ?? 0} /><Metric icon={<Gauge />} label="成本" value={metrics?.cost ?? 0} /><Metric icon={<Gauge />} label="剩余成本" value={metrics?.cost_remaining ?? 0} /></div>
+		{metrics?.budget_period_from && <small className="metrics-period">预算周期始于 {metrics.budget_period_from}</small>}
       <div className="trace-toolbar"><label>Request 或 Trace ID<input value={traceID} onChange={(event) => setTraceID(event.target.value)} /></label><button onClick={() => void findTrace()} disabled={!traceID}><Search aria-hidden="true" />查询 Trace</button></div>
       {trace && <ol className="trace-list">{trace.spans.map((span, index) => <li key={`${span.name}-${index}`}><span>{index + 1}</span><strong>{span.name}</strong><small className={`status ${span.status === "ok" ? "healthy" : "error"}`}>{span.status}</small></li>)}</ol>}
     </section>}

@@ -149,10 +149,14 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
 .section-toolbar > div { display: grid; gap: 3px; }
 .section-toolbar small { color: #68756f; }
 .policy-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; border-top: 1px solid #dce3df; border-bottom: 1px solid #dce3df; padding: 18px 0; }
-.policy-grid label, .trace-toolbar label, .audit-filters label { display: grid; gap: 6px; color: #68756f; font-size: 12px; min-width: 0; }
-.policy-grid input, .policy-grid select, .trace-toolbar input, .audit-filters input { min-width: 0; width: 100%; border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 8px 10px; }
+.policy-grid label, .trace-toolbar label, .audit-filters label, .metrics-filters label { display: grid; gap: 6px; color: #68756f; font-size: 12px; min-width: 0; }
+.policy-grid input, .policy-grid select, .trace-toolbar input, .audit-filters input, .metrics-filters select { min-width: 0; width: 100%; border: 1px solid #cbd5d0; border-radius: 6px; background: white; padding: 8px 10px; }
 .row-actions { display: flex; gap: 4px; }
-.metrics-strip { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); overflow-x: auto; border-top: 1px solid #dce3df; border-bottom: 1px solid #dce3df; }
+.metrics-filters { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)) auto; align-items: end; gap: 10px; }
+.metrics-filters button { min-height: 36px; border: 1px solid #cbd5d0; border-radius: 6px; background: white; display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px; }
+.metrics-filters button svg { width: 17px; }
+.metrics-strip { display: grid; grid-template-columns: repeat(15, minmax(110px, 1fr)); overflow-x: auto; border-top: 1px solid #dce3df; border-bottom: 1px solid #dce3df; }
+.metrics-period { color: #68756f; }
 .metric-item { min-height: 92px; padding: 14px; display: grid; grid-template-columns: 22px 1fr; align-items: center; border-right: 1px solid #dce3df; }
 .metric-item:last-child { border-right: 0; }
 .metric-item svg { width: 18px; color: #36735f; }
@@ -195,6 +199,7 @@ dd { margin: 0 0 12px; overflow-wrap: anywhere; }
   .segmented-control { width: 100%; overflow-x: auto; }
   .segmented-control button { flex: 1 0 auto; }
   .metrics-strip { grid-template-columns: repeat(5, minmax(110px, 1fr)); overflow-x: auto; }
+  .metrics-filters { grid-template-columns: 1fr; }
   .trace-toolbar { grid-template-columns: 1fr; }
   .audit-filters { grid-template-columns: 1fr; }
 }
