@@ -101,6 +101,22 @@ func TestSuccessfulMutationBecomesAuditUnavailableWhenAuditCannotPersist(t *test
 	assertAPIError(t, response, http.StatusServiceUnavailable, "audit_unavailable")
 }
 
+func TestAuthMeBecomesAuditUnavailableWhenAuditCannotPersist(t *testing.T) {
+	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RolePlatformAdmin}}})
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler.governance.SetPersistencePath(filepath.Join(blocker, "governance.json"))
+	server, client := newHandlerClient(t, handler)
+	defer server.Close()
+	response, err := client.Get(server.URL + "/api/v1/auth/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAPIError(t, response, http.StatusServiceUnavailable, "audit_unavailable")
+}
+
 func TestGovernancePolicyRunsBeforeChatRunnerAndPropagatesTrace(t *testing.T) {
 	runs := make(chan RunnerRequest, 2)
 	client := newChannelTestClient(t, requestCapturingRunner{requests: runs})
@@ -302,6 +318,25 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	requireJSONResponse(t, client, server.URL+"/api/v1/admin/governance/confirmations/"+pendingErr.ConfirmationID+"/decision", `{"approve":true}`, "", http.StatusOK, &decided)
 	if decided.Status != ConfirmationApproved {
 		t.Fatalf("decision = %#v", decided)
+	}
+	store, release, err := handler.acquireStore("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListSessionEvents(context.Background(), "tenant-a", "session-a", 0)
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundConfirmationEvent := false
+	for _, event := range events {
+		if event.Type == "tool.confirmation.approved" && event.IdempotencyKey == "request-a:confirmation-approved" {
+			foundConfirmationEvent = true
+			break
+		}
+	}
+	if !foundConfirmationEvent {
+		t.Fatalf("approved confirmation Session Event missing: %#v", events)
 	}
 
 	var metrics TenantMetrics

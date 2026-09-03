@@ -339,11 +339,11 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	auditWriter := &auditResponseWriter{ResponseWriter: w, buffered: r.Method != http.MethodGet}
+	auditWriter := &auditResponseWriter{ResponseWriter: w, buffered: r.Method != http.MethodGet || r.URL.Path == "/api/v1/auth/me"}
 	w = auditWriter
 	started := time.Now()
 	defer func() {
-		if err := h.auditHTTPRequest(context.Background(), r, auditWriter, started); err != nil && auditWriter.buffered && auditWriter.status < http.StatusBadRequest {
+		if err := h.auditHTTPRequest(context.Background(), r, auditWriter, started); err != nil && auditWriter.buffered {
 			auditWriter.auditUnavailable()
 		}
 		auditWriter.commit()

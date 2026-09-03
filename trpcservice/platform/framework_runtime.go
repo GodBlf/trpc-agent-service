@@ -29,6 +29,8 @@ type StreamingRunnerAdapter interface {
 
 type AgentFactory func(context.Context, DeploymentVersion) (frameworkagent.Agent, error)
 
+type governanceReplayContextKey struct{}
+
 func DefaultAgentFactory() AgentFactory {
 	return func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
 		if toolName, _ := version.Config["deterministic_tool_call"].(string); toolName != "" {
@@ -131,6 +133,11 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
 			SessionID: request.SessionID, RequestID: request.RequestID,
 		}, request.TraceID, args.ToolName, args.Arguments)
+		if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
+			if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
+				return &frameworktool.BeforeToolResult{CustomResult: replay}, nil
+			}
+		}
 		return nil, err
 	})
 	registry.AfterTool(func(ctx context.Context, args *frameworktool.AfterToolArgs) (*frameworktool.AfterToolResult, error) {
@@ -181,7 +188,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	if err != nil {
 		return nil, err
 	}
-	runCtx, cancel := context.WithCancel(withRunnerIdentity(ctx, request))
+	runCtx, cancel := context.WithCancel(context.WithValue(withRunnerIdentity(ctx, request), governanceReplayContextKey{}, true))
 	runID, registered := a.registerRun(request.VersionID, cancel)
 	if !registered {
 		cancel()

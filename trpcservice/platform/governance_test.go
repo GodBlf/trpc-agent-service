@@ -85,6 +85,52 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	}
 }
 
+func TestGovernancePersistenceRestoresActiveExecutionAndToolStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "governance.json")
+	center, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
+		TokenBudget: 10, EstimatedTokensPerRun: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", SessionID: "session-a", RequestID: "request-a", RequiredTools: []string{"deploy"}}
+	result, err := center.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"stage5"}`)); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("initial tool authorization = %v", err)
+	}
+	confirmation := center.Confirmations("tenant-a")[0]
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"stage5"}`)); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics := reloaded.Metrics("tenant-a"); metrics.Active != 1 {
+		t.Fatalf("active reservation was not restored: %#v", metrics)
+	}
+	if err := reloaded.CompleteTool(context.Background(), request, result.TraceID, "deploy", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloaded.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Tokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if status := reloaded.Confirmations("tenant-a")[0].Status; status != ConfirmationCompleted {
+		t.Fatalf("restored Tool confirmation status = %q", status)
+	}
+}
+
 func TestGovernanceCenterEncryptsRedactionPatternsAtRest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "governance.json")
 	center, err := NewPersistentGovernanceCenter(path)
@@ -268,6 +314,56 @@ func TestGovernanceCenterRequiresDangerousToolConfirmationExactlyOnce(t *testing
 	}
 }
 
+func TestGovernanceToolCompletionFailureKeepsTerminalStateForRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "governance.json")
+	center, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}, TokenBudget: 10, EstimatedTokensPerRun: 1})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", SessionID: "session-a", RequestID: "request-a"}
+	result, err := center.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := []byte(`{"target":"stage5"}`)
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("initial tool authorization = %v", err)
+	}
+	confirmation := center.Confirmations("tenant-a")[0]
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	center.SetPersistencePath(filepath.Join(blocker, "governance.json"))
+	if err := center.CompleteTool(context.Background(), request, result.TraceID, "deploy", nil); !IsGovernanceError(err, "audit_unavailable") {
+		t.Fatalf("Tool completion persistence error = %v", err)
+	}
+	if status := center.Confirmations("tenant-a")[0].Status; status != ConfirmationCompleted {
+		t.Fatalf("Tool completion was rolled back after side effect: %q", status)
+	}
+	center.SetPersistencePath(path)
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); !IsGovernanceError(err, "confirmation_consumed") {
+		t.Fatalf("recovery retry authorized a second side effect: %v", err)
+	}
+	if _, err := center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Tokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewPersistentGovernanceCenter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := reloaded.Confirmations("tenant-a")[0].Status; status != ConfirmationCompleted {
+		t.Fatalf("recovered Tool completion status = %q", status)
+	}
+}
+
 func TestGovernanceCenterAuthorizesActualToolCallAndHashesArguments(t *testing.T) {
 	center := NewGovernanceCenter()
 	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
@@ -330,7 +426,7 @@ func TestGovernanceCenterReconcilesExpiredReservationExactlyOnce(t *testing.T) {
 	center := NewGovernanceCenter()
 	center.now = func() time.Time { return now }
 	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
-		TenantID: "tenant-a", AgentAppID: "app-a", TokenBudget: 1, EstimatedTokensPerRun: 1,
+		TenantID: "tenant-a", AgentAppID: "app-a", TokenBudget: 2, EstimatedTokensPerRun: 1,
 	})
 	if _, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Input: "one"}); err != nil {
 		t.Fatal(err)
@@ -345,6 +441,16 @@ func TestGovernanceCenterReconcilesExpiredReservationExactlyOnce(t *testing.T) {
 	}
 	if audits := center.AuditEvents(AuditQuery{TenantID: "tenant-a", Decision: "reservation.expired", Limit: 10}); len(audits) != 1 {
 		t.Fatalf("reservation expiry audits = %#v", audits)
+	}
+	result, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Input: "one"})
+	if err != nil || !result.NewExecution {
+		t.Fatalf("same request did not receive a fresh reservation after expiry: result=%#v err=%v", result, err)
+	}
+	if _, err := center.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-one", Tokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if audits := center.AuditEvents(AuditQuery{TenantID: "tenant-a", Decision: "reservation.expired", Limit: 10}); len(audits) != 1 {
+		t.Fatalf("same request expiry was reconciled more than once: %#v", audits)
 	}
 }
 
@@ -386,6 +492,38 @@ func TestGovernanceMetricsQueryUsesBoundedAppProviderAndTimeDimensions(t *testin
 	}
 	if _, err := center.QueryMetrics(MetricsQuery{TenantID: "tenant-a", From: now.Add(-32 * 24 * time.Hour), To: now}); err == nil {
 		t.Fatal("unbounded metrics range was accepted")
+	}
+}
+
+func TestGovernanceToolLatencyKeepsProviderDimension(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	center := NewGovernanceCenter()
+	center.now = func() time.Time { return now }
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", Channel: ChannelTelegram, RequestID: "request-a"}
+	if _, err := center.Evaluate(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, "trace-a", "deploy", []byte(`{"target":"stage5"}`)); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("initial tool authorization = %v", err)
+	}
+	confirmation := center.Confirmations("tenant-a")[0]
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, "trace-a", "deploy", []byte(`{"target":"stage5"}`)); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Millisecond)
+	if err := center.CompleteTool(context.Background(), request, "trace-a", "deploy", nil); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := center.QueryMetrics(MetricsQuery{TenantID: "tenant-a", AgentAppID: "app-a", Provider: ChannelTelegram, From: now.Add(-time.Hour), To: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.ToolLatencyMS != 25 {
+		t.Fatalf("provider-filtered tool latency = %d, want 25", metrics.ToolLatencyMS)
 	}
 }
 

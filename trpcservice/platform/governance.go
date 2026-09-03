@@ -203,6 +203,23 @@ type governanceExecution struct {
 	toolCost     float64
 	started      time.Time
 	active       bool
+	expired      bool
+}
+
+type persistedGovernanceExecution struct {
+	TraceID      string             `json:"trace_id"`
+	AppID        string             `json:"app_id"`
+	SessionID    string             `json:"session_id"`
+	RequestID    string             `json:"request_id"`
+	Provider     string             `json:"provider,omitempty"`
+	Reserved     int64              `json:"reserved"`
+	ReservedCost float64            `json:"reserved_cost"`
+	CostPerToken float64            `json:"cost_per_token"`
+	ToolCosts    map[string]float64 `json:"tool_costs,omitempty"`
+	ToolCost     float64            `json:"tool_cost"`
+	Started      time.Time          `json:"started"`
+	Active       bool               `json:"active"`
+	Expired      bool               `json:"expired,omitempty"`
 }
 
 type rateWindow struct {
@@ -230,14 +247,16 @@ type GovernanceCenter struct {
 }
 
 type governanceSnapshot struct {
-	Policies                  map[string]TenantPolicy     `json:"policies"`
-	EncryptedRedactedPatterns map[string]string           `json:"encrypted_redacted_patterns,omitempty"`
-	Audits                    []AuditEvent                `json:"audits"`
-	Confirmations             map[string]ToolConfirmation `json:"confirmations"`
-	Metrics                   map[string]TenantMetrics    `json:"metrics"`
-	UsedTokens                map[string]int64            `json:"used_tokens"`
-	Traces                    map[string]PlatformTrace    `json:"traces"`
-	MetricSamples             []MetricSample              `json:"metric_samples,omitempty"`
+	Policies                  map[string]TenantPolicy                 `json:"policies"`
+	EncryptedRedactedPatterns map[string]string                       `json:"encrypted_redacted_patterns,omitempty"`
+	Audits                    []AuditEvent                            `json:"audits"`
+	Confirmations             map[string]ToolConfirmation             `json:"confirmations"`
+	Executions                map[string]persistedGovernanceExecution `json:"executions,omitempty"`
+	ToolStarts                map[string]time.Time                    `json:"tool_starts,omitempty"`
+	Metrics                   map[string]TenantMetrics                `json:"metrics"`
+	UsedTokens                map[string]int64                        `json:"used_tokens"`
+	Traces                    map[string]PlatformTrace                `json:"traces"`
+	MetricSamples             []MetricSample                          `json:"metric_samples,omitempty"`
 }
 
 type governanceState struct {
@@ -300,6 +319,17 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 	}
 	if snapshot.Confirmations != nil {
 		center.confirmations = snapshot.Confirmations
+	}
+	for key, execution := range snapshot.Executions {
+		center.executions[key] = governanceExecution{
+			traceID: execution.TraceID, appID: execution.AppID, sessionID: execution.SessionID, requestID: execution.RequestID,
+			provider: execution.Provider, reserved: execution.Reserved, reservedCost: execution.ReservedCost,
+			costPerToken: execution.CostPerToken, toolCosts: cloneToolCosts(execution.ToolCosts), toolCost: execution.ToolCost,
+			started: execution.Started, active: execution.Active, expired: execution.Expired,
+		}
+	}
+	if snapshot.ToolStarts != nil {
+		center.toolStarts = snapshot.ToolStarts
 	}
 	if snapshot.Metrics != nil {
 		center.metrics = snapshot.Metrics
@@ -435,14 +465,22 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 		return result, &GovernanceError{Code: code, TraceID: traceID, ConfirmationID: result.ConfirmationID}
 	}
 	if !configured {
-		if seen {
+		if seen && !prior.expired {
 			return result, nil
+		}
+		if seen && prior.expired {
+			delete(g.executions, key)
+			seen = false
 		}
 		if err := g.allowLocked(request, &result, key, now, 0, 0, TenantPolicy{}); err != nil {
 			g.restoreLocked(checkpoint)
 			return result, &GovernanceError{Code: "audit_unavailable", TraceID: traceID}
 		}
 		return result, nil
+	}
+	if seen && prior.expired {
+		delete(g.executions, key)
+		seen = false
 	}
 	if seen && !prior.active {
 		result.Input = redact(request.Input, policy.RedactedPatterns)
@@ -556,6 +594,7 @@ func (g *GovernanceCenter) reconcileExpiredReservationsLocked(now time.Time) boo
 			continue
 		}
 		execution.active = false
+		execution.expired = true
 		g.executions[key] = execution
 		metrics := g.metrics[strings.SplitN(key, "\x00", 2)[0]]
 		if metrics.Active > 0 {
@@ -761,7 +800,6 @@ func (g *GovernanceCenter) CompleteTool(ctx context.Context, request GovernanceR
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	checkpoint := g.snapshotLocked()
 	now := g.now().UTC()
 	key := toolExecutionKey(request.TenantID, request.RequestID, toolName)
 	started, authorized := g.toolStarts[key]
@@ -777,7 +815,11 @@ func (g *GovernanceCenter) CompleteTool(ctx context.Context, request GovernanceR
 	metrics.TenantID = request.TenantID
 	metrics.ToolLatencyMS += latency.Milliseconds()
 	g.metrics[request.TenantID] = metrics
-	g.recordMetricSampleLocked(request.TenantID, request.AgentAppID, "", now, TenantMetrics{ToolLatencyMS: latency.Milliseconds()})
+	provider := ""
+	if execution, ok := g.executions[executionKey(request.TenantID, request.RequestID)]; ok {
+		provider = execution.provider
+	}
+	g.recordMetricSampleLocked(request.TenantID, request.AgentAppID, provider, now, TenantMetrics{ToolLatencyMS: latency.Milliseconds()})
 	policy := g.policies[governanceKey(request.TenantID, request.AgentAppID)]
 	toolCost := float64(0)
 	if execution, ok := g.executions[executionKey(request.TenantID, request.RequestID)]; ok && execution.active {
@@ -806,7 +848,9 @@ func (g *GovernanceCenter) CompleteTool(ctx context.Context, request GovernanceR
 	g.appendAuditLocked(AuditEvent{TenantID: request.TenantID, UserID: request.UserID, SessionID: request.SessionID, AgentName: request.AgentAppID, ToolName: toolName, Decision: decision, ErrorType: errorType, Cost: toolCost, TraceID: traceID, RequestID: request.RequestID, PolicyRevision: policy.Revision, Checkpoint: "tool.after_call", Latency: latency, OccurredAt: now})
 	g.recordTraceLocked(request, traceID, "tool.execute", status, now)
 	if err := g.persistLocked(); err != nil {
-		g.restoreLocked(checkpoint)
+		// The Tool has already run by the time AfterTool is invoked. Keep its
+		// terminal state in memory when the audit snapshot is unavailable so a
+		// retry can persist the outcome without invoking the Tool again.
 		return &GovernanceError{Code: "audit_unavailable", TraceID: traceID}
 	}
 	return nil
@@ -866,6 +910,29 @@ func (g *GovernanceCenter) ConfirmationForRequest(tenantID, requestID string) (T
 		}
 	}
 	return ToolConfirmation{}, false
+}
+
+// ToolReplayResult returns a model-visible result for a Tool that already
+// reached a terminal confirmation state. This lets a retry reconcile an
+// already-executed Tool without invoking its side effect again.
+func (g *GovernanceCenter) ToolReplayResult(tenantID, requestID, toolName string) (any, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	confirmationID := "confirmation-" + stableID(tenantID+"\x00"+requestID+"\x00"+toolName)
+	confirmation, ok := g.confirmations[confirmationID]
+	if !ok {
+		return nil, false
+	}
+	switch confirmation.Status {
+	case ConfirmationCompleted:
+		return map[string]string{"status": "completed"}, true
+	case ConfirmationFailed:
+		return map[string]string{"status": "failed"}, true
+	case ConfirmationCancelled:
+		return map[string]string{"status": "cancelled"}, true
+	default:
+		return nil, false
+	}
 }
 
 func (g *GovernanceCenter) AuditEvents(query AuditQuery) []AuditEvent {
@@ -1093,7 +1160,16 @@ func (g *GovernanceCenter) persistLocked() error {
 		}
 		persistedPolicies[key] = persisted
 	}
-	snapshot := governanceSnapshot{Policies: persistedPolicies, EncryptedRedactedPatterns: encryptedPatterns, Audits: g.audits, Confirmations: g.confirmations, Metrics: g.metrics, UsedTokens: g.usedTokens, Traces: g.traces, MetricSamples: g.metricSamples}
+	persistedExecutions := make(map[string]persistedGovernanceExecution, len(g.executions))
+	for key, execution := range g.executions {
+		persistedExecutions[key] = persistedGovernanceExecution{
+			TraceID: execution.traceID, AppID: execution.appID, SessionID: execution.sessionID, RequestID: execution.requestID,
+			Provider: execution.provider, Reserved: execution.reserved, ReservedCost: execution.reservedCost,
+			CostPerToken: execution.costPerToken, ToolCosts: cloneToolCosts(execution.toolCosts), ToolCost: execution.toolCost,
+			Started: execution.started, Active: execution.active, Expired: execution.expired,
+		}
+	}
+	snapshot := governanceSnapshot{Policies: persistedPolicies, EncryptedRedactedPatterns: encryptedPatterns, Audits: g.audits, Confirmations: g.confirmations, Executions: persistedExecutions, ToolStarts: g.toolStarts, Metrics: g.metrics, UsedTokens: g.usedTokens, Traces: g.traces, MetricSamples: g.metricSamples}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
