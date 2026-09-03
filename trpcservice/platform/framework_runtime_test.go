@@ -5,14 +5,17 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	serviceagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -38,6 +41,103 @@ func TestFrameworkRunnerAdapterStreamsAndReusesRunner(t *testing.T) {
 	}
 	if len(second) != 3 {
 		t.Fatalf("second events = %#v", second)
+	}
+}
+
+func TestGovernancePluginAuthorizesAtActualToolCallback(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-one", AllowedTools: []string{"search"}})
+	manager := plugin.MustNewManager(&governanceRuntimePlugin{center: center})
+	callbacks := manager.ToolCallbacks()
+	request := RunnerRequest{TenantID: "tenant-one", AppID: "app-one", UserID: "user-one", SessionID: "session-one", RequestID: "request-one", TraceID: "trace-one"}
+	ctx := withRunnerIdentity(context.Background(), request)
+	if _, err := callbacks.RunBeforeTool(ctx, &tool.BeforeToolArgs{ToolName: "search", Arguments: []byte(`{"query":"safe"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callbacks.RunBeforeTool(ctx, &tool.BeforeToolArgs{ToolName: "delete", Arguments: []byte(`{}`)}); err == nil {
+		t.Fatal("disallowed Tool reached invocation")
+	}
+}
+
+func TestGovernancePluginConsumesDangerousConfirmationAndRecordsToolCompletion(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	center := NewGovernanceCenter()
+	center.now = func() time.Time { return now }
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-one", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
+	request := RunnerRequest{TenantID: "tenant-one", AppID: "app-one", UserID: "user-one", SessionID: "session-one", RequestID: "request-one", TraceID: "trace-one"}
+	_, _ = center.Evaluate(context.Background(), GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, RequiredTools: []string{"deploy"}})
+	callbacks := plugin.MustNewManager(&governanceRuntimePlugin{center: center}).ToolCallbacks()
+	ctx := withRunnerIdentity(context.Background(), request)
+	args := &tool.BeforeToolArgs{ToolName: "deploy", Arguments: []byte(`{"target":"production"}`)}
+	if _, err := callbacks.RunBeforeTool(ctx, args); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("initial Tool callback error = %v", err)
+	}
+	pending := center.Confirmations("tenant-one")[0]
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-one", pending.ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callbacks.RunBeforeTool(ctx, args); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Millisecond)
+	if _, err := callbacks.RunAfterTool(ctx, &tool.AfterToolArgs{ToolName: "deploy", Arguments: args.Arguments, Result: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callbacks.RunBeforeTool(ctx, args); !IsGovernanceError(err, "confirmation_consumed") {
+		t.Fatalf("repeated Tool callback error = %v", err)
+	}
+	if metrics := center.Metrics("tenant-one"); metrics.ToolLatencyMS != 25 {
+		t.Fatalf("Tool execution latency = %dms, want 25ms", metrics.ToolLatencyMS)
+	}
+}
+
+func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(t *testing.T) {
+	platform := activeTestPlatform(t)
+	version, ok := platform.DeploymentVersion("deploy-one-v1")
+	if !ok {
+		t.Fatal("active deployment version not found")
+	}
+	version.Config = map[string]any{"runner": "framework", "tools": []any{"deploy"}, "deterministic_tool_call": "deploy"}
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "app-one",
+		AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
+	})
+	adapter := NewFrameworkRunnerAdapter(func(id string) (DeploymentVersion, bool) {
+		if id != version.ID {
+			return DeploymentVersion{}, false
+		}
+		return version, true
+	}, nil)
+	adapter.SetGovernance(center)
+	request := RunnerRequest{
+		TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", VersionID: version.ID,
+		SessionID: "session-one", UserID: "user-one", RequestID: "request-one", TraceID: "trace-one", Input: "ship",
+	}
+	first := collectRuntimeEvents(t, adapter, request)
+	if len(first) != 1 || first[0].Type != "run.failed" || !strings.Contains(first[0].Data["error"], "confirmation_required") {
+		t.Fatalf("first Tool run events = %#v", first)
+	}
+	if metrics := center.Metrics("tenant-one"); metrics.Active != 1 || metrics.Failed != 0 || metrics.Completed != 0 {
+		t.Fatalf("confirmation reservation was reconciled too early: %#v", metrics)
+	}
+	confirmations := center.Confirmations("tenant-one")
+	if len(confirmations) != 1 || confirmations[0].ToolName != "deploy" {
+		t.Fatalf("pending confirmations = %#v", confirmations)
+	}
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-one", confirmations[0].ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	second := collectRuntimeEvents(t, adapter, request)
+	if len(second) < 2 || second[len(second)-1].Type != "run.completed" {
+		t.Fatalf("approved Tool run events = %#v", second)
+	}
+	confirmations = center.Confirmations("tenant-one")
+	if len(confirmations) != 1 || confirmations[0].Status != ConfirmationCompleted {
+		t.Fatalf("completed confirmations = %#v", confirmations)
+	}
+	if metrics := center.Metrics("tenant-one"); metrics.Active != 0 || metrics.Failed != 0 || metrics.Completed != 1 {
+		t.Fatalf("approved retry accounting = %#v", metrics)
 	}
 }
 
@@ -159,6 +259,31 @@ func TestFrameworkRunnerAdapterCloseCancelsActiveRun(t *testing.T) {
 	if !ok || runtimeEvent.Type != "run.cancelled" {
 		t.Fatalf("close event = %#v, want run.cancelled", runtimeEvent)
 	}
+}
+
+func TestFrameworkRunnerAdapterCancellationDoesNotLeakWithoutReader(t *testing.T) {
+	platform := activeTestPlatform(t)
+	adapter := NewFrameworkRunnerAdapter(platform.DeploymentVersion, func(_ context.Context, _ DeploymentVersion) (frameworkagent.Agent, error) {
+		return blockingAgent{}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	events, err := adapter.RunEvents(ctx, RunnerRequest{TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", SessionID: "session-one", UserID: "user-one", Input: "hello", RequestID: "request-one", VersionID: "deploy-one-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		adapter.mu.Lock()
+		remaining := len(adapter.runs["deploy-one-v1"])
+		adapter.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("cancelled run remained registered; events = %#v", events)
 }
 
 func TestFrameworkRunnerAdapterRetiresInactiveVersion(t *testing.T) {

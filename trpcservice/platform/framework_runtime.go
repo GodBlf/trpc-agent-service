@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	serviceagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
+	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 type RuntimeEvent struct {
@@ -26,20 +30,39 @@ type StreamingRunnerAdapter interface {
 
 type AgentFactory func(context.Context, DeploymentVersion) (frameworkagent.Agent, error)
 
+type governanceReplayContextKey struct{}
+type governanceAdmissionContextKey struct{}
+type governanceExternalCompletionContextKey struct{}
+type governanceBufferContextKey struct{}
+
 func DefaultAgentFactory() AgentFactory {
 	return func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
+		if toolName, _ := version.Config["deterministic_tool_call"].(string); toolName != "" {
+			declared := false
+			for _, candidate := range configStrings(version.Config, "tools") {
+				if candidate == toolName {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				return nil, fmt.Errorf("deterministic Tool %q is not declared", toolName)
+			}
+			return serviceagent.NewDeterministicToolAgent(version.AgentAppID, toolName), nil
+		}
 		return serviceagent.NewDeterministicAgent(version.AgentAppID), nil
 	}
 }
 
 type FrameworkRunnerAdapter struct {
-	resolve func(string) (DeploymentVersion, bool)
-	factory AgentFactory
-	mu      sync.Mutex
-	runners map[string]frameworkrunner.Runner
-	runs    map[string]map[uint64]context.CancelFunc
-	nextRun uint64
-	closed  bool
+	resolve    func(string) (DeploymentVersion, bool)
+	factory    AgentFactory
+	mu         sync.Mutex
+	runners    map[string]frameworkrunner.Runner
+	runs       map[string]map[uint64]context.CancelFunc
+	nextRun    uint64
+	closed     bool
+	governance *GovernanceCenter
 }
 
 func NewFrameworkRunnerAdapter(resolve func(string) (DeploymentVersion, bool), factory AgentFactory) *FrameworkRunnerAdapter {
@@ -69,9 +92,107 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 	if err != nil {
 		return nil, fmt.Errorf("agent_factory: %w", err)
 	}
-	runner := frameworkrunner.NewRunner(version.AgentAppID, agent)
+	options := []frameworkrunner.Option{}
+	if a.governance != nil {
+		options = append(options, frameworkrunner.WithPlugins(&governanceRuntimePlugin{center: a.governance}))
+	}
+	runner := frameworkrunner.NewRunner(version.AgentAppID, agent, options...)
 	a.runners[versionID] = runner
 	return runner, nil
+}
+
+func (a *FrameworkRunnerAdapter) SetGovernance(center *GovernanceCenter) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.governance = center
+}
+
+type governanceRuntimePlugin struct{ center *GovernanceCenter }
+
+func (p *governanceRuntimePlugin) Name() string { return "platform-governance" }
+
+func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
+	registry.BeforeAgent(func(ctx context.Context, args *frameworkagent.BeforeAgentArgs) (*frameworkagent.BeforeAgentResult, error) {
+		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
+			if _, admitted := ctx.Value(governanceAdmissionContextKey{}).(bool); !admitted {
+				input := ""
+				if args != nil && args.Invocation != nil {
+					input = args.Invocation.Message.Content
+				}
+				result, err := p.center.Evaluate(ctx, runnerGovernanceRequest(request, nil, nil, input))
+				if err != nil {
+					return nil, err
+				}
+				if args != nil && args.Invocation != nil {
+					args.Invocation.Message.Content = result.Input
+				}
+				return &frameworkagent.BeforeAgentResult{Context: context.WithValue(ctx, governanceAdmissionContextKey{}, true)}, nil
+			}
+			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.before_agent", "ok"); err != nil {
+				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
+			}
+		}
+		return nil, nil
+	})
+	registry.OnEvent(func(ctx context.Context, _ *frameworkagent.Invocation, upstream *event.Event) (*event.Event, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		if !ok || p.center == nil || upstream == nil || upstream.Response == nil {
+			return upstream, nil
+		}
+		updated := upstream.Clone()
+		buffer := p.center.RequiresBufferedOutput(request.TenantID, request.AppID)
+		for index := range updated.Response.Choices {
+			choice := &updated.Response.Choices[index]
+			if updated.Response.IsPartial {
+				if buffer {
+					if _, adapterBuffering := ctx.Value(governanceBufferContextKey{}).(bool); adapterBuffering {
+						continue
+					}
+				}
+				choice.Delta.Content, _ = p.center.FilterOutput(request.TenantID, request.AppID, choice.Delta.Content)
+				continue
+			}
+			choice.Message.Content, _ = p.center.FilterOutput(request.TenantID, request.AppID, choice.Message.Content)
+		}
+		return updated, nil
+	})
+	registry.AfterAgent(func(ctx context.Context, _ *frameworkagent.AfterAgentArgs) (*frameworkagent.AfterAgentResult, error) {
+		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
+			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.after_agent", "ok"); err != nil {
+				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
+			}
+		}
+		return nil, nil
+	})
+	registry.BeforeTool(func(ctx context.Context, args *frameworktool.BeforeToolArgs) (*frameworktool.BeforeToolResult, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		if !ok || p.center == nil {
+			return nil, nil
+		}
+		err := p.center.AuthorizeTool(ctx, GovernanceRequest{
+			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
+			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
+			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
+		}, request.TraceID, args.ToolName, args.Arguments)
+		if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
+			if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
+				return &frameworktool.BeforeToolResult{CustomResult: replay}, nil
+			}
+		}
+		return nil, err
+	})
+	registry.AfterTool(func(ctx context.Context, args *frameworktool.AfterToolArgs) (*frameworktool.AfterToolResult, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		if !ok || p.center == nil {
+			return nil, nil
+		}
+		err := p.center.CompleteTool(ctx, GovernanceRequest{
+			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
+			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
+			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
+		}, request.TraceID, args.ToolName, args.Error)
+		return nil, err
+	})
 }
 
 func (a *FrameworkRunnerAdapter) Run(ctx context.Context, request RunnerRequest) (RunnerResponse, error) {
@@ -80,9 +201,17 @@ func (a *FrameworkRunnerAdapter) Run(ctx context.Context, request RunnerRequest)
 		return RunnerResponse{}, err
 	}
 	var output string
+	var usageTokens int64
+	var usageKnown bool
 	for runtimeEvent := range events {
+		if tokens, known := runtimeUsage(runtimeEvent.Data); known {
+			usageTokens, usageKnown = tokens, true
+		}
 		if runtimeEvent.Type == "message.delta" {
 			output += runtimeEvent.Data["delta"]
+		}
+		if runtimeEvent.Type == "message.completed" && runtimeEvent.Data["output"] != "" {
+			output = runtimeEvent.Data["output"]
 		}
 		if runtimeEvent.Type == "run.failed" {
 			return RunnerResponse{}, errors.New(runtimeEvent.Data["error"])
@@ -91,7 +220,7 @@ func (a *FrameworkRunnerAdapter) Run(ctx context.Context, request RunnerRequest)
 			return RunnerResponse{}, context.Canceled
 		}
 	}
-	return RunnerResponse{Output: output}, nil
+	return RunnerResponse{Output: output, UsageTokens: usageTokens, UsageKnown: usageKnown}, nil
 }
 
 func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRequest) (<-chan RuntimeEvent, error) {
@@ -105,17 +234,39 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	if !ok || version.TenantID != request.TenantID || version.AgentAppID != request.AppID || version.DeploymentID != request.DeploymentID {
 		return nil, errors.New("deployment_version_scope_mismatch")
 	}
+	governanceOwned := false
+	externallyCompleted, _ := ctx.Value(governanceExternalCompletionContextKey{}).(bool)
+	if a.governance != nil {
+		admission, err := a.governance.Evaluate(ctx, runnerGovernanceRequest(request, configStrings(version.Config, "tools"), configStrings(version.Config, "mcp"), request.Input))
+		if err != nil {
+			return nil, err
+		}
+		request.Input = admission.Input
+		request.TraceID = admission.TraceID
+		request.PolicyRevision = admission.PolicyRevision
+		governanceOwned = !externallyCompleted && admission.ExecutionActive
+	}
 	runner, err := a.runner(ctx, request.VersionID)
 	if err != nil {
+		if governanceOwned {
+			completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, "", 0, false, "runner_failed", false))
+		}
 		return nil, err
 	}
-	runCtx, cancel := context.WithCancel(withRunnerIdentity(ctx, request))
+	bufferOutput := a.governance != nil && a.governance.RequiresBufferedOutput(request.TenantID, request.AppID)
+	runnerContext := context.WithValue(withRunnerIdentity(ctx, request), governanceReplayContextKey{}, true)
+	runnerContext = context.WithValue(runnerContext, governanceAdmissionContextKey{}, true)
+	runnerContext = context.WithValue(runnerContext, governanceBufferContextKey{}, bufferOutput)
+	runCtx, cancel := context.WithCancel(runnerContext)
 	runID, registered := a.registerRun(request.VersionID, cancel)
 	if !registered {
 		cancel()
+		if governanceOwned {
+			completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, "", 0, false, "runner_failed", false))
+		}
 		return nil, errors.New("framework_runtime_closed")
 	}
-	upstream, err := runner.Run(runCtx, request.UserID, request.SessionID, model.NewUserMessage(request.Input), frameworkagent.WithRequestID(request.RequestID))
+	upstream, err := runner.Run(runCtx, request.UserID, request.SessionID, model.NewUserMessage(request.Input), frameworkagent.WithRequestID(request.RequestID), frameworkagent.WithExecutionTraceEnabled(true))
 	if err != nil {
 		a.unregisterRun(request.VersionID, runID)
 		cancel()
@@ -123,7 +274,13 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 			results := make(chan RuntimeEvent, 1)
 			results <- RuntimeEvent{Type: "run.cancelled", Data: runtimeEventData(request, map[string]string{"error": "run cancelled"})}
 			close(results)
+			if governanceOwned {
+				completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, "", 0, false, "cancelled", true))
+			}
 			return results, nil
+		}
+		if governanceOwned {
+			completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, "", 0, false, "runner_failed", false))
 		}
 		return nil, err
 	}
@@ -132,32 +289,118 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 		defer close(results)
 		defer a.unregisterRun(request.VersionID, runID)
 		defer cancel()
+		var rawOutput string
+		var sawContent, sawCompleted bool
+		var usageTokens int64
+		var usageKnown bool
+		errorType := ""
+		cancelled := false
+		awaitingConfirmation := false
+		defer func() {
+			go func() {
+				for range upstream {
+				}
+			}()
+		}()
+		defer func() {
+			if governanceOwned && !awaitingConfirmation {
+				completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, rawOutput, usageTokens, usageKnown, errorType, cancelled))
+			}
+		}()
 		for {
 			select {
 			case <-runCtx.Done():
-				results <- RuntimeEvent{Type: "run.cancelled", Data: runtimeEventData(request, map[string]string{"error": "run cancelled"})}
+				cancelled, errorType = true, "cancelled"
+				a.emitCancelled(results, RuntimeEvent{Type: "run.cancelled", Data: runtimeEventData(request, map[string]string{"error": "run cancelled"})})
 				return
 			case upstreamEvent, ok := <-upstream:
 				if !ok {
-					results <- RuntimeEvent{Type: "run.completed", Data: runtimeEventData(request, nil)}
+					if bufferOutput && sawContent {
+						output := rawOutput
+						if a.governance != nil {
+							output, _ = a.governance.FilterOutput(request.TenantID, request.AppID, output)
+						}
+						data := runtimeEventData(request, map[string]string{"delta": output, "output": output})
+						addRuntimeUsage(data, usageTokens, usageKnown)
+						if !a.emit(runCtx, results, RuntimeEvent{Type: "message.delta", Data: data}) {
+							cancelled, errorType = true, "cancelled"
+							return
+						}
+						if !a.emit(runCtx, results, RuntimeEvent{Type: "message.completed", Data: data}) {
+							cancelled, errorType = true, "cancelled"
+							return
+						}
+					}
+					data := runtimeEventData(request, nil)
+					addRuntimeUsage(data, usageTokens, usageKnown)
+					a.emit(runCtx, results, RuntimeEvent{Type: "run.completed", Data: data})
 					return
 				}
 				if upstreamEvent == nil || upstreamEvent.Response == nil {
 					continue
 				}
+				if tokens, known := eventUsage(upstreamEvent); known {
+					usageTokens, usageKnown = tokens, true
+				}
 				if upstreamEvent.IsError() {
-					a.emit(context.Background(), results, RuntimeEvent{Type: "run.failed", Data: runtimeEventData(request, map[string]string{"error": upstreamEvent.Response.Error.Error()})})
+					errorText := upstreamEvent.Response.Error.Error()
+					if strings.Contains(errorText, "confirmation_required") {
+						awaitingConfirmation = true
+					} else {
+						errorType = "runner_failed"
+					}
+					data := runtimeEventData(request, map[string]string{"error": errorText})
+					addRuntimeUsage(data, usageTokens, usageKnown)
+					a.emit(runCtx, results, RuntimeEvent{Type: "run.failed", Data: data})
 					return
 				}
 				content := eventContent(upstreamEvent)
 				if content == "" {
 					continue
 				}
+				sawContent = true
+				if upstreamEvent.Response.IsPartial {
+					if !sawCompleted {
+						rawOutput += content
+					}
+				} else {
+					rawOutput, sawCompleted = content, true
+				}
+				// The upstream function-call processor surfaces BeforeTool plugin
+				// failures as a model-visible completed message. Stop here so a
+				// pending confirmation cannot be mistaken for a successful run.
+				if !upstreamEvent.Response.IsPartial && strings.HasPrefix(content, "tool callback error:") {
+					if strings.Contains(content, "confirmation_required") {
+						awaitingConfirmation = true
+					} else {
+						errorType = "runner_failed"
+					}
+					if !a.emit(runCtx, results, RuntimeEvent{Type: "run.failed", Data: runtimeEventData(request, map[string]string{"error": content})}) {
+						cancelled, errorType = true, "cancelled"
+						return
+					}
+					// The framework may still be unwinding its flow after the
+					// callback error. Cancel and drain its event channel before
+					// releasing the request ID so an approved retry can start.
+					cancel()
+					for range upstream {
+					}
+					return
+				}
 				eventType := "message.delta"
 				if !upstreamEvent.Response.IsPartial {
 					eventType = "message.completed"
 				}
-				if !a.emit(runCtx, results, RuntimeEvent{Type: eventType, Data: runtimeEventData(request, map[string]string{"delta": content, "output": content})}) {
+				if bufferOutput {
+					continue
+				}
+				if a.governance != nil {
+					content, _ = a.governance.FilterOutput(request.TenantID, request.AppID, content)
+				}
+				data := runtimeEventData(request, map[string]string{"delta": content, "output": content})
+				addRuntimeUsage(data, usageTokens, usageKnown)
+				if !a.emit(runCtx, results, RuntimeEvent{Type: eventType, Data: data}) {
+					cancelled, errorType = true, "cancelled"
 					return
 				}
 			}
@@ -180,12 +423,56 @@ func RunnerIdentityFromContext(ctx context.Context) (RunnerRequest, bool) {
 func runtimeEventData(request RunnerRequest, values map[string]string) map[string]string {
 	data := map[string]string{
 		"tenant_id": request.TenantID, "app_id": request.AppID, "deployment_id": request.DeploymentID,
-		"version_id": request.VersionID, "session_id": request.SessionID, "request_id": request.RequestID,
+		"version_id": request.VersionID, "session_id": request.SessionID, "request_id": request.RequestID, "trace_id": request.TraceID,
+		"user_id": request.UserID, "channel": request.Channel, "external_subject": request.ExternalSubject,
 	}
 	for key, value := range values {
 		data[key] = value
 	}
 	return data
+}
+
+func addRuntimeUsage(data map[string]string, tokens int64, known bool) {
+	if !known {
+		return
+	}
+	data["usage_known"] = "true"
+	data["usage_tokens"] = strconv.FormatInt(tokens, 10)
+}
+
+func eventUsage(upstream *event.Event) (int64, bool) {
+	if upstream == nil {
+		return 0, false
+	}
+	if upstream.ExecutionTrace != nil && upstream.ExecutionTrace.Usage != nil {
+		return int64(upstream.ExecutionTrace.Usage.TotalTokens), true
+	}
+	if upstream.Response != nil && upstream.Response.Usage != nil {
+		return int64(upstream.Response.Usage.TotalTokens), true
+	}
+	return 0, false
+}
+
+func runnerGovernanceRequest(request RunnerRequest, requiredTools, requiredMCP []string, input string) GovernanceRequest {
+	if input == "" {
+		input = request.Input
+	}
+	return GovernanceRequest{
+		TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
+		SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
+		ProviderAccount: request.ProviderAccount, ConversationType: request.ConversationType,
+		ExternalSubject: request.ExternalSubject, Input: input, RequiredTools: requiredTools,
+		RequiredMCP: requiredMCP, PolicyRevision: request.PolicyRevision,
+	}
+}
+
+func runnerGovernanceCompletion(request RunnerRequest, output string, tokens int64, usageKnown bool, errorType string, cancelled bool) GovernanceCompletion {
+	return GovernanceCompletion{
+		TenantID: request.TenantID, AgentAppID: request.AppID, RequestID: request.RequestID,
+		UserID: request.UserID, SessionID: request.SessionID, Channel: request.Channel,
+		ExternalSubject: request.ExternalSubject, Output: output, Tokens: tokens,
+		NoUsage: !usageKnown, ErrorType: errorType, Cancelled: cancelled,
+	}
 }
 
 func (a *FrameworkRunnerAdapter) registerRun(versionID string, cancel context.CancelFunc) (uint64, bool) {
@@ -233,6 +520,13 @@ func (a *FrameworkRunnerAdapter) emit(ctx context.Context, results chan<- Runtim
 		return false
 	case results <- value:
 		return true
+	}
+}
+
+func (a *FrameworkRunnerAdapter) emitCancelled(results chan<- RuntimeEvent, value RuntimeEvent) {
+	select {
+	case results <- value:
+	default:
 	}
 }
 

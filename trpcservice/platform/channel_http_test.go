@@ -35,6 +35,17 @@ func newChannelTestClient(t *testing.T, runner RunnerAdapter) *channelTestClient
 }
 
 func newChannelTestClientWithIdentity(t *testing.T, runner RunnerAdapter, identity DevelopmentIdentity) *channelTestClient {
+	client := newChannelTestClientWithoutPolicy(t, runner, identity)
+	for _, assignment := range identity.Assignments {
+		if assignment.TenantID == "" {
+			continue
+		}
+		_, _ = client.handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: assignment.TenantID, AgentAppID: "app-one"})
+	}
+	return client
+}
+
+func newChannelTestClientWithoutPolicy(t *testing.T, runner RunnerAdapter, identity DevelopmentIdentity) *channelTestClient {
 	t.Helper()
 	handler := NewAdminHandler(NewMemoryPlatform(), identity)
 	handler.ConfigureRuntime(runner, nil)
@@ -127,6 +138,9 @@ func TestMockChannelSignedCallbackRunsAndRepliesWithoutDuplicates(t *testing.T) 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for callback run")
+	}
+	if err := waitForChatEvent(client, binding.SessionID, "channel.reply"); err != nil {
+		t.Fatal(err)
 	}
 
 	var events struct {

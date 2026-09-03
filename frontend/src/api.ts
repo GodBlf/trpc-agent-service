@@ -12,6 +12,7 @@ export interface Identity {
   active_tenant_id: string;
   active_role: Role;
   assignments: TenantAssignment[];
+  auth_mode?: "development" | "production";
 }
 
 export interface Tenant {
@@ -65,8 +66,26 @@ export interface ChannelBinding {
   secret?: string;
 }
 export interface ProviderStatus { provider: string; status: string; credential_smoke_status: "not_run" | "unavailable" | "passed"; last_error?: string }
-export interface BotRoute { provider: "enterprise_wechat" | "telegram"; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group"; enabled: boolean }
+export interface BotRoute { provider: "enterprise_wechat" | "telegram"; provider_account?: string; external_subject: string; tenant_id: string; app_id: string; conversation_type: "single" | "group"; enabled: boolean }
 export interface ProviderDelivery { provider: BotRoute["provider"]; external_subject: string; tenant_id: string; app_id: string; request_id: string; status: "accepted" | "retried" | "rejected" | "delivered" | "terminal_failed"; code?: string; attempts: number; updated_at: string }
+export interface TenantPolicy { tenant_id: string; agent_app_id: string; revision: number; allowed_tools: string[]; allowed_mcp: string[]; dangerous_tools: string[]; denied_input_patterns: string[]; denied_output_patterns: string[]; redacted_patterns: string[]; allowed_im_users: string[]; allowed_im_subjects: string[]; allowed_provider_accounts: string[]; allowed_conversation_types: string[]; token_budget: number; cost_budget: number; cost_per_token: number; tool_costs: Record<string, number>; estimated_tokens_per_run: number; rate_limit: number; rate_window_seconds: number; updated_at?: string }
+export interface AuditEvent { id: string; tenant_id: string; channel?: string; user_id?: string; session_id?: string; agent_name?: string; tool_name?: string; decision: string; latency: number; error_type?: string; cost: number; trace_id: string; request_id?: string; occurred_at: string; policy_revision?: number; checkpoint?: string; rule?: string; reason?: string }
+export interface AuditFilters {
+  from?: string;
+  to?: string;
+  channel?: string;
+  user_id?: string;
+  session_id?: string;
+  agent_name?: string;
+  decision?: string;
+  error_type?: string;
+  request_id?: string;
+  trace_id?: string;
+}
+export interface MetricsFilters { app_id?: string; provider?: ChannelProvider | ""; from?: string; to?: string }
+export interface TenantMetrics { tenant_id: string; requests: number; active_executions: number; completed_executions: number; failed_executions: number; denied_requests: number; rate_limited_requests: number; tokens: number; cost: number; model_latency_ms: number; tool_latency_ms: number; storage_latency_ms: number; im_delivered: number; im_failed: number; token_budget: number; tokens_remaining: number; cost_budget: number; cost_remaining: number; budget_period_from?: string }
+export interface ToolConfirmation { id: string; tenant_id: string; agent_app_id: string; session_id: string; request_id: string; user_id: string; tool_name: string; argument_summary: string; policy_revision: number; trace_id: string; status: "pending" | "approved" | "rejected" | "expired" | "running" | "completed" | "failed" | "cancelled"; created_at: string; expires_at: string; decided_at?: string; decided_by?: string; invoked_at?: string; completed_at?: string }
+export interface PlatformTrace { trace_id: string; tenant_id: string; request_id: string; session_id: string; agent_app_id: string; spans: { name: string; status: string; occurred_at: string }[] }
 
 export class APIError extends Error {
   constructor(
@@ -88,6 +107,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const body = (await response.json()) as T | { error: { code: string; message: string } };
   if (!response.ok) {
     const error = (body as { error?: { code?: string; message?: string } }).error;
+    if (response.status === 401 && typeof window !== "undefined") window.dispatchEvent(new Event("trpc-auth-required"));
     throw new APIError(response.status, error?.code ?? "unknown_error", error?.message ?? "服务请求失败");
   }
   return body as T;
@@ -95,6 +115,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   identity: () => request<Identity>("/api/v1/auth/me"),
+  login: (token: string) => request<Identity>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ token }) }),
+  logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   switchTenant: (tenant_id: string) =>
     request<Identity>("/api/v1/auth/switch-tenant", {
       method: "POST",
@@ -144,7 +166,24 @@ export const api = {
   providerRoutes: () => request<ListResponse<BotRoute>>("/api/v1/admin/providers/routes"),
   providerDeliveries: () => request<ListResponse<ProviderDelivery>>("/api/v1/admin/providers/deliveries"),
   createProviderRoute: (route: BotRoute) => request<BotRoute>("/api/v1/admin/providers/routes", { method: "POST", body: JSON.stringify(route) }),
-  updateProviderRoute: (route: BotRoute) => request<BotRoute>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "PATCH", body: JSON.stringify({ tenant_id: route.tenant_id, app_id: route.app_id, conversation_type: route.conversation_type, enabled: route.enabled }) }),
+  updateProviderRoute: (route: BotRoute) => request<BotRoute>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "PATCH", body: JSON.stringify({ tenant_id: route.tenant_id, app_id: route.app_id, provider_account: route.provider_account, conversation_type: route.conversation_type, enabled: route.enabled }) }),
   deleteProviderRoute: (route: BotRoute) => request<void>(`/api/v1/admin/providers/routes?provider=${encodeURIComponent(route.provider)}&external_subject=${encodeURIComponent(route.external_subject)}`, { method: "DELETE" }),
   replayProviderRoute: (route: BotRoute, text: string) => request<ChatRunResponse>("/api/v1/admin/providers/replay", { method: "POST", body: JSON.stringify({ provider: route.provider, external_subject: route.external_subject, text }) }),
+  governancePolicy: (appID: string) => request<TenantPolicy>(`/api/v1/admin/governance/policy?app_id=${encodeURIComponent(appID)}`),
+  saveGovernancePolicy: (policy: TenantPolicy) => request<TenantPolicy>("/api/v1/admin/governance/policy", { method: "POST", body: JSON.stringify(policy) }),
+  governanceAudit: (filters: AuditFilters = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => { if (value?.trim()) query.set(key, value.trim()); });
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request<ListResponse<AuditEvent>>(`/api/v1/admin/governance/audit${suffix}`);
+  },
+  governanceMetrics: (filters: MetricsFilters = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => { if (value?.trim()) query.set(key, value.trim()); });
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request<TenantMetrics>(`/api/v1/admin/governance/metrics${suffix}`);
+  },
+  confirmations: () => request<ListResponse<ToolConfirmation>>("/api/v1/admin/governance/confirmations"),
+  decideConfirmation: (id: string, approve: boolean) => request<ToolConfirmation>(`/api/v1/admin/governance/confirmations/${encodeURIComponent(id)}/decision`, { method: "POST", body: JSON.stringify({ approve }) }),
+  governanceTrace: (id: string) => request<PlatformTrace>(`/api/v1/admin/governance/traces?trace_id=${encodeURIComponent(id)}&request_id=${encodeURIComponent(id)}`),
 };

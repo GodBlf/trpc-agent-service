@@ -13,11 +13,17 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
+	servicelog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/platform"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
 func main() {
+	redactor := servicelog.NewRedactor([]string{
+		os.Getenv("TRPC_AUTH_HMAC_SECRET"), os.Getenv("TRPC_TELEGRAM_BOT_TOKEN"), os.Getenv("TRPC_WECOM_BOT_SECRET"),
+		os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_BACKEND_SELECTIONS"),
+	}, nil)
+	log.SetOutput(servicelog.NewRedactingWriter(os.Stderr, redactor))
 	defaultAddr := os.Getenv("TRPC_SERVICE_ADDR")
 	if defaultAddr == "" {
 		defaultAddr = ":8080"
@@ -35,6 +41,31 @@ func main() {
 		},
 	}
 	admin := platform.NewAdminHandler(store, identity)
+	governancePath := os.Getenv("TRPC_GOVERNANCE_PATH")
+	if governancePath == "" {
+		governancePath = "data/governance.json"
+	}
+	governance, err := platform.NewPersistentGovernanceCenter(governancePath)
+	if err != nil {
+		log.Fatalf("governance state: %v", err)
+	}
+	admin.ConfigureGovernance(governance)
+	switch authMode := os.Getenv("TRPC_AUTH_MODE"); authMode {
+	case "", "development":
+	case "production":
+		directoryPath := os.Getenv("TRPC_IDENTITY_DIRECTORY")
+		directory, err := platform.LoadIdentityDirectory(directoryPath)
+		if err != nil {
+			log.Fatalf("identity directory: %v", err)
+		}
+		issuer, audience, secret := os.Getenv("TRPC_AUTH_ISSUER"), os.Getenv("TRPC_AUTH_AUDIENCE"), os.Getenv("TRPC_AUTH_HMAC_SECRET")
+		if issuer == "" || audience == "" || secret == "" {
+			log.Fatal("production identity requires issuer, audience, and signing secret")
+		}
+		admin.ConfigureIdentityProvider(platform.NewJWTIdentityProvider(platform.JWTIdentityConfig{Issuer: issuer, Audience: audience, HMACSecret: []byte(secret)}, directory))
+	default:
+		log.Fatalf("unsupported authentication mode %q", authMode)
+	}
 	if err := admin.ConfigureBackendSelections(os.Getenv("TRPC_BACKEND_SELECTIONS")); err != nil && os.Getenv("TRPC_BACKEND_SELECTIONS") != "" {
 		log.Fatalf("backend selections: %v", err)
 	}

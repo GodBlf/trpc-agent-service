@@ -27,6 +27,7 @@ type ChannelBinding struct {
 	TenantID         string    `json:"tenant_id"`
 	AppID            string    `json:"app_id"`
 	Channel          string    `json:"channel"`
+	ProviderAccount  string    `json:"provider_account,omitempty"`
 	ConversationType string    `json:"conversation_type"`
 	ConversationID   string    `json:"external_conversation_id"`
 	UserID           string    `json:"external_user_id"`

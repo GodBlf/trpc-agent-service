@@ -28,7 +28,7 @@ func TestChatSessionAPIPersistsHistoryAndPropagatesRequestID(t *testing.T) {
 		if request.RequestID != "request-one" || request.AppID != "app-one" || request.SessionID != "session-one" || request.Input != "hello" {
 			t.Fatalf("Runner request = %#v", request)
 		}
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("chat run did not reach Runner")
 	}
 	if err := waitForChatEvent(client, "session-one", "run.completed"); err != nil {
