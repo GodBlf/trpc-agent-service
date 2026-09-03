@@ -1,0 +1,9 @@
+# Multi-Tenant Telegram Bot Routing
+
+Status: accepted
+
+Telegram uses one real Bot and one webhook endpoint for multiple Tenants. After Bot webhook authentication, a server-owned Bot Tenant Allowlist routes groups by `chat_id` and private chats by `chat_id` with a `user_id` fallback to exactly one Tenant/Agent App; conflicting mappings are prohibited and unresolved or ambiguous messages are rejected. Only platform administrators manage this cross-Tenant mapping. A temporary HTTPS tunnel and configurable public base URL support local verification without coupling the design to the final domain. Enterprise WeChat first uses the Management Console IM Simulator while real provider credentials and callback encryption details are pending, preserving the same Channel Adapter contract for later activation.
+
+The Bot is a platform-owned Provider Account rather than a Tenant-owned Channel Binding. Each allowlist entry selects one Tenant and Agent App. Telegram Sessions are stable per Bot and `chat_id`; the actual sender remains the message user identity. Authenticated but unmapped updates return provider success without invoking the Agent, record an `unmapped` Delivery Status, and receive a tenant-neutral notice. Duplicate `update_id` values similarly return success without execution or another reply.
+
+Bot API tokens are process credentials supplied outside repository and browser state; webhook authentication uses a distinct secret. Provider registration and credential smoke checks are explicit platform-administrator operations, never automatic startup side effects. Allowlist configuration is persisted atomically in a server-owned configuration file, while Session and Memory stores remain uninvolved. Telegram accepts text plus image/file metadata and captions while Agent replies remain text. The Enterprise WeChat IM Simulator exercises text/image/file fixtures through the Channel Adapter path and is visibly labelled as simulation.
