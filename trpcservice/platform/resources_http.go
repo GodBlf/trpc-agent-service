@@ -230,12 +230,15 @@ func (h *AdminHandler) handleDeploymentRollout(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "rollout_confirmation_required", "target version and confirmation are required")
 		return
 	}
+	if err := h.recordDeploymentOperation(r, tenant, "deployment.rollout.updated"); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
 	updated, code, ok := h.platform.startRollout(deployment, request.TargetVersionID, request.GrayPercentage)
 	if !ok {
 		writeError(w, http.StatusConflict, code, "Deployment rollout is not allowed")
 		return
 	}
-	h.recordDeploymentOperation(r, tenant, "deployment.rollout.updated")
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -271,23 +274,26 @@ func (h *AdminHandler) handleRollback(w http.ResponseWriter, r *http.Request, te
 		writeError(w, http.StatusBadRequest, "rollback_confirmation_required", "rollback confirmation is required")
 		return
 	}
+	if err := h.recordDeploymentOperation(r, tenant, "deployment.rollback.confirmed"); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
 	updated, code, ok := h.platform.rollback(deployment)
 	if !ok {
 		writeError(w, http.StatusConflict, code, "Deployment rollback is not allowed")
 		return
 	}
-	h.recordDeploymentOperation(r, tenant, "deployment.rollback.confirmed")
 	writeJSON(w, http.StatusOK, updated)
 }
 
-func (h *AdminHandler) recordDeploymentOperation(r *http.Request, tenant TenantContext, decision string) {
+func (h *AdminHandler) recordDeploymentOperation(r *http.Request, tenant TenantContext, decision string) error {
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 	if !validIdempotencyKey(requestID) {
 		requestID = newRequestID()
 	}
 	auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = h.governance.Record(auditCtx, AuditEvent{
+	return h.governance.Record(auditCtx, AuditEvent{
 		TenantID: tenant.TenantID, UserID: tenant.UserID, Decision: decision,
 		RequestID: requestID, TraceID: newTraceID(), OccurredAt: time.Now().UTC(),
 	})

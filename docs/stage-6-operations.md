@@ -51,6 +51,10 @@ the server-resolved immutable Version.
   `POST /api/v1/admin/capacity/{id}/cancel`: bounded deterministic capacity
   estimation with request/trace identity.
 
+Drain, rollout, and rollback require Audit Event persistence before their
+state changes. If audit persistence fails, the API returns `audit_unavailable`
+and leaves the previous operation state unchanged.
+
 Rollouts never mutate Version content. The request's selected Version is
 resolved before dispatch and embedded in the Worker request, so a Worker
 restart cannot silently move an in-flight request to another Version.

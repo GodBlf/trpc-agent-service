@@ -26,13 +26,15 @@ test("renders backend-reported gateway and worker state without request data", a
 });
 
 test("starts a confirmed graceful drain and shows dependency health", async () => {
+  let drainStatus: DrainStatus = { state: "idle", active_executions: 1 };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url === "/api/v1/admin/operations/drain" && init?.method === "POST") {
       expect(JSON.parse(String(init.body))).toEqual({ confirm: true });
-      return { ok: true, json: async () => ({ state: "draining", active_executions: 1 }) };
+      drainStatus = { state: "draining", active_executions: 1 };
+      return { ok: true, json: async () => drainStatus };
     }
-    const body = url.includes("/runtime/status") ? { items: [] } : url.includes("/operations/drain") ? { state: "idle", active_executions: 1 } : url.includes("/storage/backend") ? { health: { backend: "redis", status: "healthy", checked_at: "2026-09-04T00:00:00Z" } } : url.includes("/agent-apps") ? { items: [] } : url.includes("/operations/faults") ? { enabled: true, scenarios: [] } : { items: [] };
+    const body = url.includes("/runtime/status") ? { items: [] } : url.includes("/operations/drain") ? drainStatus : url.includes("/storage/backend") ? { health: { backend: "redis", status: "healthy", checked_at: "2026-09-04T00:00:00Z" } } : url.includes("/agent-apps") ? { items: [] } : url.includes("/operations/faults") ? { enabled: true, scenarios: [] } : { items: [] };
     return { ok: true, json: async () => body };
   });
   const confirmMock = vi.fn(() => true);
@@ -41,5 +43,7 @@ test("starts a confirmed graceful drain and shows dependency health", async () =
   render(<RuntimePage identity={{ id: "operator", name: "Operator", active_tenant_id: "tenant", active_role: "operator", assignments: [] }} />);
   fireEvent.click(await screen.findByText("开始优雅排水"));
   await waitFor(() => expect(screen.getByText("draining")).toBeInTheDocument());
+  drainStatus = { state: "closed", active_executions: 0 };
+  await waitFor(() => expect(screen.getByText("closed")).toBeInTheDocument());
   expect(confirmMock).toHaveBeenCalledWith("确认开始优雅排水？新请求将被拒绝，活跃请求会等待完成。");
 });

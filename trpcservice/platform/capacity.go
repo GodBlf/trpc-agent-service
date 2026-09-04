@@ -53,6 +53,20 @@ const maxCapacityConcurrency = 10
 const maxCapacityRuns = 100
 const minCapacityTimeoutMS = 100
 const maxCapacityTimeoutMS = 5000
+const capacityRunDelay = 25 * time.Millisecond
+
+type capacityRunner struct{}
+
+func (capacityRunner) Run(ctx context.Context, _ RunnerRequest) (RunnerResponse, error) {
+	timer := time.NewTimer(capacityRunDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return RunnerResponse{}, ctx.Err()
+	case <-timer.C:
+		return RunnerResponse{Output: "capacity smoke test"}, nil
+	}
+}
 
 func (h *AdminHandler) handleCapacity(w http.ResponseWriter, r *http.Request, tenant TenantContext, parts []string) {
 	if len(parts) == 0 && r.Method == http.MethodPost {
@@ -155,7 +169,7 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 }
 
 func (h *AdminHandler) executeCapacityRun(ctx context.Context, run *capacityRun, tenant TenantContext, policy TenantPolicy) {
-	runtime := NewRuntime(h.platform, EchoRunner{}, h.life)
+	runtime := NewRuntime(h.platform, capacityRunner{}, h.life)
 	slots := make(chan struct{}, run.result.Concurrency)
 	var failed, completed, active atomic.Int64
 	var totalLatency atomic.Int64

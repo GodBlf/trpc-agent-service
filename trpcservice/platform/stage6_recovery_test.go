@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -193,19 +195,82 @@ func TestCapacityRunIsBoundedDeterministicAndTenantScoped(t *testing.T) {
 	if result.Status != "running" || result.TenantID != "tenant-one" || result.TraceID == "" {
 		t.Fatalf("initial result=%#v", result)
 	}
-	time.Sleep(20 * time.Millisecond)
-	response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+result.ID, "", nil)
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("capacity result=%d", response.StatusCode)
-	}
+
 	var completed CapacityTestResult
-	if err := json.NewDecoder(response.Body).Decode(&completed); err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+result.ID, "", nil)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("capacity result=%d", response.StatusCode)
+		}
+		if err := json.NewDecoder(response.Body).Decode(&completed); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if completed.Status != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity run did not finish: %#v", completed)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if completed.Status != "completed" || completed.Completed != 4 || completed.Failed != 0 || completed.EstimatedTokens != 0 || completed.FirstBottleneck == "" {
 		t.Fatalf("capacity result=%#v", completed)
 	}
+	client.post("/api/v1/auth/switch-tenant", `{"tenant_id":"tenant-two"}`, nil, http.StatusOK, nil)
+	response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+result.ID, "", nil)
+	assertChannelAPIError(t, response, http.StatusNotFound, "capacity_run_not_found")
+}
+
+func TestCapacityRunIsValidatedAndCancelledWithoutActiveWork(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	invalid := client.do(http.MethodPost, "/api/v1/admin/capacity", `{"agent_app_id":"app-one","concurrency":11,"runs":101,"timeout_ms":99}`, nil)
+	assertChannelAPIError(t, invalid, http.StatusBadRequest, "invalid_capacity_request")
+
+	var result CapacityTestResult
+	client.post("/api/v1/admin/capacity", `{"agent_app_id":"app-one","concurrency":1,"runs":100,"timeout_ms":5000}`, nil, http.StatusAccepted, &result)
+	client.post("/api/v1/admin/capacity/"+result.ID+"/cancel", "", nil, http.StatusAccepted, nil)
+
+	var cancelled CapacityTestResult
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+result.ID, "", nil)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("cancelled capacity result=%d", response.StatusCode)
+		}
+		if err := json.NewDecoder(response.Body).Decode(&cancelled); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if cancelled.Status != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity run was not cancelled: %#v", cancelled)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cancelled.Status != "cancelled" || cancelled.Active != 0 || cancelled.Completed+cancelled.Failed > 100 ||
+		cancelled.Concurrency > maxCapacityConcurrency || cancelled.Runs > maxCapacityRuns {
+		t.Fatalf("cancelled capacity result=%#v", cancelled)
+	}
+}
+
+func TestCapacityRunRespectsGovernanceResourceExhaustion(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	if _, err := client.handler.governance.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "app-one", RateLimit: 1, RateWindowSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client.post("/api/v1/admin/capacity", `{"agent_app_id":"app-one","concurrency":1,"runs":1,"timeout_ms":1000}`, nil, http.StatusAccepted, nil)
+	response := client.do(http.MethodPost, "/api/v1/admin/capacity", `{"agent_app_id":"app-one","concurrency":1,"runs":1,"timeout_ms":1000}`, nil)
+	assertChannelAPIError(t, response, http.StatusTooManyRequests, "tenant_rate_limited")
 }
 
 func TestRollbackDoesNotCancelInFlightVersionExecution(t *testing.T) {
@@ -272,4 +337,47 @@ func TestProductionModeAllowsChannelBindingsButBlocksFaultInjection(t *testing.T
 	assertChannelAPIError(t, mockFaults, http.StatusForbidden, "fault_injection_disabled")
 	runtimeFaults := client.do(http.MethodPost, "/api/v1/admin/operations/faults", `{"agent_app_id":"app-one","scenario":"tool_error","delay_ms":0}`, nil)
 	assertChannelAPIError(t, runtimeFaults, http.StatusForbidden, "fault_injection_disabled")
+}
+
+func TestDeploymentHighRiskOperationsFailClosedWhenAuditCannotPersist(t *testing.T) {
+	handler := NewAdminHandler(activeTestPlatform(t), DevelopmentIdentity{
+		ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleOperator}},
+	})
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler.governance.SetPersistencePath(filepath.Join(blocker, "governance.json"))
+	deployment, _ := handler.platform.deployment("tenant-one", "deploy-one")
+	second, _, ok := handler.platform.createVersion(deployment, "audit-failure-v2", map[string]any{"model": "fake-v2"})
+	if !ok {
+		t.Fatal("create second version")
+	}
+
+	post := func(path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request = request.WithContext(WithTenantContext(request.Context(), TenantContext{
+			TenantID: "tenant-one", Role: RoleOperator, UserID: "operator",
+		}))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	rolloutResponse := post("/api/v1/admin/deployments/deploy-one/rollout", fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":50,"confirm":true}`, second.ID))
+	assertChannelAPIError(t, rolloutResponse.Result(), http.StatusServiceUnavailable, "audit_unavailable")
+	current, _ := handler.platform.deployment("tenant-one", "deploy-one")
+	if current.VersionID != "deploy-one-v1" || current.TargetVersionID != "" || current.GrayPercentage != 0 {
+		t.Fatalf("rollout changed after audit failure: %#v", current)
+	}
+
+	if _, _, ok := handler.platform.startRollout(deployment, second.ID, 50); !ok {
+		t.Fatal("prepare rollback state")
+	}
+	rollbackResponse := post("/api/v1/admin/deployments/deploy-one/rollback", `{"confirm":true}`)
+	assertChannelAPIError(t, rollbackResponse.Result(), http.StatusServiceUnavailable, "audit_unavailable")
+	current, _ = handler.platform.deployment("tenant-one", "deploy-one")
+	if current.VersionID != "deploy-one-v1" || current.TargetVersionID != second.ID || current.GrayPercentage != 50 {
+		t.Fatalf("rollback changed after audit failure: %#v", current)
+	}
 }

@@ -70,22 +70,27 @@ func (h *AdminHandler) handleOperationsDrain(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusServiceUnavailable, "drain_unavailable", "graceful drain is not configured")
 		return
 	}
-	h.drainState = DrainDraining
-	h.drainStartedAt = time.Now().UTC()
-	h.mu.Unlock()
-
-	life.BeginShutdown()
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 	if !validIdempotencyKey(requestID) {
 		requestID = newRequestID()
 	}
 	traceID := newTraceID()
-	auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = h.governance.Record(auditCtx, AuditEvent{
+	auditCtx, cancelAudit := context.WithTimeout(context.Background(), 2*time.Second)
+	auditErr := h.governance.Record(auditCtx, AuditEvent{
 		TenantID: tenant.TenantID, UserID: tenant.UserID, Decision: "operations.drain.started",
 		RequestID: requestID, TraceID: traceID, OccurredAt: time.Now().UTC(),
 	})
+	cancelAudit()
+	if auditErr != nil {
+		h.mu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
+	h.drainState = DrainDraining
+	h.drainStartedAt = time.Now().UTC()
+	h.mu.Unlock()
+
+	life.BeginShutdown()
 
 	go func() {
 		err := life.Wait(context.Background())

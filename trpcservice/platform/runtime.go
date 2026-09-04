@@ -258,6 +258,10 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 		cancel()
 		return nil, err
 	}
+	counters := rt.countersFor(tenant.TenantID)
+	rt.global.active.Add(1)
+	counters.active.Add(1)
+	terminalEvent := ""
 	output := make(chan RuntimeEvent, 4)
 	go func() {
 		defer close(output)
@@ -266,7 +270,22 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			defer releaseLife()
 		}
 		defer cancel()
+		defer func() {
+			if terminalEvent == "run.failed" || terminalEvent == "run.cancelled" || streamCtx.Err() != nil {
+				rt.global.failed.Add(1)
+				counters.failed.Add(1)
+			} else {
+				rt.global.complete.Add(1)
+				counters.complete.Add(1)
+			}
+			rt.global.active.Add(-1)
+			counters.active.Add(-1)
+		}()
 		for event := range events {
+			switch event.Type {
+			case "run.completed", "run.failed", "run.cancelled":
+				terminalEvent = event.Type
+			}
 			select {
 			case <-streamCtx.Done():
 				return

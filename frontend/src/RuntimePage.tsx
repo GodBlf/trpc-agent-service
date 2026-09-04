@@ -17,6 +17,14 @@ export function RuntimePage({ identity }: { identity?: Identity }) {
       .catch(setError);
   };
   useEffect(load, []);
+  const drainState = drain?.state;
+  useEffect(() => {
+    if (drainState !== "draining") return;
+    const timer = setInterval(() => {
+      void api.operationsDrain().then(setDrain).catch(() => undefined);
+    }, 500);
+    return () => clearInterval(timer);
+  }, [drainState]);
   const canOperate = !identity || ["platform_admin", "tenant_admin", "operator"].includes(identity.active_role);
   const startDrain = async () => {
     if (!window.confirm("确认开始优雅排水？新请求将被拒绝，活跃请求会等待完成。")) return;
