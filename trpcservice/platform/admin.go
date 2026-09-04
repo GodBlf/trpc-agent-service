@@ -87,7 +87,6 @@ type ControlPlaneStore interface {
 	rollback(context.Context, Deployment) (Deployment, string, bool, error)
 	activeDeployment(context.Context, string, string) (Deployment, bool, error)
 	routeDeployment(context.Context, string, string, string) (Deployment, bool, error)
-	controlPlaneError() error
 	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
 	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
 	loadBackendSelections(context.Context) (map[string]backendSelection, error)
@@ -99,10 +98,11 @@ type ControlPlaneStore interface {
 
 var errControlPlaneUnavailable = errors.New("control_plane_unavailable")
 
-func (p *SnapshotControlPlane) controlPlaneError() error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.persistenceErr
+func controlPlanePersistenceError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", errControlPlaneUnavailable, err)
 }
 
 type versionCreationKey struct {
@@ -233,7 +233,11 @@ func (p *SnapshotControlPlane) persistLockedContext(ctx context.Context) bool {
 	}
 	operationCtx, cancel := controlPlaneOperationContext(ctx)
 	defer cancel()
-	p.persistenceRevision, p.persistenceErr = p.persistence.Save(operationCtx, controlPlaneSnapshotFrom(p), p.persistenceRevision)
+	revision, err := p.persistence.Save(operationCtx, controlPlaneSnapshotFrom(p), p.persistenceRevision)
+	p.persistenceErr = controlPlanePersistenceError(err)
+	if err == nil {
+		p.persistenceRevision = revision
+	}
 	return p.persistenceErr == nil
 }
 
@@ -244,7 +248,7 @@ func (p *SnapshotControlPlane) refreshLockedContext(ctx context.Context) bool {
 	operationCtx, cancel := controlPlaneOperationContext(ctx)
 	defer cancel()
 	snapshot, revision, err := p.persistence.Load(operationCtx)
-	p.persistenceErr = err
+	p.persistenceErr = controlPlanePersistenceError(err)
 	if err != nil {
 		return false
 	}
@@ -867,7 +871,7 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 }
 
 func writeControlPlaneError(w http.ResponseWriter, err error) bool {
-	if err == nil {
+	if !errors.Is(err, errControlPlaneUnavailable) {
 		return false
 	}
 	writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -22,6 +23,21 @@ type cancellationObservingControlPlanePersistence struct {
 	enterOnce  sync.Once
 	cancelOnce sync.Once
 }
+
+type saveFailingControlPlanePersistence struct {
+	snapshot controlPlaneSnapshot
+	revision int64
+}
+
+func (p saveFailingControlPlanePersistence) Load(context.Context) (controlPlaneSnapshot, int64, error) {
+	return p.snapshot, p.revision, nil
+}
+
+func (saveFailingControlPlanePersistence) Save(context.Context, controlPlaneSnapshot, int64) (int64, error) {
+	return 0, errors.New("database unavailable")
+}
+
+func (saveFailingControlPlanePersistence) Close() error { return nil }
 
 func (p *cancellationObservingControlPlanePersistence) Load(ctx context.Context) (controlPlaneSnapshot, int64, error) {
 	p.enterOnce.Do(func() { close(p.entered) })
@@ -103,6 +119,59 @@ func TestControlPlaneFailureDoesNotBecomeResourceConflict(t *testing.T) {
 	}
 	if apiError.Error.Code != "control_plane_unavailable" {
 		t.Fatalf("error code = %q", apiError.Error.Code)
+	}
+}
+
+func TestControlPlaneSaveFailureIsClassifiedFromCurrentRequest(t *testing.T) {
+	platform := NewInMemoryControlPlane()
+	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
+	defer handler.Close()
+	handler.ConfigureGovernance(handler.governance)
+	if created, err := platform.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}); err != nil || !created {
+		t.Fatal("seed App")
+	}
+	platform.persistence = saveFailingControlPlanePersistence{snapshot: controlPlaneSnapshotFrom(platform), revision: platform.persistenceRevision}
+
+	requests := []struct {
+		path string
+		body string
+	}{
+		{path: "/api/v1/admin/governance/policy", body: `{"agent_app_id":"app-one","token_budget":1000}`},
+		{path: "/api/v1/chat/bindings", body: `{"channel":"mock","app_id":"app-one","conversation_type":"single","external_conversation_id":"conversation-one","external_user_id":"user-one"}`},
+	}
+	for _, item := range requests {
+		request := httptest.NewRequest(http.MethodPost, item.path, strings.NewReader(item.body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("POST %s status = %d, want %d", item.path, response.Code, http.StatusServiceUnavailable)
+		}
+		var apiError errorResponse
+		if err := json.NewDecoder(response.Body).Decode(&apiError); err != nil {
+			t.Fatal(err)
+		}
+		if apiError.Error.Code != "control_plane_unavailable" {
+			t.Fatalf("POST %s error code = %q", item.path, apiError.Error.Code)
+		}
+	}
+}
+
+func TestRuntimeStatusDoesNotClassifyBackendClosingAsControlPlaneFailure(t *testing.T) {
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
+	defer handler.Close()
+	handler.backends.beginClose()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/runtime/status", nil)
+	request = request.WithContext(WithTenantContext(request.Context(), TenantContext{TenantID: "tenant-one", Role: RoleTenantAdmin}))
+	response := httptest.NewRecorder()
+
+	handler.handleRuntimeStatus(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("HTTP status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "control_plane_unavailable") || !strings.Contains(response.Body.String(), `"id":"dependency-storage"`) {
+		t.Fatalf("runtime status = %s", response.Body.String())
 	}
 }
 

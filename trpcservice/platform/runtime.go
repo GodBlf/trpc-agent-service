@@ -588,7 +588,7 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		code, message := "storage_unavailable", "tenant storage is unavailable"
-		if h.platform.controlPlaneError() != nil {
+		if errors.Is(err, errControlPlaneUnavailable) {
 			code, message = "control_plane_unavailable", "control plane is unavailable"
 		} else if h.life != nil && h.life.IsClosing() {
 			code, message = "service_closing", "service is closing"
@@ -649,7 +649,8 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 	items := h.runtime.StatusFor(tenant)
 	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
-		if writeControlPlaneError(w, err) {
+		if errors.Is(err, errControlPlaneUnavailable) {
+			writeControlPlaneError(w, err)
 			return
 		}
 		items = appendDependencyStatus(items, "dependency-storage", LifecycleUnavailable)

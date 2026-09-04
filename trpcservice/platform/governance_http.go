@@ -131,7 +131,8 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 		}
 		updated, err := h.governance.PutPolicy(r.Context(), policy)
 		if err != nil {
-			if writeControlPlaneError(w, h.platform.controlPlaneError()) {
+			if errors.Is(err, errControlPlaneUnavailable) {
+				writeControlPlaneError(w, err)
 				return
 			}
 			if err.Error() == "invalid_policy" {

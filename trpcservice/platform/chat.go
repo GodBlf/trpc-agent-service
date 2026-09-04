@@ -334,7 +334,7 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		if err != nil {
-			if h.platform.controlPlaneError() != nil {
+			if errors.Is(err, errControlPlaneUnavailable) {
 				writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
 			} else {
 				writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel binding is invalid")
