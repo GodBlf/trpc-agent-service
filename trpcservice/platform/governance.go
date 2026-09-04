@@ -100,14 +100,16 @@ func IsGovernanceError(err error, code string) bool {
 type ConfirmationStatus string
 
 const (
-	ConfirmationPending   ConfirmationStatus = "pending"
-	ConfirmationApproved  ConfirmationStatus = "approved"
-	ConfirmationRejected  ConfirmationStatus = "rejected"
-	ConfirmationExpired   ConfirmationStatus = "expired"
-	ConfirmationRunning   ConfirmationStatus = "running"
-	ConfirmationCompleted ConfirmationStatus = "completed"
-	ConfirmationFailed    ConfirmationStatus = "failed"
-	ConfirmationCancelled ConfirmationStatus = "cancelled"
+	ConfirmationPending        ConfirmationStatus = "pending"
+	ConfirmationApproved       ConfirmationStatus = "approved"
+	ConfirmationRejected       ConfirmationStatus = "rejected"
+	ConfirmationExpired        ConfirmationStatus = "expired"
+	ConfirmationExecuting      ConfirmationStatus = "executing"
+	ConfirmationRunning        ConfirmationStatus = ConfirmationExecuting
+	ConfirmationCompleted      ConfirmationStatus = "completed"
+	ConfirmationFailed         ConfirmationStatus = "failed"
+	ConfirmationOutcomeUnknown ConfirmationStatus = "outcome_unknown"
+	ConfirmationCancelled      ConfirmationStatus = ConfirmationOutcomeUnknown
 )
 
 type ToolConfirmation struct {
@@ -263,6 +265,10 @@ type GovernanceCenter struct {
 	metricSamples []MetricSample
 	now           func() time.Time
 	path          string
+	policyStore   interface {
+		loadGovernancePolicies() (map[string]TenantPolicy, error)
+		saveGovernancePolicy(TenantPolicy) (TenantPolicy, error)
+	}
 }
 
 type governanceSnapshot struct {
@@ -296,6 +302,49 @@ func NewGovernanceCenter() *GovernanceCenter {
 		policies: map[string]TenantPolicy{}, confirmations: map[string]ToolConfirmation{}, executions: map[string]governanceExecution{},
 		metrics: map[string]TenantMetrics{}, rateWindows: map[string]rateWindow{}, traces: map[string]PlatformTrace{}, usedTokens: map[string]int64{}, toolStarts: map[string]time.Time{}, now: time.Now,
 	}
+}
+
+func (g *GovernanceCenter) configurePolicyStore(store interface {
+	loadGovernancePolicies() (map[string]TenantPolicy, error)
+	saveGovernancePolicy(TenantPolicy) (TenantPolicy, error)
+}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.policyStore = store
+	shared, err := g.policyStore.loadGovernancePolicies()
+	if err != nil {
+		return
+	}
+	if len(shared) == 0 && len(g.policies) > 0 {
+		keys := make([]string, 0, len(g.policies))
+		for key := range g.policies {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		imported := make(map[string]TenantPolicy, len(keys))
+		for _, key := range keys {
+			policy, saveErr := g.policyStore.saveGovernancePolicy(g.policies[key])
+			if saveErr != nil {
+				return
+			}
+			imported[key] = clonePolicy(policy)
+		}
+		g.policies = imported
+		return
+	}
+	g.policies = shared
+}
+
+func (g *GovernanceCenter) refreshPoliciesLocked() error {
+	if g.policyStore == nil {
+		return nil
+	}
+	policies, err := g.policyStore.loadGovernancePolicies()
+	if err != nil {
+		return err
+	}
+	g.policies = policies
+	return nil
 }
 
 func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
@@ -338,6 +387,13 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 	}
 	if snapshot.Confirmations != nil {
 		center.confirmations = snapshot.Confirmations
+		for id, confirmation := range center.confirmations {
+			if confirmation.Status == ConfirmationExecuting {
+				confirmation.Status = ConfirmationOutcomeUnknown
+				confirmation.CompletedAt = time.Now().UTC()
+				center.confirmations[id] = confirmation
+			}
+		}
 	}
 	for key, execution := range snapshot.Executions {
 		center.executions[key] = governanceExecution{
@@ -419,9 +475,20 @@ func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	checkpoint := g.snapshotLocked()
-	previous := g.policies[governanceKey(policy.TenantID, policy.AgentAppID)]
-	policy.Revision = previous.Revision + 1
-	policy.UpdatedAt = g.now().UTC()
+	if err := g.refreshPoliciesLocked(); err != nil {
+		return TenantPolicy{}, err
+	}
+	if g.policyStore != nil {
+		persisted, err := g.policyStore.saveGovernancePolicy(policy)
+		if err != nil {
+			return TenantPolicy{}, err
+		}
+		policy = persisted
+	} else {
+		previous := g.policies[governanceKey(policy.TenantID, policy.AgentAppID)]
+		policy.Revision = previous.Revision + 1
+		policy.UpdatedAt = g.now().UTC()
+	}
 	g.policies[governanceKey(policy.TenantID, policy.AgentAppID)] = clonePolicy(policy)
 	metrics := g.metrics[policy.TenantID]
 	metrics.TenantID = policy.TenantID
@@ -449,6 +516,9 @@ func (p TenantPolicy) runtimeTimeout() time.Duration {
 func (g *GovernanceCenter) Policy(tenantID, appID string) (TenantPolicy, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.refreshPoliciesLocked() != nil {
+		return TenantPolicy{}, false
+	}
 	policy, ok := g.policies[governanceKey(tenantID, appID)]
 	return clonePolicy(policy), ok
 }
@@ -459,6 +529,9 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if err := g.refreshPoliciesLocked(); err != nil {
+		return GovernanceResult{}, &GovernanceError{Code: "control_plane_unavailable"}
+	}
 	checkpoint := g.snapshotLocked()
 	now := g.now().UTC()
 	if g.reconcileExpiredReservationsLocked(now) {
@@ -831,6 +904,9 @@ func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request Governance
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if err := g.refreshPoliciesLocked(); err != nil {
+		return &GovernanceError{Code: "control_plane_unavailable", TraceID: traceID}
+	}
 	checkpoint := g.snapshotLocked()
 	now := g.now().UTC()
 	policy, configured := g.policies[governanceKey(request.TenantID, request.AgentAppID)]
@@ -891,9 +967,9 @@ func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request Governance
 		case ConfirmationRejected, ConfirmationExpired:
 			return &GovernanceError{Code: "confirmation_rejected", TraceID: traceID, ConfirmationID: confirmationID}
 		case ConfirmationApproved:
-			confirmation.Status = ConfirmationRunning
+			confirmation.Status = ConfirmationExecuting
 			confirmation.InvokedAt = now
-		case ConfirmationRunning, ConfirmationCompleted, ConfirmationFailed, ConfirmationCancelled:
+		case ConfirmationExecuting, ConfirmationCompleted, ConfirmationFailed, ConfirmationOutcomeUnknown:
 			return deny("confirmation_consumed")
 		default:
 			return deny("confirmation_rejected")
@@ -950,9 +1026,9 @@ func (g *GovernanceCenter) CompleteTool(ctx context.Context, request GovernanceR
 		decision, status, errorType = "tool.failed", "error", "tool_failed"
 	}
 	confirmationID := "confirmation-" + stableID(request.TenantID+"\x00"+request.RequestID+"\x00"+toolName)
-	if confirmation, ok := g.confirmations[confirmationID]; ok && confirmation.Status == ConfirmationRunning {
+	if confirmation, ok := g.confirmations[confirmationID]; ok && confirmation.Status == ConfirmationExecuting {
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-			confirmation.Status = ConfirmationCancelled
+			confirmation.Status = ConfirmationOutcomeUnknown
 		} else if runErr != nil {
 			confirmation.Status = ConfirmationFailed
 		} else {
@@ -968,6 +1044,42 @@ func (g *GovernanceCenter) CompleteTool(ctx context.Context, request GovernanceR
 		// terminal state in memory when the audit snapshot is unavailable so a
 		// retry can persist the outcome without invoking the Tool again.
 		return &GovernanceError{Code: "audit_unavailable", TraceID: traceID}
+	}
+	return nil
+}
+
+func (g *GovernanceCenter) MarkExecutingToolsOutcomeUnknown(ctx context.Context, request GovernanceRequest, traceID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	checkpoint := g.snapshotLocked()
+	now := g.now().UTC()
+	changed := false
+	for id, confirmation := range g.confirmations {
+		if confirmation.TenantID != request.TenantID || confirmation.RequestID != request.RequestID || confirmation.Status != ConfirmationExecuting {
+			continue
+		}
+		confirmation.Status = ConfirmationOutcomeUnknown
+		confirmation.CompletedAt = now
+		g.confirmations[id] = confirmation
+		delete(g.toolStarts, toolExecutionKey(request.TenantID, request.RequestID, confirmation.ToolName))
+		g.appendAuditLocked(AuditEvent{
+			TenantID: request.TenantID, UserID: request.UserID, SessionID: request.SessionID,
+			AgentName: request.AgentAppID, ToolName: confirmation.ToolName, Decision: "tool.outcome_unknown",
+			ErrorType: "worker_lost", TraceID: traceID, RequestID: request.RequestID,
+			PolicyRevision: confirmation.PolicyRevision, Checkpoint: "tool.after_call", OccurredAt: now,
+		})
+		g.recordTraceLocked(request, traceID, "tool.execute", "outcome_unknown", now)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := g.persistLocked(); err != nil {
+		g.restoreLocked(checkpoint)
+		return err
 	}
 	return nil
 }

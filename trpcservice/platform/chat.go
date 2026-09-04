@@ -781,6 +781,11 @@ func (h *AdminHandler) handleSendChatMessage(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid_request_id", "request id must be 1 to 128 printable ASCII characters")
 		return
 	}
+	traceParent := strings.ToLower(strings.TrimSpace(r.Header.Get("traceparent")))
+	if traceParent != "" && !validTraceParent(traceParent) {
+		writeError(w, http.StatusBadRequest, "invalid_traceparent", "traceparent is invalid")
+		return
+	}
 	events, err := h.chatEvents(r.Context(), tenant.TenantID, sessionID)
 	if err != nil {
 		writeStorageError(w, err)
@@ -797,7 +802,7 @@ func (h *AdminHandler) handleSendChatMessage(w http.ResponseWriter, r *http.Requ
 	}
 	result, err := h.startChatRun(chatRunOptions{
 		tenant: tenant, appID: appID, sessionID: sessionID, input: request.Input,
-		requestID: requestID, userID: tenant.UserID,
+		requestID: requestID, userID: tenant.UserID, traceParent: traceParent,
 	})
 	if err != nil {
 		writeChatStartError(w, err)
@@ -1032,12 +1037,14 @@ type chatRunOptions struct {
 	userID         string
 	binding        *ChannelBinding
 	traceID        string
+	traceParent    string
 	policyRevision uint64
 }
 
 type activeChatRun struct {
 	cancel context.CancelFunc
 	input  string
+	done   <-chan struct{}
 }
 
 func (o chatRunOptions) provider() string {
@@ -1065,6 +1072,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	}
 	options.input = governanceResult.Input
 	options.traceID = governanceResult.TraceID
+	if options.traceParent == "" {
+		options.traceParent = newTraceParent(options.traceID)
+	}
 	options.policyRevision = governanceResult.PolicyRevision
 	started := false
 	defer func() {
@@ -1111,7 +1121,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	}
 	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	inputPayload, _ := json.Marshal(map[string]string{
-		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID, "trace_id": options.traceID,
+		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID, "trace_id": options.traceID, "traceparent": options.traceParent,
 	})
 	recoveryOptions := options
 	existingInput := false
@@ -1121,11 +1131,12 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			continue
 		}
 		var persistedInput struct {
-			AppID     string `json:"app_id"`
-			Input     string `json:"input"`
-			UserID    string `json:"user_id"`
-			RequestID string `json:"request_id"`
-			TraceID   string `json:"trace_id"`
+			AppID       string `json:"app_id"`
+			Input       string `json:"input"`
+			UserID      string `json:"user_id"`
+			RequestID   string `json:"request_id"`
+			TraceID     string `json:"trace_id"`
+			TraceParent string `json:"traceparent"`
 		}
 		if event.Type != "message.input" || json.Unmarshal(event.Payload, &persistedInput) != nil ||
 			persistedInput.Input != options.input || (persistedInput.AppID != "" && persistedInput.AppID != options.appID) ||
@@ -1149,6 +1160,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 		if persistedInput.TraceID != "" {
 			recoveryOptions.traceID = persistedInput.TraceID
+		}
+		if persistedInput.TraceParent != "" {
+			recoveryOptions.traceParent = persistedInput.TraceParent
 		}
 		recoveryOptions.input = persistedInput.Input
 		options = recoveryOptions
@@ -1197,7 +1211,8 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		return chatRunResponse{}, &GovernanceError{Code: "policy_unavailable"}
 	}
 	runCtx, cancel := runtimeTimeoutContext(h.chatCtx, policy.runtimeTimeout())
-	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input}
+	done := make(chan struct{})
+	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input, done: done}
 	h.chatWG.Add(1)
 	started = true
 	h.chatMu.Unlock()
@@ -1208,6 +1223,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			h.chatMu.Lock()
 			delete(h.activeRuns, key)
 			h.chatMu.Unlock()
+			close(done)
 			cancel()
 			release()
 		}()
@@ -1227,8 +1243,13 @@ func runtimeTimeoutContext(parent context.Context, timeout time.Duration) (conte
 
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
 	governanceRequest := h.governanceRequest(options)
+	agentInput, err := contextualAgentInput(ctx, store, options)
+	if err != nil {
+		h.finishChatStorageFailure(store, options, governanceRequest, err)
+		return
+	}
 	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
-		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID, PolicyRevision: options.policyRevision,
+		AppID: options.appID, SessionID: options.sessionID, Input: agentInput, RequestID: options.requestID, TraceID: options.traceID, TraceParent: options.traceParent, PolicyRevision: options.policyRevision,
 		Channel: options.provider(), ExternalSubject: optionsExternalSubject(options),
 	})
 	if err != nil {
@@ -1237,6 +1258,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 		if spanErr := h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "error"); spanErr != nil {
+			return
+		}
+		if markErr := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); markErr != nil {
 			return
 		}
 		cancelled := err.Error() == "request_cancelled" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -1258,7 +1282,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, code)
 		}
 		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
-		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", eventType, h.chatIdentityPayload(options, map[string]string{"error": "run failed"}))
+		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", eventType, h.chatIdentityPayload(options, map[string]string{"error": err.Error()}))
 		cancel()
 		return
 	}
@@ -1305,6 +1329,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		if runtimeEvent.Type == "run.failed" {
 			if strings.Contains(runtimeEvent.Data["error"], "confirmation_required") {
 				_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
+				if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+					return
+				}
 				h.appendPendingConfirmationEvent(store, options)
 				return
 			}
@@ -1325,6 +1352,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		if runtimeEvent.Type == "run.cancelled" {
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
+			if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+				return
+			}
 			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
 				return
 			}
@@ -1342,6 +1372,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	}
 	if ctx.Err() != nil {
 		_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
+		if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+			return
+		}
 		if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
 			return
 		}
@@ -1372,6 +1405,23 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		payload := h.chatIdentityPayload(options, map[string]string{"output": output})
 		_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", "message.completed", payload)
+	}
+	if artifacts, ok := store.(ArtifactStore); ok && sawCompleted {
+		_, artifactErr := artifacts.PutArtifact(ctx, Artifact{
+			TenantID: options.tenant.TenantID, SessionID: options.sessionID,
+			Name:       "response-" + options.requestID + ".txt",
+			ContentRef: "session-event://" + options.tenant.TenantID + "/" + options.sessionID + "/" + options.requestID + ":completed",
+			RequestID:  options.requestID, TraceID: options.traceID, Status: "published",
+		})
+		if artifactErr != nil {
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":artifact-failed", "artifact.publication.failed", h.chatIdentityPayload(options, map[string]string{"error": "artifact publication failed"}))
+			cancel()
+			return
+		}
+		if err := h.governance.RecordSpan(governanceRequest, options.traceID, "storage.artifact.publish", "ok"); err != nil {
+			return
+		}
 	}
 	if options.binding != nil {
 		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: output})
@@ -1411,6 +1461,58 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
 	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
 	cancelTerminal()
+}
+
+func contextualAgentInput(ctx context.Context, store DataStore, options chatRunOptions) (string, error) {
+	sections := make([]string, 0, 2)
+	memory, err := store.ListMemory(ctx, options.tenant.TenantID, options.sessionID)
+	if err != nil {
+		return "", err
+	}
+	if len(memory) > 0 {
+		var values []string
+		for _, item := range memory {
+			values = append(values, item.Key+"="+item.Value)
+		}
+		sections = append(sections, "Memory:\n"+strings.Join(values, "\n"))
+	}
+	if knowledge, ok := store.(KnowledgeStore); ok {
+		records, err := knowledge.ListKnowledge(ctx, options.tenant.TenantID, options.appID)
+		if err != nil {
+			return "", err
+		}
+		if len(records) > 0 {
+			var values []string
+			for _, item := range records {
+				values = append(values, item.Content)
+			}
+			sections = append(sections, "Knowledge:\n"+strings.Join(values, "\n"))
+		}
+	}
+	if len(sections) == 0 {
+		return options.input, nil
+	}
+	return strings.Join(sections, "\n\n") + "\n\nUser:\n" + options.input, nil
+}
+
+func (h *AdminHandler) finishChatStorageFailure(store DataStore, options chatRunOptions, request GovernanceRequest, cause error) {
+	_ = h.governance.RecordSpan(request, options.traceID, "storage.context.read", "error")
+	_, _ = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, "storage_error", false))
+	terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+	defer cancel()
+	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": storageFailureError(cause).Error()}))
+}
+
+func newTraceParent(traceID string) string {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if len(traceID) != 32 {
+		buf := make([]byte, 16)
+		_, _ = rand.Read(buf)
+		traceID = hex.EncodeToString(buf)
+	}
+	span := make([]byte, 8)
+	_, _ = rand.Read(span)
+	return "00-" + traceID + "-" + hex.EncodeToString(span) + "-01"
 }
 
 func (h *AdminHandler) appendPendingConfirmationEvent(store DataStore, options chatRunOptions) {
@@ -1540,8 +1642,13 @@ func (h *AdminHandler) appendChatEvent(ctx context.Context, store DataStore, ten
 	if err != nil {
 		return err
 	}
+	var fencingToken uint64
+	if fields, ok := payload.(map[string]string); ok {
+		fencingToken, _ = strconv.ParseUint(fields["fencing_token"], 10, 64)
+	}
 	return store.AppendSessionEvent(ctx, SessionEvent{
 		TenantID: tenantID, SessionID: sessionID, IdempotencyKey: idempotencyKey, Type: eventType, Payload: encoded,
+		FencingToken: fencingToken,
 	})
 }
 

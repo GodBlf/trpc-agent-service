@@ -21,4 +21,5 @@ fi
 npm --prefix "$ROOT/frontend" run build
 mkdir -p "$ROOT/bin"
 go build -o "$ROOT/bin/trpc-service" ./cmd/trpc-service
-echo "built frontend and $ROOT/bin/trpc-service"
+go build -o "$ROOT/bin/control-migrate" ./cmd/control-migrate
+echo "built frontend, $ROOT/bin/trpc-service, and $ROOT/bin/control-migrate"

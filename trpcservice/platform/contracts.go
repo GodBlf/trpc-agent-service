@@ -145,10 +145,12 @@ type GatewayRequest struct {
 	Input           string             `json:"input"`
 	RequestID       string             `json:"-"`
 	TraceID         string             `json:"-"`
+	TraceParent     string             `json:"-"`
 	DeploymentID    string             `json:"-"`
 	VersionID       string             `json:"-"`
 	Version         *DeploymentVersion `json:"-"`
 	PolicyRevision  uint64             `json:"-"`
+	FencingToken    uint64             `json:"-"`
 }
 
 type GatewayResponse struct {
@@ -183,6 +185,7 @@ type SessionEvent struct {
 	Type           string    `json:"type"`
 	Payload        []byte    `json:"payload"`
 	OccurredAt     time.Time `json:"occurred_at"`
+	FencingToken   uint64    `json:"fencing_token,omitempty"`
 }
 
 type RunnerRequest struct {
@@ -197,10 +200,12 @@ type RunnerRequest struct {
 	Input            string
 	RequestID        string
 	TraceID          string
+	TraceParent      string
 	DeploymentID     string
 	VersionID        string
 	Version          *DeploymentVersion `json:"version,omitempty"`
 	PolicyRevision   uint64
+	FencingToken     uint64
 }
 
 type RunnerResponse struct {
@@ -304,6 +309,7 @@ type AuditSink interface {
 }
 
 var (
-	ErrNotFound       = errors.New("platform: not found")
-	ErrDuplicateEvent = errors.New("platform: duplicate session event")
+	ErrNotFound          = errors.New("platform: not found")
+	ErrDuplicateEvent    = errors.New("platform: duplicate session event")
+	ErrStaleFencingToken = errors.New("platform: stale fencing token")
 )

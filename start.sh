@@ -16,6 +16,8 @@ if [[ ! -x "$ROOT/bin/trpc-service" ]]; then
   "$ROOT/build.sh"
 fi
 
+"$ROOT/bin/control-migrate"
+
 PID_FILE="$ROOT/data/trpc-service.pid"
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "already running: pid=$(cat "$PID_FILE")"

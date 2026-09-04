@@ -14,20 +14,34 @@ import (
 )
 
 type DeterministicAgent struct {
-	name string
+	name  string
+	delay time.Duration
 }
 
 func NewDeterministicAgent(name string) *DeterministicAgent {
+	return NewDeterministicAgentWithDelay(name, 0)
+}
+
+func NewDeterministicAgentWithDelay(name string, delay time.Duration) *DeterministicAgent {
 	if name == "" {
 		name = "deterministic-agent"
 	}
-	return &DeterministicAgent{name: name}
+	return &DeterministicAgent{name: name, delay: delay}
 }
 
 func (a *DeterministicAgent) Run(ctx context.Context, invocation *frameworkagent.Invocation) (<-chan *event.Event, error) {
 	results := make(chan *event.Event, 3)
 	go func() {
 		defer close(results)
+		if a.delay > 0 {
+			timer := time.NewTimer(a.delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
 		input := invocation.Message.Content
 		output := "framework:" + input
 		partial := event.NewResponseEvent(invocation.InvocationID, a.name, &model.Response{
@@ -80,9 +94,22 @@ type deterministicToolModel struct {
 // NewDeterministicToolAgent exercises the upstream model-to-Tool execution
 // path without relying on a hosted model or an external side effect.
 func NewDeterministicToolAgent(name, toolName string) frameworkagent.Agent {
+	return NewDeterministicToolAgentWithDelay(name, toolName, 0)
+}
+
+func NewDeterministicToolAgentWithDelay(name, toolName string, delay time.Duration) frameworkagent.Agent {
 	modelStub := &deterministicToolModel{name: name + "-model", toolName: toolName}
 	toolStub := function.NewFunctionTool(
-		func(context.Context, deterministicToolInput) (deterministicToolOutput, error) {
+		func(ctx context.Context, _ deterministicToolInput) (deterministicToolOutput, error) {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return deterministicToolOutput{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
 			return deterministicToolOutput{Status: "completed"}, nil
 		},
 		function.WithName(toolName),

@@ -48,12 +48,57 @@ type identityResponse struct {
 // MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
 // Stage 2 replaces storage through the frozen adapter boundary.
 type MemoryPlatform struct {
-	mu               sync.RWMutex
-	tenants          map[string]Tenant
-	apps             map[string]AgentApp
-	deployments      map[string]Deployment
-	versions         map[string][]DeploymentVersion
-	versionCreations map[versionCreationKey]versionCreation
+	mu                  sync.RWMutex
+	tenants             map[string]Tenant
+	apps                map[string]AgentApp
+	deployments         map[string]Deployment
+	versions            map[string][]DeploymentVersion
+	versionCreations    map[versionCreationKey]versionCreation
+	channelBindings     map[string]ChannelBinding
+	backendSelections   map[string]backendSelection
+	governancePolicies  map[string]TenantPolicy
+	persistence         controlPlanePersistence
+	persistenceErr      error
+	persistenceRevision int64
+}
+
+// ControlPlaneStore is the authoritative Gateway resource boundary. The
+// operations stay package-private so persistence cannot bypass domain rules.
+type ControlPlaneStore interface {
+	seedTenant(TenantAssignment)
+	createTenant(Tenant) bool
+	tenant(string) (Tenant, bool)
+	DeploymentVersion(string) (DeploymentVersion, bool)
+	listTenants() []Tenant
+	listTenantsFor(TenantContext) []Tenant
+	createApp(AgentApp) bool
+	app(string, string) (AgentApp, bool)
+	listApps(string) []AgentApp
+	createDeployment(Deployment) bool
+	deployment(string, string) (Deployment, bool)
+	listDeployments(string) []Deployment
+	createVersion(Deployment, string, map[string]any) (DeploymentVersion, string, bool)
+	listVersions(string, string) []DeploymentVersion
+	transition(Deployment, DeploymentStatus, string) (Deployment, string, bool)
+	startRollout(Deployment, string, int) (Deployment, string, bool)
+	rollbackPreview(Deployment) (DeploymentRollbackPreview, string, bool)
+	rollback(Deployment) (Deployment, string, bool)
+	activeDeployment(string, string) (Deployment, bool)
+	routeDeployment(string, string, string) (Deployment, bool)
+	controlPlaneError() error
+	loadChannelBindings() map[string]ChannelBinding
+	saveChannelBindings(map[string]ChannelBinding) error
+	loadBackendSelections() (map[string]backendSelection, error)
+	saveBackendSelection(string, backendSelection) error
+	loadGovernancePolicies() (map[string]TenantPolicy, error)
+	saveGovernancePolicy(TenantPolicy) (TenantPolicy, error)
+	Close() error
+}
+
+func (p *MemoryPlatform) controlPlaneError() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.persistenceErr
 }
 
 type versionCreationKey struct {
@@ -71,38 +116,175 @@ func NewMemoryPlatform() *MemoryPlatform {
 	return &MemoryPlatform{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
-		versionCreations: make(map[versionCreationKey]versionCreation),
+		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding),
+		backendSelections: make(map[string]backendSelection), governancePolicies: make(map[string]TenantPolicy),
 	}
+}
+
+func (p *MemoryPlatform) loadBackendSelections() (map[string]backendSelection, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return nil, p.persistenceErr
+	}
+	return copyBackendSelections(p.backendSelections), nil
+}
+
+func (p *MemoryPlatform) saveBackendSelection(tenantID string, selection backendSelection) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return p.persistenceErr
+	}
+	previous, existed := p.backendSelections[tenantID]
+	p.backendSelections[tenantID] = selection
+	if p.persistLocked() {
+		return nil
+	}
+	if existed {
+		p.backendSelections[tenantID] = previous
+	} else {
+		delete(p.backendSelections, tenantID)
+	}
+	return p.persistenceErr
+}
+
+func (p *MemoryPlatform) loadGovernancePolicies() (map[string]TenantPolicy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return nil, p.persistenceErr
+	}
+	policies := make(map[string]TenantPolicy, len(p.governancePolicies))
+	for key, policy := range p.governancePolicies {
+		policies[key] = clonePolicy(policy)
+	}
+	return policies, nil
+}
+
+func (p *MemoryPlatform) saveGovernancePolicy(policy TenantPolicy) (TenantPolicy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return TenantPolicy{}, p.persistenceErr
+	}
+	key := governanceKey(policy.TenantID, policy.AgentAppID)
+	previous, existed := p.governancePolicies[key]
+	policy.Revision = previous.Revision + 1
+	policy.UpdatedAt = time.Now().UTC()
+	p.governancePolicies[key] = clonePolicy(policy)
+	if p.persistLocked() {
+		return clonePolicy(policy), nil
+	}
+	if existed {
+		p.governancePolicies[key] = previous
+	} else {
+		delete(p.governancePolicies, key)
+	}
+	return TenantPolicy{}, p.persistenceErr
+}
+
+func (p *MemoryPlatform) loadChannelBindings() map[string]ChannelBinding {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
+	items := make(map[string]ChannelBinding, len(p.channelBindings))
+	for key, binding := range p.channelBindings {
+		items[key] = binding
+	}
+	return items
+}
+
+func (p *MemoryPlatform) saveChannelBindings(bindings map[string]ChannelBinding) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return p.persistenceErr
+	}
+	p.channelBindings = make(map[string]ChannelBinding, len(bindings))
+	for key, binding := range bindings {
+		p.channelBindings[key] = binding
+	}
+	if !p.persistLocked() {
+		return p.persistenceErr
+	}
+	return nil
+}
+
+func (p *MemoryPlatform) persistLocked() bool {
+	if p.persistence == nil {
+		return true
+	}
+	p.persistenceRevision, p.persistenceErr = p.persistence.Save(controlPlaneSnapshotFrom(p), p.persistenceRevision)
+	return p.persistenceErr == nil
+}
+
+func (p *MemoryPlatform) refreshLocked() bool {
+	if p.persistence == nil {
+		return true
+	}
+	snapshot, revision, err := p.persistence.Load()
+	p.persistenceErr = err
+	if err != nil {
+		return false
+	}
+	if revision > p.persistenceRevision {
+		applyControlPlaneSnapshot(p, snapshot)
+		p.persistenceRevision = revision
+	}
+	return true
+}
+
+func (p *MemoryPlatform) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.persistence == nil {
+		return nil
+	}
+	err := p.persistence.Close()
+	p.persistence = nil
+	return err
 }
 
 func (p *MemoryPlatform) seedTenant(assignment TenantAssignment) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.refreshLocked()
 	if _, exists := p.tenants[assignment.TenantID]; !exists {
 		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+		p.persistLocked()
 	}
 }
 
 func (p *MemoryPlatform) createTenant(tenant Tenant) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return false
+	}
 	if _, exists := p.tenants[tenant.ID]; exists {
 		return false
 	}
 	p.tenants[tenant.ID] = tenant
-	return true
+	return p.persistLocked()
 }
 
 func (p *MemoryPlatform) tenant(id string) (Tenant, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return Tenant{}, false
+	}
 	tenant, ok := p.tenants[id]
 	return tenant, ok
 }
 
 func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return DeploymentVersion{}, false
+	}
 	for _, versions := range p.versions {
 		for _, version := range versions {
 			if version.ID == id {
@@ -118,8 +300,9 @@ func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) 
 }
 
 func (p *MemoryPlatform) listTenants() []Tenant {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
 	items := make([]Tenant, 0, len(p.tenants))
 	for _, tenant := range p.tenants {
 		items = append(items, tenant)
@@ -129,8 +312,9 @@ func (p *MemoryPlatform) listTenants() []Tenant {
 }
 
 func (p *MemoryPlatform) listTenantsFor(tenant TenantContext) []Tenant {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
 	items := make([]Tenant, 0, len(tenant.Assignments))
 	for _, candidate := range p.tenants {
 		if tenantCanSee(tenant, candidate.ID) {
@@ -154,7 +338,7 @@ type productionSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
-	platform                 *MemoryPlatform
+	platform                 ControlPlaneStore
 	identity                 DevelopmentIdentity
 	identityProvider         IdentityProvider
 	productionSessions       map[string]*productionSession
@@ -194,6 +378,7 @@ type AdminHandler struct {
 	drainCompletedAt         time.Time
 	drainError               string
 	faultInjectionEnabled    bool
+	internalGovernanceToken  string
 }
 
 // ConfigureIdentityProvider enables production identity mode. Development
@@ -217,12 +402,13 @@ func (h *AdminHandler) ConfigureGovernance(center *GovernanceCenter) {
 		return
 	}
 	h.governance = center
+	center.configurePolicyStore(h.platform)
 	if governed, ok := h.runtime.worker.runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
 		governed.SetGovernance(center)
 	}
 }
 
-func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
+func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *AdminHandler {
 	if platform == nil {
 		platform = NewMemoryPlatform()
 	}
@@ -234,6 +420,7 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	chatCtx, chatCancel := context.WithCancel(context.Background())
 	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
+	channels.configurePersistence(platform.loadChannelBindings(), platform.saveChannelBindings)
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),
@@ -270,7 +457,12 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.backendSelectionPath = path
-	if path == "" {
+	selections, err := h.platform.loadBackendSelections()
+	if err != nil {
+		return err
+	}
+	if len(selections) > 0 || path == "" {
+		h.backends.setSelections(selections)
 		return nil
 	}
 	data, err := os.ReadFile(path)
@@ -280,11 +472,16 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	if err != nil {
 		return err
 	}
-	var selections map[string]backendSelection
-	if err := json.Unmarshal(data, &selections); err != nil {
+	var importedSelections map[string]backendSelection
+	if err := json.Unmarshal(data, &importedSelections); err != nil {
 		return err
 	}
-	h.backends.setSelections(selections)
+	h.backends.setSelections(importedSelections)
+	for tenantID, selection := range importedSelections {
+		if err := h.platform.saveBackendSelection(tenantID, selection); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 func (h *AdminHandler) ConfigureMigration(sourceAddress, destinationPath, checkpointPath string) {
@@ -317,6 +514,9 @@ func (h *AdminHandler) ConfigurePostgresBackend(dsn string) {
 func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.platform.saveBackendSelection(tenantID, selection); err != nil {
+		return err
+	}
 	next := h.backends.selectionSnapshot()
 	next[tenantID] = selection
 	if h.backendSelectionPath != "" {
@@ -356,7 +556,10 @@ func (h *AdminHandler) Close() error {
 	if runtimeErr != nil {
 		return runtimeErr
 	}
-	return storeErr
+	if storeErr != nil {
+		return storeErr
+	}
+	return h.platform.Close()
 }
 
 func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
@@ -370,6 +573,11 @@ func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
 }
 
 func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
+	selections, err := h.platform.loadBackendSelections()
+	if err != nil {
+		return nil, nil, err
+	}
+	h.backends.syncSelections(selections)
 	return h.backends.acquire(tenantID)
 }
 
@@ -386,7 +594,15 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 	h.mu.Unlock()
 }
 
+func (h *AdminHandler) ConfigureSessionLeases(manager SessionLeaseManager) {
+	h.runtime.SetSessionLeaseManager(manager)
+}
+
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/internal/governance/tool/") {
+		h.handleInternalGovernance(w, r)
+		return
+	}
 	auditWriter := &auditResponseWriter{ResponseWriter: w, buffered: r.Method != http.MethodGet || r.URL.Path == "/api/v1/auth/me"}
 	w = auditWriter
 	started := time.Now()

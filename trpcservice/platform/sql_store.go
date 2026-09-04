@@ -61,8 +61,10 @@ func (s *SQLStore) q(query string) string {
 }
 func (s *SQLStore) init(ctx context.Context) error {
 	statements := []string{
-		`CREATE TABLE IF NOT EXISTS session_events (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, sequence BIGINT NOT NULL, event_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_type TEXT NOT NULL, payload BYTEA NOT NULL, occurred_at TEXT NOT NULL, PRIMARY KEY (tenant_id, session_id, sequence), UNIQUE (tenant_id, session_id, idempotency_key))`,
+		`CREATE TABLE IF NOT EXISTS session_events (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, sequence BIGINT NOT NULL, event_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_type TEXT NOT NULL, payload BYTEA NOT NULL, occurred_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, session_id, sequence), UNIQUE (tenant_id, session_id, idempotency_key))`,
 		`CREATE TABLE IF NOT EXISTS session_memory (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, memory_key TEXT NOT NULL, memory_id TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (tenant_id, session_id, memory_key))`,
+		`CREATE TABLE IF NOT EXISTS artifacts (tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, session_id TEXT NOT NULL, name TEXT NOT NULL, content_reference TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', trace_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, artifact_id))`,
+		`CREATE TABLE IF NOT EXISTS knowledge_records (tenant_id TEXT NOT NULL, knowledge_id TEXT NOT NULL, agent_app_id TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, index_status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, knowledge_id))`,
 	}
 	if s.backend == "sqlite" {
 		statements[0] = strings.Replace(statements[0], "BYTEA", "BLOB", 1)
@@ -72,7 +74,54 @@ func (s *SQLStore) init(ctx context.Context) error {
 			return err
 		}
 	}
+	if s.backend == "postgres" {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE session_events ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+		for _, statement := range []string{
+			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'`,
+		} {
+			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+	} else {
+		for name, definition := range map[string]string{"request_id": "TEXT NOT NULL DEFAULT ''", "trace_id": "TEXT NOT NULL DEFAULT ''", "status": "TEXT NOT NULL DEFAULT 'published'"} {
+			if err := s.ensureSQLiteColumn(ctx, "artifacts", name, definition); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func (s *SQLStore) ensureSQLiteColumn(ctx context.Context, table, name, definition string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var column, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &column, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		found = found || column == name
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+name+" "+definition)
+	return err
 }
 
 func (s *SQLStore) GetSession(ctx context.Context, tenant, session string) (Session, error) {
@@ -97,6 +146,14 @@ func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) e
 		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 		if err != nil {
 			return err
+		}
+		if s.backend == "postgres" && event.FencingToken > 0 {
+			var current uint64
+			err = tx.QueryRowContext(ctx, `SELECT fencing_token FROM session_execution_leases WHERE tenant_id=$1 AND session_id=$2 AND expires_at > NOW()`, event.TenantID, event.SessionID).Scan(&current)
+			if err != nil || current != event.FencingToken {
+				tx.Rollback()
+				return ErrStaleFencingToken
+			}
 		}
 		var typ string
 		var payload []byte
@@ -123,7 +180,7 @@ func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) e
 		if event.OccurredAt.IsZero() {
 			event.OccurredAt = time.Now().UTC()
 		}
-		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO session_events(tenant_id,session_id,sequence,event_id,idempotency_key,event_type,payload,occurred_at) VALUES(?,?,?,?,?,?,?,?)`), event.TenantID, event.SessionID, sequence, event.ID, event.IdempotencyKey, event.Type, event.Payload, event.OccurredAt.Format(time.RFC3339Nano))
+		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO session_events(tenant_id,session_id,sequence,event_id,idempotency_key,event_type,payload,occurred_at,fencing_token) VALUES(?,?,?,?,?,?,?,?,?)`), event.TenantID, event.SessionID, sequence, event.ID, event.IdempotencyKey, event.Type, event.Payload, event.OccurredAt.Format(time.RFC3339Nano), event.FencingToken)
 		if err != nil {
 			tx.Rollback()
 			continue
@@ -135,7 +192,7 @@ func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) e
 	return errors.New("platform: concurrent append retry exhausted")
 }
 func (s *SQLStore) ListSessionEvents(ctx context.Context, tenant, session string, after uint64) ([]SessionEvent, error) {
-	rows, err := s.db.QueryContext(ctx, s.q(`SELECT event_id,sequence,idempotency_key,event_type,payload,occurred_at FROM session_events WHERE tenant_id=? AND session_id=? AND sequence>? ORDER BY sequence`), tenant, session, after)
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT event_id,sequence,idempotency_key,event_type,payload,occurred_at,fencing_token FROM session_events WHERE tenant_id=? AND session_id=? AND sequence>? ORDER BY sequence`), tenant, session, after)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +203,7 @@ func (s *SQLStore) ListSessionEvents(ctx context.Context, tenant, session string
 		var occurred string
 		e.TenantID = tenant
 		e.SessionID = session
-		if err := rows.Scan(&e.ID, &e.Sequence, &e.IdempotencyKey, &e.Type, &e.Payload, &occurred); err != nil {
+		if err := rows.Scan(&e.ID, &e.Sequence, &e.IdempotencyKey, &e.Type, &e.Payload, &occurred, &e.FencingToken); err != nil {
 			return nil, err
 		}
 		e.OccurredAt, _ = time.Parse(time.RFC3339Nano, occurred)

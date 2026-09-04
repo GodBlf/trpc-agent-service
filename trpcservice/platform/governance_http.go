@@ -191,7 +191,53 @@ func (h *AdminHandler) handleConfirmationDecision(w http.ResponseWriter, r *http
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "confirmation event could not be persisted")
 		return
 	}
+	if !h.waitForChatRunExit(r.Context(), confirmation) {
+		writeError(w, http.StatusServiceUnavailable, "request_cancelled", "confirmation decision was interrupted")
+		return
+	}
+	if confirmation.Status == ConfirmationRejected || confirmation.Status == ConfirmationExpired {
+		if err := h.finalizeRejectedConfirmation(r.Context(), confirmation); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "storage_error", "rejected confirmation could not be finalized")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, confirmation)
+}
+
+func (h *AdminHandler) waitForChatRunExit(ctx context.Context, confirmation ToolConfirmation) bool {
+	key := chatRunKey(confirmation.TenantID, confirmation.SessionID, confirmation.RequestID)
+	h.chatMu.Lock()
+	active, running := h.activeRuns[key]
+	h.chatMu.Unlock()
+	if !running || active.done == nil {
+		return true
+	}
+	select {
+	case <-active.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (h *AdminHandler) finalizeRejectedConfirmation(ctx context.Context, confirmation ToolConfirmation) error {
+	if _, err := completeGovernance(ctx, h.governance, GovernanceCompletion{
+		TenantID: confirmation.TenantID, AgentAppID: confirmation.AgentAppID, RequestID: confirmation.RequestID,
+		UserID: confirmation.UserID, SessionID: confirmation.SessionID, ErrorType: "confirmation_rejected",
+	}); err != nil {
+		return err
+	}
+	store, release, err := h.acquireStore(confirmation.TenantID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	payload := map[string]string{
+		"tenant_id": confirmation.TenantID, "app_id": confirmation.AgentAppID, "session_id": confirmation.SessionID,
+		"user_id": confirmation.UserID, "request_id": confirmation.RequestID, "trace_id": confirmation.TraceID,
+		"policy_revision": strconv.FormatUint(confirmation.PolicyRevision, 10), "error": "confirmation_rejected",
+	}
+	return h.appendCriticalChatEvent(ctx, store, confirmation.TenantID, confirmation.SessionID, confirmation.RequestID+":terminal", "run.failed", payload)
 }
 
 func (h *AdminHandler) appendConfirmationSessionEvent(ctx context.Context, confirmation ToolConfirmation) error {

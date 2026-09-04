@@ -84,6 +84,27 @@ type ChannelCoordinator struct {
 	acceptedMessages map[string]struct{}
 	adapter          ChannelAdapter
 	adapters         map[string]ChannelAdapter
+	persist          func(map[string]ChannelBinding) error
+}
+
+func (c *ChannelCoordinator) configurePersistence(bindings map[string]ChannelBinding, persist func(map[string]ChannelBinding) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bindings != nil {
+		c.bindings = bindings
+	}
+	c.persist = persist
+}
+
+func (c *ChannelCoordinator) persistLocked() error {
+	if c.persist == nil {
+		return nil
+	}
+	items := make(map[string]ChannelBinding, len(c.bindings))
+	for key, binding := range c.bindings {
+		items[key] = binding
+	}
+	return c.persist(items)
 }
 
 func NewChannelCoordinator(adapter ChannelAdapter) *ChannelCoordinator {
@@ -167,6 +188,10 @@ func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createC
 		}
 	}
 	c.bindings[binding.ID] = binding
+	if err := c.persistLocked(); err != nil {
+		delete(c.bindings, binding.ID)
+		return ChannelBinding{}, err
+	}
 	return binding, nil
 }
 
@@ -179,6 +204,9 @@ func (c *ChannelCoordinator) UpdateBinding(tenantID, id string, enabled bool) (C
 	}
 	binding.Enabled = enabled
 	c.bindings[id] = binding
+	if err := c.persistLocked(); err != nil {
+		return ChannelBinding{}, err
+	}
 	binding.Secret = ""
 	return binding, nil
 }
@@ -196,6 +224,9 @@ func (c *ChannelCoordinator) ReplaceSecret(tenantID, id, secret string) (Channel
 	}
 	binding.Secret = secret
 	c.bindings[id] = binding
+	if err := c.persistLocked(); err != nil {
+		return ChannelBinding{}, err
+	}
 	binding.Secret = ""
 	return binding, nil
 }
@@ -208,7 +239,7 @@ func (c *ChannelCoordinator) DeleteBinding(tenantID, id string) error {
 		return ErrNotFound
 	}
 	delete(c.bindings, id)
-	return nil
+	return c.persistLocked()
 }
 
 func (c *ChannelCoordinator) Binding(tenantID, id string) (ChannelBinding, bool) {

@@ -2,8 +2,11 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -18,6 +21,154 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
+
+func TestOpenAICompatibleAgentFactoryUsesServerOwnedProfile(t *testing.T) {
+	requests := make(chan map[string]any, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" || r.Header.Get("Authorization") != "Bearer fixture-secret" {
+			http.Error(w, "unexpected provider request", http.StatusUnauthorized)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		requests <- payload
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"id":"fixture","object":"chat.completion","created":1699200000,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"fixture reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}`)
+	}))
+	defer provider.Close()
+
+	store := activeTestPlatform(t)
+	store.mu.Lock()
+	versions := store.versions[resourceKey("tenant-one", "deploy-one")]
+	versions[0].Config = map[string]any{"provider_profile": "default-openai", "model": "fixture-model", "prompt": "Answer briefly."}
+	store.versions[resourceKey("tenant-one", "deploy-one")] = versions
+	store.mu.Unlock()
+	adapter := NewFrameworkRunnerAdapter(store.DeploymentVersion, OpenAICompatibleAgentFactory(ModelProviderProfile{
+		ID: "default-openai", BaseURL: provider.URL, APIKey: "fixture-secret", Model: "server-default",
+	}))
+	defer adapter.Close()
+	response, err := adapter.Run(context.Background(), RunnerRequest{
+		TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", VersionID: "deploy-one-v1",
+		SessionID: "session-one", UserID: "user-one", RequestID: "request-openai", Input: "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Output != "fixture reply" {
+		t.Fatalf("output = %q", response.Output)
+	}
+	request := <-requests
+	if request["model"] != "fixture-model" {
+		t.Fatalf("provider model = %#v", request["model"])
+	}
+	encoded, _ := json.Marshal(request)
+	if strings.Contains(string(encoded), "fixture-secret") {
+		t.Fatal("provider credential leaked into request body")
+	}
+}
+
+func TestOpenAICompatibleModelStreamsThroughPublicChatSSE(t *testing.T) {
+	startedAt := time.Now()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" || r.Header.Get("Authorization") != "Bearer fixture-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"id":"fixture","object":"chat.completion","created":1699200000,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"fixture public reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
+	}))
+	defer provider.Close()
+
+	client := newChannelTestClient(t, EchoRunner{})
+	client.post("/api/v1/admin/agent-apps", `{"id":"app-model","name":"Model"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/admin/deployments", `{"id":"deploy-model","agent_app_id":"app-model"}`, nil, http.StatusCreated, nil)
+	var version DeploymentVersion
+	client.post("/api/v1/admin/deployments/deploy-model/versions", `{"config":{"provider_profile":"default-openai","model":"fixture-model","prompt":"Answer briefly."}}`, map[string]string{"Idempotency-Key": "model-version"}, http.StatusCreated, &version)
+	client.post("/api/v1/admin/deployments/deploy-model/transition", `{"status":"published","version_id":"`+version.ID+`"}`, nil, http.StatusOK, nil)
+	client.post("/api/v1/admin/deployments/deploy-model/transition", `{"status":"active"}`, nil, http.StatusOK, nil)
+	if _, err := client.handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-model"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewFrameworkRunnerAdapter(client.handler.platform.DeploymentVersion, OpenAICompatibleAgentFactory(ModelProviderProfile{ID: "default-openai", BaseURL: provider.URL, APIKey: "fixture-secret", Model: "fixture-model"}))
+	client.handler.ConfigureRuntime(adapter, nil)
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-model","session_id":"session-model"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-model/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-model"}, http.StatusAccepted, nil)
+	envelopes := readSSE(t, client, "/api/v1/chat/sessions/session-model/stream?request_id=request-model", nil)
+	found := false
+	for _, envelope := range envelopes {
+		var data map[string]string
+		_ = json.Unmarshal(envelope.Data, &data)
+		if envelope.Type == "message.completed" && data["output"] == "fixture public reply" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("public SSE did not contain fixture response: %#v", envelopes)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 5*time.Second {
+		t.Fatalf("model workflow waited for an event completion notice: %v", elapsed)
+	}
+}
+
+func TestResponsesModelStreamsThroughPublicChatSSE(t *testing.T) {
+	requests := make(chan map[string]any, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer fixture-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		requests <- payload
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"message-1\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":\"fixture responses reply\"}\n\n")
+		fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"response-1\",\"object\":\"response\",\"created_at\":1699200000,\"model\":\"gpt-5.6-luna\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5,\"input_tokens_details\":{},\"output_tokens_details\":{}}}}\n\n")
+	}))
+	defer provider.Close()
+
+	client := newChannelTestClient(t, EchoRunner{})
+	client.post("/api/v1/admin/agent-apps", `{"id":"app-responses","name":"Responses"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/admin/deployments", `{"id":"deploy-responses","agent_app_id":"app-responses"}`, nil, http.StatusCreated, nil)
+	var version DeploymentVersion
+	client.post("/api/v1/admin/deployments/deploy-responses/versions", `{"config":{"provider_profile":"default-openai","model":"gpt-5.6-luna","prompt":"Answer briefly.","generation_config":{"max_tokens":64,"temperature":0.2}}}`, map[string]string{"Idempotency-Key": "responses-version"}, http.StatusCreated, &version)
+	client.post("/api/v1/admin/deployments/deploy-responses/transition", `{"status":"published","version_id":"`+version.ID+`"}`, nil, http.StatusOK, nil)
+	client.post("/api/v1/admin/deployments/deploy-responses/transition", `{"status":"active"}`, nil, http.StatusOK, nil)
+	if _, err := client.handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-responses"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewFrameworkRunnerAdapter(client.handler.platform.DeploymentVersion, OpenAICompatibleAgentFactory(ModelProviderProfile{
+		ID: "default-openai", BaseURL: provider.URL, APIKey: "fixture-secret", Model: "gpt-5.6-luna", Protocol: ModelProtocolResponses,
+	}))
+	client.handler.ConfigureRuntime(adapter, nil)
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-responses","session_id":"session-responses"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-responses/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-responses"}, http.StatusAccepted, nil)
+	envelopes := readSSE(t, client, "/api/v1/chat/sessions/session-responses/stream?request_id=request-responses", nil)
+	found := false
+	for _, envelope := range envelopes {
+		var data map[string]string
+		_ = json.Unmarshal(envelope.Data, &data)
+		if envelope.Type == "message.completed" && data["output"] == "fixture responses reply" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("public SSE did not contain Responses output: %#v", envelopes)
+	}
+	request := <-requests
+	if request["model"] != "gpt-5.6-luna" || request["max_output_tokens"] != float64(64) || request["temperature"] != 0.2 || request["stream"] != true {
+		t.Fatalf("Responses request = %#v", request)
+	}
+	encoded, _ := json.Marshal(request)
+	if strings.Contains(string(encoded), "fixture-secret") {
+		t.Fatal("provider credential leaked into request body")
+	}
+}
 
 func TestFrameworkRunnerAdapterStreamsAndReusesRunner(t *testing.T) {
 	platform := activeTestPlatform(t)
@@ -151,6 +302,47 @@ func TestFrameworkRunnerAdapterRejectsUnknownVersionAndClose(t *testing.T) {
 	}
 	if _, err := adapter.RunEvents(context.Background(), RunnerRequest{VersionID: "missing"}); err == nil || err.Error() != "framework_runtime_closed" {
 		t.Fatalf("closed adapter error = %v", err)
+	}
+}
+
+func TestFrameworkRunnerAdapterAppliesToolGovernanceAfterRunningPlainVersion(t *testing.T) {
+	versions := map[string]DeploymentVersion{
+		"plain-v1": {
+			ID: "plain-v1", TenantID: "tenant-one", AgentAppID: "plain-app", DeploymentID: "plain", Active: true,
+			Config: map[string]any{"runner": "plain"},
+		},
+		"tool-v1": {
+			ID: "tool-v1", TenantID: "tenant-one", AgentAppID: "tool-app", DeploymentID: "tool", Active: true,
+			Config: map[string]any{"runner": "tool", "tools": []any{"deploy"}, "deterministic_tool_call": "deploy"},
+		},
+	}
+	adapter := NewFrameworkRunnerAdapter(func(id string) (DeploymentVersion, bool) {
+		version, ok := versions[id]
+		return version, ok
+	}, nil)
+	defer adapter.Close()
+	center := NewGovernanceCenter()
+	policy, err := center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "tool-app", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.SetToolGovernance(center)
+
+	plain := collectRuntimeEvents(t, adapter, RunnerRequest{
+		TenantID: "tenant-one", AppID: "plain-app", DeploymentID: "plain", VersionID: "plain-v1",
+		SessionID: "plain-session", UserID: "user-one", RequestID: "plain-request", Input: "hello",
+	})
+	if plain[len(plain)-1].Type != "run.completed" {
+		t.Fatalf("plain events = %#v", plain)
+	}
+	tool := collectRuntimeEvents(t, adapter, RunnerRequest{
+		TenantID: "tenant-one", AppID: "tool-app", DeploymentID: "tool", VersionID: "tool-v1",
+		SessionID: "tool-session", UserID: "user-one", RequestID: "tool-request", Input: "deploy", PolicyRevision: policy.Revision,
+	})
+	if len(tool) != 1 || tool[0].Type != "run.failed" || !strings.Contains(tool[0].Data["error"], "confirmation_required") {
+		t.Fatalf("governed Tool events = %#v", tool)
 	}
 }
 

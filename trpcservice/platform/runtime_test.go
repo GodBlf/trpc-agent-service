@@ -45,6 +45,36 @@ type capturingRunner struct {
 	err     error
 }
 
+type losingLeaseManager struct {
+	lost chan struct{}
+}
+
+func (m *losingLeaseManager) Acquire(context.Context, string, string) (SessionExecutionLease, error) {
+	return SessionExecutionLease{FencingToken: 42, Lost: m.lost}, nil
+}
+
+func (*losingLeaseManager) Close() error { return nil }
+
+type quietStreamingRunner struct {
+	started chan struct{}
+}
+
+func (r quietStreamingRunner) Run(context.Context, RunnerRequest) (RunnerResponse, error) {
+	return RunnerResponse{}, nil
+}
+
+func (r quietStreamingRunner) RunEvents(ctx context.Context, _ RunnerRequest) (<-chan RuntimeEvent, error) {
+	events := make(chan RuntimeEvent)
+	close(r.started)
+	go func() {
+		defer close(events)
+		<-ctx.Done()
+	}()
+	return events, nil
+}
+
+func (quietStreamingRunner) Close() error { return nil }
+
 type notifyingLifecycle struct {
 	*lifecycle.Service
 	acquired chan struct{}
@@ -141,6 +171,33 @@ func TestRuntimeSerializesSameSessionAndRunsDifferentSessionsConcurrently(t *tes
 	runner.mu.Unlock()
 	if max != 2 {
 		t.Fatalf("max concurrency = %d, want 2", max)
+	}
+}
+
+func TestRuntimeStreamEmitsCancelledWhenLeaseIsLostWithoutWorkerEvent(t *testing.T) {
+	started := make(chan struct{})
+	lost := make(chan struct{})
+	runtime := NewRuntime(activeTestPlatform(t), quietStreamingRunner{started: started}, nil)
+	runtime.SetSessionLeaseManager(&losingLeaseManager{lost: lost})
+
+	events, err := runtime.Stream(context.Background(), TenantContext{TenantID: "tenant-one", Role: RoleOperator}, GatewayRequest{
+		AppID: "app-one", SessionID: "session", Input: "hello", RequestID: "request-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	close(lost)
+	select {
+	case event, ok := <-events:
+		if !ok || event.Type != "run.cancelled" || event.Data["fencing_token"] != "42" {
+			t.Fatalf("lease-loss event = %#v, open = %v", event, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease loss did not emit a terminal event")
+	}
+	if _, ok := <-events; ok {
+		t.Fatal("stream emitted more than one terminal event")
 	}
 }
 
@@ -307,5 +364,18 @@ func TestUnavailableWorkerReturnsStableError(t *testing.T) {
 	}
 	if got := runtime.Status()[1].Lifecycle; got != "unavailable" {
 		t.Fatalf("worker status = %q", got)
+	}
+}
+
+func TestTimedOutWorkerIsRetired(t *testing.T) {
+	runtime := NewRuntime(activeTestPlatform(t), capturingRunner{err: context.DeadlineExceeded}, nil)
+	tenant := TenantContext{TenantID: "tenant-one", Role: RoleOperator}
+	_, _ = runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "session", Input: "x"})
+	if got := runtime.Status()[1].Lifecycle; got != LifecycleUnavailable {
+		t.Fatalf("worker lifecycle = %q", got)
+	}
+	_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "next", Input: "x"})
+	if err == nil || err.Error() != "worker_unavailable" {
+		t.Fatalf("retired worker accepted work: %v", err)
 	}
 }

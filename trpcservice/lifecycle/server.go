@@ -14,12 +14,14 @@ type Service struct {
 	mu       sync.Mutex
 	closing  bool
 	done     chan struct{}
-	wg       sync.WaitGroup
+	finished chan struct{}
+	active   int
+	finish   sync.Once
 	shutdown sync.Once
 	cancel   sync.Once
 }
 
-func New() *Service { return &Service{done: make(chan struct{})} }
+func New() *Service { return &Service{done: make(chan struct{}), finished: make(chan struct{})} }
 
 // Acquire reserves one active-work slot. The returned release function is
 // idempotent and should be deferred by the caller.
@@ -29,38 +31,49 @@ func (s *Service) Acquire() (release func(), ok bool) {
 	if s.closing {
 		return func() {}, false
 	}
-	s.wg.Add(1)
+	s.active++
 	var once sync.Once
-	return func() { once.Do(s.wg.Done) }, true
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.active--
+			finished := s.closing && s.active == 0
+			s.mu.Unlock()
+			if finished {
+				s.finish.Do(func() { close(s.finished) })
+			}
+		})
+	}, true
 }
 
 // Shutdown stops new work and waits for active work until ctx expires.
 // Repeated calls are safe; each call observes the same completion state.
 func (s *Service) Shutdown(ctx context.Context) error {
 	s.BeginShutdown()
-	s.cancel.Do(func() {
-		s.mu.Lock()
-		close(s.done)
-		s.mu.Unlock()
-	})
+	s.Cancel()
 	return s.Wait(ctx)
 }
+
+// Cancel propagates shutdown cancellation to active work without waiting.
+func (s *Service) Cancel() { s.cancel.Do(func() { close(s.done) }) }
 
 // BeginShutdown stops new work without waiting for active work.
 func (s *Service) BeginShutdown() {
 	s.shutdown.Do(func() {
 		s.mu.Lock()
 		s.closing = true
+		finished := s.active == 0
 		s.mu.Unlock()
+		if finished {
+			s.finish.Do(func() { close(s.finished) })
+		}
 	})
 }
 
 // Wait waits for all already-registered work to finish until ctx expires.
 func (s *Service) Wait(ctx context.Context) error {
-	finished := make(chan struct{})
-	go func() { s.wg.Wait(); close(finished) }()
 	select {
-	case <-finished:
+	case <-s.finished:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

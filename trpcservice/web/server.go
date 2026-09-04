@@ -40,7 +40,13 @@ func NewStage1Handler(runner platform.RunnerAdapter, tenant platform.TenantConte
 
 func newHandler(runner platform.RunnerAdapter, tenant platform.TenantContext, life *lifecycle.Service, admin http.Handler, serveFrontend bool) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if life != nil && life.IsClosing() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "closing"})
+			return
+		}
+		healthHandler(w, r)
+	})
 	mux.HandleFunc("/version", versionHandler)
 	run := platform.RunHandler{Runner: runner}
 	mux.Handle("/v1/run", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +73,7 @@ func newHandler(runner platform.RunnerAdapter, tenant platform.TenantContext, li
 	}))
 	if admin != nil {
 		mux.Handle("/api/", admin)
+		mux.Handle("/internal/governance/", admin)
 	}
 	if serveFrontend {
 		mux.Handle("/", frontendHandler())

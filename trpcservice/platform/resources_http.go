@@ -141,24 +141,31 @@ func resourceKey(tenantID, id string) string { return tenantID + "\x00" + id }
 func (p *MemoryPlatform) createApp(app AgentApp) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return false
+	}
 	key := resourceKey(app.TenantID, app.ID)
 	if _, exists := p.apps[key]; exists {
 		return false
 	}
 	p.apps[key] = app
-	return true
+	return p.persistLocked()
 }
 
 func (p *MemoryPlatform) app(tenantID, id string) (AgentApp, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return AgentApp{}, false
+	}
 	app, ok := p.apps[resourceKey(tenantID, id)]
 	return app, ok
 }
 
 func (p *MemoryPlatform) listApps(tenantID string) []AgentApp {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
 	items := make([]AgentApp, 0)
 	for _, app := range p.apps {
 		if app.TenantID == tenantID {
@@ -427,24 +434,31 @@ func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, 
 func (p *MemoryPlatform) createDeployment(deployment Deployment) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	if _, exists := p.deployments[key]; exists {
 		return false
 	}
 	p.deployments[key] = deployment
-	return true
+	return p.persistLocked()
 }
 
 func (p *MemoryPlatform) deployment(tenantID, id string) (Deployment, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return Deployment{}, false
+	}
 	deployment, ok := p.deployments[resourceKey(tenantID, id)]
 	return deployment, ok
 }
 
 func (p *MemoryPlatform) listDeployments(tenantID string) []Deployment {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
 	items := []Deployment{}
 	for _, item := range p.deployments {
 		if item.TenantID == tenantID {
@@ -459,6 +473,9 @@ func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey str
 	canonical, _ := json.Marshal(config)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return DeploymentVersion{}, "control_plane_unavailable", false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	creationKey := versionCreationKey{tenantID: deployment.TenantID, deploymentID: deployment.ID, idempotencyKey: idempotencyKey}
 	if creation, exists := p.versionCreations[creationKey]; exists {
@@ -473,6 +490,9 @@ func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey str
 	version := DeploymentVersion{ID: fmt.Sprintf("%s-v%d", deployment.ID, number), TenantID: deployment.TenantID, AgentAppID: deployment.AgentAppID, DeploymentID: deployment.ID, Number: number, Config: cloneConfig(config), CreatedAt: time.Now().UTC()}
 	p.versions[key] = append(p.versions[key], version)
 	p.versionCreations[creationKey] = versionCreation{config: string(canonical), version: version}
+	if !p.persistLocked() {
+		return DeploymentVersion{}, "control_plane_unavailable", false
+	}
 	version.Config = cloneConfig(version.Config)
 	return version, "", true
 }
@@ -485,8 +505,9 @@ func cloneConfig(config map[string]any) map[string]any {
 }
 
 func (p *MemoryPlatform) listVersions(tenantID, deploymentID string) []DeploymentVersion {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refreshLocked()
 	source := p.versions[resourceKey(tenantID, deploymentID)]
 	items := make([]DeploymentVersion, len(source))
 	for i, version := range source {
@@ -499,6 +520,9 @@ func (p *MemoryPlatform) listVersions(tenantID, deploymentID string) []Deploymen
 func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus, versionID string) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	current := p.deployments[key]
 	valid := (current.Status == DeploymentDraft && next == DeploymentPublished) || (current.Status == DeploymentPublished && next == DeploymentActive) || (current.Status == DeploymentActive && next == DeploymentPaused)
@@ -527,12 +551,18 @@ func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus
 	}
 	current.Status = next
 	p.deployments[key] = current
+	if !p.persistLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	return current, "", true
 }
 
 func (p *MemoryPlatform) startRollout(deployment Deployment, targetVersionID string, grayPercentage int) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	current := p.deployments[key]
 	if current.Status != DeploymentActive || current.VersionID == "" {
@@ -559,12 +589,18 @@ func (p *MemoryPlatform) startRollout(deployment Deployment, targetVersionID str
 		current.RolloutStatus = DeploymentRolloutCompleted
 	}
 	p.deployments[key] = current
+	if !p.persistLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	return current, "", true
 }
 
 func (p *MemoryPlatform) rollbackPreview(deployment Deployment) (DeploymentRollbackPreview, string, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return DeploymentRollbackPreview{}, "control_plane_unavailable", false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	current := p.deployments[key]
 	if current.Status != DeploymentActive || current.PreviousVersionID == "" || !p.hasVersionLocked(key, current.PreviousVersionID) {
@@ -580,6 +616,9 @@ func (p *MemoryPlatform) rollbackPreview(deployment Deployment) (DeploymentRollb
 func (p *MemoryPlatform) rollback(deployment Deployment) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.refreshLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
 	current := p.deployments[key]
 	if current.Status != DeploymentActive || current.PreviousVersionID == "" || !p.hasVersionLocked(key, current.PreviousVersionID) {
@@ -591,6 +630,9 @@ func (p *MemoryPlatform) rollback(deployment Deployment) (Deployment, string, bo
 	current.GrayPercentage = 100
 	current.RolloutStatus = DeploymentRolloutCompleted
 	p.deployments[key] = current
+	if !p.persistLocked() {
+		return Deployment{}, "control_plane_unavailable", false
+	}
 	return current, "", true
 }
 

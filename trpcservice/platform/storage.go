@@ -15,9 +15,10 @@ import (
 // SessionState is the materialized, tenant-scoped view of a Session.
 type SessionState struct {
 	Session
-	Summary    string    `json:"summary"`
-	EventCount int       `json:"event_count"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Summary            string    `json:"summary"`
+	EventCount         int       `json:"event_count"`
+	ProjectionSequence uint64    `json:"projection_sequence"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type MemoryRecord struct {
@@ -38,11 +39,19 @@ type BackendHealth struct {
 
 // DataStore is the Stage 2 storage boundary. Implementations must preserve
 // event immutability, tenant isolation, idempotency, and sequence ordering.
-type DataStore interface {
+type SessionStore interface {
 	StorageAdapter
 	GetSessionState(context.Context, string, string) (SessionState, error)
+}
+
+type MemoryStore interface {
 	ListMemory(context.Context, string, string) ([]MemoryRecord, error)
 	PutMemory(context.Context, MemoryRecord) error
+}
+
+type DataStore interface {
+	SessionStore
+	MemoryStore
 	Health(context.Context) BackendHealth
 }
 
@@ -76,15 +85,18 @@ type memoryEventKey struct{ tenant, session, key string }
 // InMemoryStore is the deterministic reference implementation used by local
 // development and tests.
 type InMemoryStore struct {
-	mu      sync.RWMutex
-	events  map[string][]SessionEvent
-	byKey   map[memoryEventKey]SessionEvent
-	memory  map[string]MemoryRecord
-	backend string
+	mu        sync.RWMutex
+	events    map[string][]SessionEvent
+	byKey     map[memoryEventKey]SessionEvent
+	memory    map[string]MemoryRecord
+	backend   string
+	fences    map[string]uint64
+	artifacts map[string]Artifact
+	knowledge map[string]KnowledgeRecord
 }
 
 func NewInMemoryStore() *InMemoryStore {
-	return &InMemoryStore{events: map[string][]SessionEvent{}, byKey: map[memoryEventKey]SessionEvent{}, memory: map[string]MemoryRecord{}, backend: "inmemory"}
+	return &InMemoryStore{events: map[string][]SessionEvent{}, byKey: map[memoryEventKey]SessionEvent{}, memory: map[string]MemoryRecord{}, backend: "inmemory", fences: map[string]uint64{}, artifacts: map[string]Artifact{}, knowledge: map[string]KnowledgeRecord{}}
 }
 
 func storageSessionKey(tenant, session string) string { return tenant + "\x00" + session }
@@ -111,6 +123,10 @@ func materializeSession(tenant, session string, events []SessionEvent) (SessionS
 	}
 	state := SessionState{Session: Session{ID: session, TenantID: tenant}, EventCount: len(events)}
 	for _, event := range events {
+		if event.Sequence != state.ProjectionSequence+1 {
+			return SessionState{}, errors.New("platform: session projection sequence gap")
+		}
+		state.ProjectionSequence = event.Sequence
 		state.Sequence = event.Sequence
 		state.UpdatedAt = event.OccurredAt
 		if event.Type == "summary" {
@@ -129,6 +145,13 @@ func (s *InMemoryStore) AppendSessionEvent(ctx context.Context, event SessionEve
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	stream := storageSessionKey(event.TenantID, event.SessionID)
+	if event.FencingToken > 0 && event.FencingToken < s.fences[stream] {
+		return ErrStaleFencingToken
+	}
+	if event.FencingToken > s.fences[stream] {
+		s.fences[stream] = event.FencingToken
+	}
 	key := memoryEventKey{event.TenantID, event.SessionID, event.IdempotencyKey}
 	if prior, ok := s.byKey[key]; ok {
 		if prior.Type == event.Type && string(prior.Payload) == string(event.Payload) {
@@ -136,7 +159,6 @@ func (s *InMemoryStore) AppendSessionEvent(ctx context.Context, event SessionEve
 		}
 		return ErrDuplicateEvent
 	}
-	stream := storageSessionKey(event.TenantID, event.SessionID)
 	event.Sequence = uint64(len(s.events[stream]) + 1)
 	if event.ID == "" {
 		event.ID = event.TenantID + ":" + event.SessionID + ":" + itoa(event.Sequence)
