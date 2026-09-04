@@ -45,8 +45,9 @@ type identityResponse struct {
 	AuthMode       string             `json:"auth_mode"`
 }
 
-// MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
-// Stage 2 replaces storage through the frozen adapter boundary.
+// MemoryPlatform applies Control Plane domain rules to an in-memory snapshot.
+// Durable constructors attach SQLite or PostgreSQL persistence; the bare
+// constructor remains the test-only implementation.
 type MemoryPlatform struct {
 	mu                  sync.RWMutex
 	tenants             map[string]Tenant
@@ -86,8 +87,8 @@ type ControlPlaneStore interface {
 	activeDeployment(string, string) (Deployment, bool)
 	routeDeployment(string, string, string) (Deployment, bool)
 	controlPlaneError() error
-	loadChannelBindings() map[string]ChannelBinding
-	saveChannelBindings(map[string]ChannelBinding) error
+	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
+	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
 	loadBackendSelections() (map[string]backendSelection, error)
 	saveBackendSelection(string, backendSelection) error
 	loadGovernancePolicies() (map[string]TenantPolicy, error)
@@ -184,46 +185,70 @@ func (p *MemoryPlatform) saveGovernancePolicy(policy TenantPolicy) (TenantPolicy
 	return TenantPolicy{}, p.persistenceErr
 }
 
-func (p *MemoryPlatform) loadChannelBindings() map[string]ChannelBinding {
+func (p *MemoryPlatform) loadChannelBindings(ctx context.Context) (map[string]ChannelBinding, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLocked()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
 	items := make(map[string]ChannelBinding, len(p.channelBindings))
 	for key, binding := range p.channelBindings {
 		items[key] = binding
 	}
-	return items
+	return items, nil
 }
 
-func (p *MemoryPlatform) saveChannelBindings(bindings map[string]ChannelBinding) error {
+func (p *MemoryPlatform) mutateChannelBindings(ctx context.Context, mutate func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
-		return p.persistenceErr
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
 	}
-	p.channelBindings = make(map[string]ChannelBinding, len(bindings))
+	previous := p.channelBindings
+	bindings := make(map[string]ChannelBinding, len(previous))
+	for key, binding := range previous {
+		bindings[key] = binding
+	}
+	if err := mutate(bindings); err != nil {
+		return nil, err
+	}
+	p.channelBindings = bindings
+	if !p.persistLockedContext(ctx) {
+		p.channelBindings = previous
+		return nil, p.persistenceErr
+	}
+	result := make(map[string]ChannelBinding, len(bindings))
 	for key, binding := range bindings {
-		p.channelBindings[key] = binding
+		result[key] = binding
 	}
-	if !p.persistLocked() {
-		return p.persistenceErr
-	}
-	return nil
+	return result, nil
 }
 
 func (p *MemoryPlatform) persistLocked() bool {
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
+	return p.persistLockedContext(ctx)
+}
+
+func (p *MemoryPlatform) persistLockedContext(ctx context.Context) bool {
 	if p.persistence == nil {
 		return true
 	}
-	p.persistenceRevision, p.persistenceErr = p.persistence.Save(controlPlaneSnapshotFrom(p), p.persistenceRevision)
+	p.persistenceRevision, p.persistenceErr = p.persistence.Save(ctx, controlPlaneSnapshotFrom(p), p.persistenceRevision)
 	return p.persistenceErr == nil
 }
 
 func (p *MemoryPlatform) refreshLocked() bool {
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
+	return p.refreshLockedContext(ctx)
+}
+
+func (p *MemoryPlatform) refreshLockedContext(ctx context.Context) bool {
 	if p.persistence == nil {
 		return true
 	}
-	snapshot, revision, err := p.persistence.Load()
+	snapshot, revision, err := p.persistence.Load(ctx)
 	p.persistenceErr = err
 	if err != nil {
 		return false
@@ -420,7 +445,7 @@ func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *
 	chatCtx, chatCancel := context.WithCancel(context.Background())
 	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
-	channels.configurePersistence(platform.loadChannelBindings(), platform.saveChannelBindings)
+	channels.configurePersistence(platform.loadChannelBindings, platform.mutateChannelBindings)
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),

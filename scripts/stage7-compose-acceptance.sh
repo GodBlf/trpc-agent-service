@@ -91,12 +91,23 @@ jq -e '.backend == "postgres"' "$RESPONSE" >/dev/null
 expect 200 "$(request b "$COOKIE_B" GET /api/v1/admin/agent-apps)" read-app-b
 jq -e '.items[] | select(.id == "app-stage7")' "$RESPONSE" >/dev/null
 
+# Channel Binding is immediately shared and each Gateway mutates the latest
+# authoritative snapshot instead of replacing it with a stale local copy.
+expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/bindings '{"channel":"mock","app_id":"app-stage7","conversation_type":"single","external_conversation_id":"shared-a","external_user_id":"shared-a","session_id":"session-binding-a"}')" create-binding-a
+BINDING_A="$(jq -r '.id' "$RESPONSE")"
+expect 200 "$(request b "$COOKIE_B" GET /api/v1/chat/bindings)" read-binding-a-from-b
+jq -e --arg id "$BINDING_A" '.items[] | select(.id == $id)' "$RESPONSE" >/dev/null
+expect 201 "$(request b "$COOKIE_B" POST /api/v1/chat/bindings '{"channel":"mock","app_id":"app-stage7","conversation_type":"single","external_conversation_id":"shared-b","external_user_id":"shared-b","session_id":"session-binding-b"}')" create-binding-b
+BINDING_B="$(jq -r '.id' "$RESPONSE")"
+expect 200 "$(request a "$COOKIE_A" GET /api/v1/chat/bindings)" read-both-bindings-from-a
+jq -e --arg a "$BINDING_A" --arg b "$BINDING_B" '([.items[].id] | index($a)) != null and ([.items[].id] | index($b)) != null' "$RESPONSE" >/dev/null
+
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions '{"app_id":"app-stage7","session_id":"session-stage7"}')" create-session-a
 expect 202 "$(request b "$COOKIE_B" POST /api/v1/chat/sessions/session-stage7/messages '{"input":"run through gateway b"}' request-b)" run-b
 wait_request_terminal b "$COOKIE_B" session-stage7 request-b run.completed
 
-# Force Gateway A to lose a live lease, then prove Gateway B commits with a
-# higher fencing token while A records an exact cancellation.
+# Pause Gateway A until its live lease expires. After it resumes and records an
+# exact cancellation, Gateway B must commit with a higher observable token.
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/admin/agent-apps '{"id":"app-fence","name":"Fencing"}')" create-fence-app
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/admin/deployments '{"id":"deploy-fence","agent_app_id":"app-fence"}')" create-fence-deployment
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/admin/deployments/deploy-fence/versions '{"config":{"runner":"fence","deterministic_response_delay_ms":12000}}' fence-version)" create-fence-version
@@ -105,25 +116,18 @@ expect 200 "$(request a "$COOKIE_A" POST /api/v1/admin/deployments/deploy-fence/
 expect 200 "$(request a "$COOKIE_A" POST /api/v1/admin/governance/policy '{"agent_app_id":"app-fence","token_budget":100000,"rate_limit":100,"rate_window_seconds":60}')" policy-fence
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions '{"app_id":"app-fence","session_id":"session-fence"}')" create-fence-session
 expect 202 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions/session-fence/messages '{"input":"first owner"}' fence-a)" fence-a-admitted
-FENCE_A=""
-for _ in $(seq 1 30); do
-  FENCE_A="$(docker compose -f "$COMPOSE_FILE" exec -T postgres psql -U trpc -d trpc_agent -Atc "SELECT fencing_token FROM session_execution_leases WHERE tenant_id='tenant-dev' AND session_id='session-fence' AND owner_id='gateway-a'" 2>/dev/null || true)"
-  [[ -n "$FENCE_A" ]] && break
-  sleep 1
-done
-[[ -n "$FENCE_A" ]] || { echo "error: Gateway A did not acquire fencing lease" >&2; exit 1; }
-docker compose -f "$COMPOSE_FILE" exec -T postgres psql -U trpc -d trpc_agent -c "UPDATE session_execution_leases SET expires_at=to_timestamp(0) WHERE tenant_id='tenant-dev' AND session_id='session-fence'" >/dev/null
+wait_request_event a "$COOKIE_A" session-fence fence-a session.lease.acquired
+docker compose -f "$COMPOSE_FILE" pause gateway-a >/dev/null
+sleep 4
 expect 202 "$(request b "$COOKIE_B" POST /api/v1/chat/sessions/session-fence/messages '{"input":"current owner"}' fence-b)" fence-b-admitted
-FENCE_B=""
-for _ in $(seq 1 30); do
-  FENCE_B="$(docker compose -f "$COMPOSE_FILE" exec -T postgres psql -U trpc -d trpc_agent -Atc "SELECT fencing_token FROM session_execution_leases WHERE tenant_id='tenant-dev' AND session_id='session-fence' AND owner_id='gateway-b'" 2>/dev/null || true)"
-  [[ -n "$FENCE_B" ]] && break
-  sleep 1
-done
-[[ -n "$FENCE_B" && "$FENCE_B" -gt "$FENCE_A" ]] || { echo "error: fencing token did not increase ($FENCE_A -> $FENCE_B)" >&2; exit 1; }
-wait_request_terminal a "$COOKIE_A" session-fence fence-a run.cancelled
+wait_request_event b "$COOKIE_B" session-fence fence-b session.lease.acquired
+wait_request_terminal b "$COOKIE_B" session-fence fence-a run.cancelled
 wait_request_terminal b "$COOKIE_B" session-fence fence-b run.completed
+docker compose -f "$COMPOSE_FILE" unpause gateway-a >/dev/null
 request b "$COOKIE_B" GET /api/v1/admin/sessions/session-fence/events >/dev/null
+FENCE_A="$(jq -r '.items[] | select(.idempotency_key | startswith("fence-a:lease-")) | .fencing_token' "$RESPONSE" | head -1)"
+FENCE_B="$(jq -r '.items[] | select(.idempotency_key | startswith("fence-b:lease-")) | .fencing_token' "$RESPONSE" | head -1)"
+[[ -n "$FENCE_A" && -n "$FENCE_B" && "$FENCE_B" -gt "$FENCE_A" ]] || { echo "error: fencing token did not increase ($FENCE_A -> $FENCE_B)" >&2; exit 1; }
 jq -e '[.items[] | select(.idempotency_key == "fence-a:run-completed")] | length == 0' "$RESPONSE" >/dev/null
 
 # Exercise dangerous Tool governance through the independent Worker.
@@ -188,7 +192,11 @@ done
 jq -e '.items[] | select(.request_id == "tool-worker-loss" and .status == "executing")' "$RESPONSE" >/dev/null
 docker compose -f "$COMPOSE_FILE" kill -s SIGKILL worker >/dev/null
 wait_request_terminal a "$COOKIE_A" session-tool-loss tool-worker-loss run.failed
-request a "$COOKIE_A" GET /api/v1/admin/governance/confirmations >/dev/null
+for _ in $(seq 1 30); do
+  request a "$COOKIE_A" GET /api/v1/admin/governance/confirmations >/dev/null
+  jq -e '.items[] | select(.request_id == "tool-worker-loss" and .status == "outcome_unknown")' "$RESPONSE" >/dev/null 2>&1 && break
+  sleep 1
+done
 jq -e '.items[] | select(.request_id == "tool-worker-loss" and .status == "outcome_unknown")' "$RESPONSE" >/dev/null
 docker compose -f "$COMPOSE_FILE" up -d worker >/dev/null
 for _ in $(seq 1 60); do

@@ -60,32 +60,45 @@ func (m *responsesModel) GenerateContent(ctx context.Context, request *model.Req
 	output := make(chan *model.Response)
 	go func() {
 		defer close(output)
+		defer stream.Close()
+		send := func(response *model.Response) bool {
+			select {
+			case output <- response:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 		var content string
 		for stream.Next() {
 			event := stream.Current()
 			switch event.Type {
 			case "response.output_text.delta":
 				content += event.Delta.OfString
-				output <- &model.Response{
+				if !send(&model.Response{
 					ID: event.ItemID, Object: model.ObjectTypeChatCompletionChunk, Model: m.name,
 					Choices:   []model.Choice{{Index: 0, Delta: model.Message{Role: model.RoleAssistant, Content: event.Delta.OfString}}},
 					Timestamp: time.Now(), IsPartial: true,
+				}) {
+					return
 				}
 			case "response.completed":
 				finishReason := "stop"
-				output <- &model.Response{
+				if !send(&model.Response{
 					ID: event.Response.ID, Object: model.ObjectTypeChatCompletion, Created: int64(event.Response.CreatedAt), Model: string(event.Response.Model),
 					Choices:   []model.Choice{{Index: 0, Message: model.Message{Role: model.RoleAssistant, Content: content}, FinishReason: &finishReason}},
 					Usage:     &model.Usage{PromptTokens: int(event.Response.Usage.InputTokens), CompletionTokens: int(event.Response.Usage.OutputTokens), TotalTokens: int(event.Response.Usage.TotalTokens)},
 					Timestamp: time.Now(), Done: true,
+				}) {
+					return
 				}
 			case "error", "response.failed", "response.incomplete":
-				output <- responsesStreamError()
+				send(responsesStreamError())
 				return
 			}
 		}
 		if err := stream.Err(); err != nil {
-			output <- responsesStreamError()
+			send(responsesStreamError())
 		}
 	}()
 	return output, nil

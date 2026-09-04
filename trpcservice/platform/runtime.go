@@ -321,6 +321,13 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			rt.global.active.Add(-1)
 			counters.active.Add(-1)
 		}()
+		if fencingToken > 0 {
+			select {
+			case <-streamCtx.Done():
+				return
+			case output <- RuntimeEvent{Type: "session.lease.acquired", Data: map[string]string{"fencing_token": fmt.Sprint(fencingToken)}}:
+			}
+		}
 		for event := range events {
 			if event.Data == nil {
 				event.Data = map[string]string{}

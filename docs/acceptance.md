@@ -37,7 +37,7 @@ Stage 7 是本项目最后一个交付阶段，不存在后续验收阶段。验
 | SQLite Gateway 重启 | `TestSQLiteControlPlaneSurvivesGatewayRestart` | Tenant/App/Version/Binding 重启后可查可路由 |
 | 真实运行时模型 | `TestOpenAICompatibleModelStreamsThroughPublicChatSSE`、`TestResponsesModelStreamsThroughPublicChatSSE` | Chat Completions/Responses 本地 fixture 经公开 Chat/SSE 返回完成消息；`gpt-5.6-*` 自动使用 Responses API |
 | 双 Gateway 共享控制面 | `stage7-compose-acceptance.sh` | A 创建，B 直接读取 App、Governance Policy、Backend Selection 并执行；A 重启后仍可见 |
-| Session fencing | `TestPostgresSessionLease*`、Stage 7 Compose | 强制 A 丢失 lease 后 B 获得更高 token；A 精确取消且旧 token 不能写完成终态 |
+| Session fencing | `TestPostgresSessionLease*`、Stage 7 Compose | 暂停 A 使 lease 过期，B 接管后从 `session.lease.acquired` 观察更高 token，并以当前 token 终结 A；旧 token 不能写完成终态 |
 | 签名远程 Worker | `TestRemoteWorker*`、`TestExecutionManifest*` | 身份/version/trace 贯穿；篡改、过期、未知 key 拒绝 |
 | 危险 Tool | governance、remote Tool tests、Stage 7 Compose | approve/重复 approve、reject/重复 reject、Governance outage fail-closed、Worker 断连转 outcome_unknown 且不自动 replay |
 | Memory/Knowledge | `TestMemoryKnowledgeArtifactAndTraceCompletePublicWorkflow` | 权威记录影响后续 Runner 输入，跨 Tenant 空集合 |

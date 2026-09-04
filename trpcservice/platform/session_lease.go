@@ -33,19 +33,28 @@ type PostgresSessionLeaseManager struct {
 	renewInterval time.Duration
 }
 
-func NewPostgresSessionLeaseManager(dsn, owner string) (*PostgresSessionLeaseManager, error) {
+func NewPostgresSessionLeaseManager(dsn, owner string, timing ...time.Duration) (*PostgresSessionLeaseManager, error) {
 	if dsn == "" || owner == "" {
 		return nil, errors.New("PostgreSQL DSN and Gateway owner are required")
+	}
+	ttl, renewInterval := 30*time.Second, 10*time.Second
+	if len(timing) != 0 {
+		if len(timing) != 2 || timing[0] <= 0 || timing[1] <= 0 || timing[1] >= timing[0] {
+			return nil, errors.New("Session Execution Lease timing is invalid")
+		}
+		ttl, renewInterval = timing[0], timing[1]
 	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &PostgresSessionLeaseManager{db: db, owner: owner, ttl: 30 * time.Second, renewInterval: 10 * time.Second}, nil
+	return &PostgresSessionLeaseManager{db: db, owner: owner, ttl: ttl, renewInterval: renewInterval}, nil
 }
 
 func (m *PostgresSessionLeaseManager) Acquire(ctx context.Context, tenantID, sessionID string) (SessionExecutionLease, error) {
@@ -84,7 +93,9 @@ func (m *PostgresSessionLeaseManager) maintain(parent context.Context, tenantID,
 	release := func() {
 		once.Do(func() {
 			cancel()
-			_, _ = m.db.Exec(`UPDATE session_execution_leases SET expires_at=$1 WHERE tenant_id=$2 AND session_id=$3 AND owner_id=$4 AND fencing_token=$5`, time.Unix(0, 0).UTC(), tenantID, sessionID, m.owner, token)
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer releaseCancel()
+			_, _ = m.db.ExecContext(releaseCtx, `UPDATE session_execution_leases SET expires_at=$1 WHERE tenant_id=$2 AND session_id=$3 AND owner_id=$4 AND fencing_token=$5`, time.Unix(0, 0).UTC(), tenantID, sessionID, m.owner, token)
 		})
 	}
 	go func() {

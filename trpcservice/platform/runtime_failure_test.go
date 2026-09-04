@@ -29,11 +29,11 @@ type blockingFailureStore struct {
 
 type unavailableControlPlanePersistence struct{}
 
-func (unavailableControlPlanePersistence) Load() (controlPlaneSnapshot, int64, error) {
+func (unavailableControlPlanePersistence) Load(context.Context) (controlPlaneSnapshot, int64, error) {
 	return controlPlaneSnapshot{}, 0, errors.New("database unavailable")
 }
 
-func (unavailableControlPlanePersistence) Save(controlPlaneSnapshot, int64) (int64, error) {
+func (unavailableControlPlanePersistence) Save(context.Context, controlPlaneSnapshot, int64) (int64, error) {
 	return 0, errors.New("database unavailable")
 }
 

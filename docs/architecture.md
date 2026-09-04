@@ -47,7 +47,7 @@ flowchart LR
 
 公开 Chat 请求进入 Gateway 后，身份组件从受信任会话生成 Tenant Context，忽略客户端伪造的 tenant_id。Gateway 校验角色和治理策略，把 `message.input` 与 `run.started` 先写入 Session Event，再解析唯一 Active Deployment。跨 Gateway 的同一 Session 由 Lease 串行化；不同 Session 可以并行。Gateway 把解析后的 Tenant、App、Deployment、Version、Policy Revision、request_id、Platform trace_id、W3C traceparent 和 fencing token 写入 Execution Manifest，以专用可轮换 HS256 key 签名。Worker 只接受内部 Bearer Token，并拒绝缺失、过期、篡改、未知 key 或 traceparent 不一致的 Manifest。
 
-Worker 根据 Manifest 中的不可变 Version 调用 AgentFactory，构造 `trpc-agent-go` Runner。Tool 回调进入 Plugin 时，Worker 通过内部 Governance API 再做一次 allowlist、预算、Guardrail 和危险操作确认检查；治理不可用时 fail closed，副作用不会开始。Runner Event 被转换为稳定的 `message.delta`、`message.completed`、`run.failed`、`run.cancelled`、`run.completed`，Gateway 写入 Session Event 并通过 SSE 或 Channel Adapter 返回。事件写入携带 fencing token，已失去租约的旧执行不能覆盖新所有者结果。
+Worker 根据 Manifest 中的不可变 Version 调用 AgentFactory，构造 `trpc-agent-go` Runner。Tool 回调进入 Plugin 时，Worker 通过内部 Governance API 再做一次 allowlist、预算、Guardrail 和危险操作确认检查；治理不可用时 fail closed，副作用不会开始。Gateway 在远程 SSE 建立后先记录 `session.lease.acquired`，再把 Runner Event 转换为稳定的 `message.delta`、`message.completed`、`run.failed`、`run.cancelled`、`run.completed`，写入 Session Event 并通过 SSE 或 Channel Adapter 返回。事件、Memory 与 Artifact 的执行期写入携带 fencing token；新 owner 接管时以当前 token 关闭遗留未终结请求，已失去租约的旧执行不能覆盖新所有者结果。
 
 ## 4. 企业微信完整时序
 
@@ -84,7 +84,7 @@ sequenceDiagram
     Runner-->>Worker: Agent Events
     Worker-->>Gateway: 内部 SSE Events
     Gateway->>Store: 按 fencing token 写 Session Event
-    Gateway->>Store: 更新 Memory / 连续 Projection Checkpoint
+    Gateway->>Store: 连续推进 Session State / Summary Projection Checkpoint
     Gateway->>Gov: 写 Audit Event、Metrics、Trace Span
     Gateway->>Channel: ChannelReply
     Channel->>WeCom: aibot_respond_msg
@@ -96,7 +96,7 @@ sequenceDiagram
 
 ## 5. 数据隔离与一致性
 
-Control Plane Store 保存 Tenant、Agent App、Deployment、Version、Channel Binding、Backend Selection、Governance Policy 与配置幂等记录。每次读取按共享 revision 刷新，Gateway 不以进程本地旧配置维持正确性；从旧本地治理文件升级且共享策略为空时，会一次性导入策略。Session Event 是运行数据事实源，Session State 与 Summary 是只允许连续推进的投影，`projection_sequence` 表示已经消费的最高事件序号；发现序号空洞时拒绝产生看似最新的状态。Memory 和 Knowledge 在执行前按 Tenant/App/Session 查询并注入 Agent 输入。Knowledge 权威文本先提交，向量索引属于最终一致派生物，即使索引处于 retry 状态，权威内容仍可读取。
+Control Plane Store 保存 Tenant、Agent App、Deployment、Version、Channel Binding、Backend Selection、Governance Policy 与配置幂等记录。每次读取按共享 revision 刷新，Gateway 不以进程本地旧配置维持正确性；从旧本地治理文件升级且共享策略为空时，会一次性导入策略。Session Event 是运行数据事实源，Session State 与 Summary 是只允许连续推进的投影，`projection_sequence` 表示已经消费的最高事件序号；发现序号空洞时拒绝产生看似最新的状态。Memory 和 Knowledge 由租户数据管理接口写入，在 Agent 执行前按 Tenant/App/Session 查询并注入输入；当前执行链不会从模型输出自动提取并写回 Memory。Knowledge 权威文本先提交，向量索引属于最终一致派生物，即使索引处于 retry 状态，权威内容仍可读取。
 
 Artifact 元数据记录 Tenant、Session、request_id、trace_id、状态与 content reference。参考实现把 Agent 完成回复发布为指向 `message.completed` 的 `session-event://` 引用；如果内容或元数据发布失败，写入 `artifact.publication.failed`，不报告虚假的 `run.completed`。生产对象内容应由 S3 适配器保存，SQL 只保存引用、校验和与发布状态。
 

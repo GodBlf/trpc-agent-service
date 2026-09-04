@@ -241,7 +241,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 				}
 				return &frameworkagent.BeforeAgentResult{Context: context.WithValue(ctx, governanceAdmissionContextKey{}, true)}, nil
 			}
-			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.before_agent", "ok"); err != nil {
+			if err := p.center.RecordSpan(runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, "plugin.before_agent", "ok"); err != nil {
 				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
 			}
 		}
@@ -274,7 +274,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 	})
 	registry.AfterAgent(func(ctx context.Context, _ *frameworkagent.AfterAgentArgs) (*frameworkagent.AfterAgentResult, error) {
 		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
-			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.after_agent", "ok"); err != nil {
+			if err := p.center.RecordSpan(runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, "plugin.after_agent", "ok"); err != nil {
 				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
 			}
 		}
@@ -289,11 +289,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 		if governance == nil {
 			governance = p.center
 		}
-		err := governance.AuthorizeTool(ctx, GovernanceRequest{
-			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
-			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
-		}, request.TraceID, args.ToolName, args.Arguments)
+		err := governance.AuthorizeTool(ctx, runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, args.ToolName, args.Arguments)
 		if p.center != nil {
 			if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
 				if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
@@ -312,11 +308,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 		if governance == nil {
 			governance = p.center
 		}
-		err := governance.CompleteTool(ctx, GovernanceRequest{
-			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
-			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
-		}, request.TraceID, args.ToolName, args.Error)
+		err := governance.CompleteTool(ctx, runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, args.ToolName, args.Error)
 		return nil, err
 	})
 }

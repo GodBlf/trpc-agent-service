@@ -25,7 +25,7 @@ Artifact 采用内容与元数据两阶段发布。S3 设计先把内容写到�
 
 PostgreSQL Control Plane 每次读操作刷新 revision，不依赖进程本地缓存作为正确性来源。共享范围包括 Tenant、Agent App、Deployment/Version、Channel Binding、Backend Selection、Governance Policy 和配置幂等状态。并发配置写使用 revision 检查；冲突请求失败并由上层按同一幂等 key 重试，不能覆盖另一个 Gateway 已提交的数据。数据库不可用时返回 `control_plane_unavailable`，不退回 InMemory 或旧快照。确认、执行中 Tool、预算计数、Audit 与 Trace 尚未实现多 Gateway 共享事务存储，Compose 将内部 Governance API 固定到 Gateway A；这是生产高可用扩展限制，不作为已完成能力声明。
 
-Session Lease 使用数据库时间判断 expires_at。续租失败或 token 不再匹配时关闭 Lost channel，Gateway 取消 Runner；即使旧 goroutine 没有及时结束，SQL append 也会原子拒绝旧 fencing token。不同 Session 使用不同 lease row，可以水平并行。sticky session 只能作为性能优化，不能承担正确性。
+Session Lease 使用数据库时间判断 expires_at。续租失败或 token 不再匹配时关闭 Lost channel，Gateway 取消 Runner；即使旧 goroutine 没有及时结束，Session Event、执行期 Memory 和 Artifact 写入也会在同一事务中比较当前最高 token 并拒绝旧 token。租约过期但尚未被重新授予时，原 token 可以完成有界收尾；新 owner 接管后会以当前 token 关闭事实源中遗留的未终结请求。不同 Session 使用不同 lease row，可以水平并行。sticky session 只能作为性能优化，不能承担正确性。
 
 Redis 短暂不可用时 API 返回 `storage_unavailable`，不把本地缓存当作提交成功。PostgreSQL 超时与调用者取消分别映射为稳定公开错误。IM 重试沿用 provider message ID；已存在同内容 input 或终态直接返回已有状态，内容不一致则返回 idempotency conflict。
 

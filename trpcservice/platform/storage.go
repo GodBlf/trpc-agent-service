@@ -22,12 +22,13 @@ type SessionState struct {
 }
 
 type MemoryRecord struct {
-	ID        string    `json:"id"`
-	TenantID  string    `json:"tenant_id"`
-	SessionID string    `json:"session_id"`
-	Key       string    `json:"key"`
-	Value     string    `json:"value"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string    `json:"id"`
+	TenantID     string    `json:"tenant_id"`
+	SessionID    string    `json:"session_id"`
+	Key          string    `json:"key"`
+	Value        string    `json:"value"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	FencingToken uint64    `json:"fencing_token,omitempty"`
 }
 
 type BackendHealth struct {
@@ -215,6 +216,13 @@ func (s *InMemoryStore) PutMemory(ctx context.Context, item MemoryRecord) error 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	stream := storageSessionKey(item.TenantID, item.SessionID)
+	if item.FencingToken > 0 && item.FencingToken < s.fences[stream] {
+		return ErrStaleFencingToken
+	}
+	if item.FencingToken > s.fences[stream] {
+		s.fences[stream] = item.FencingToken
+	}
 	if item.ID == "" {
 		item.ID = item.TenantID + ":" + item.SessionID + ":" + item.Key
 	}

@@ -187,6 +187,10 @@ func TestRuntimeStreamEmitsCancelledWhenLeaseIsLostWithoutWorkerEvent(t *testing
 		t.Fatal(err)
 	}
 	<-started
+	leaseEvent := <-events
+	if leaseEvent.Type != "session.lease.acquired" || leaseEvent.Data["fencing_token"] != "42" {
+		t.Fatalf("lease event = %#v", leaseEvent)
+	}
 	close(lost)
 	select {
 	case event, ok := <-events:

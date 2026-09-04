@@ -157,7 +157,15 @@ func main() {
 			gatewayID, _ = os.Hostname()
 			gatewayID = fmt.Sprintf("%s-%d", gatewayID, os.Getpid())
 		}
-		leases, err := platform.NewPostgresSessionLeaseManager(controlPlaneDSN, gatewayID)
+		leaseTTL, err := configuredDuration("TRPC_SESSION_LEASE_TTL", 30*time.Second)
+		if err != nil {
+			log.Fatal(err)
+		}
+		leaseRenewInterval, err := configuredDuration("TRPC_SESSION_LEASE_RENEW_INTERVAL", 10*time.Second)
+		if err != nil {
+			log.Fatal(err)
+		}
+		leases, err := platform.NewPostgresSessionLeaseManager(controlPlaneDSN, gatewayID, leaseTTL, leaseRenewInterval)
 		if err != nil {
 			log.Fatalf("Session Execution Lease store: %v", err)
 		}
@@ -213,6 +221,18 @@ func main() {
 	if err := admin.Close(); err != nil {
 		log.Printf("data stores: %v", err)
 	}
+}
+
+func configuredDuration(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return value, nil
 }
 
 func configuredManifestKeys(authMode string) (string, map[string][]byte, error) {

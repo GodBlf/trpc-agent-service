@@ -62,8 +62,8 @@ func (s *SQLStore) q(query string) string {
 func (s *SQLStore) init(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS session_events (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, sequence BIGINT NOT NULL, event_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_type TEXT NOT NULL, payload BYTEA NOT NULL, occurred_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, session_id, sequence), UNIQUE (tenant_id, session_id, idempotency_key))`,
-		`CREATE TABLE IF NOT EXISTS session_memory (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, memory_key TEXT NOT NULL, memory_id TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (tenant_id, session_id, memory_key))`,
-		`CREATE TABLE IF NOT EXISTS artifacts (tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, session_id TEXT NOT NULL, name TEXT NOT NULL, content_reference TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', trace_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, artifact_id))`,
+		`CREATE TABLE IF NOT EXISTS session_memory (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, memory_key TEXT NOT NULL, memory_id TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, session_id, memory_key))`,
+		`CREATE TABLE IF NOT EXISTS artifacts (tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, session_id TEXT NOT NULL, name TEXT NOT NULL, content_reference TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', trace_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, artifact_id))`,
 		`CREATE TABLE IF NOT EXISTS knowledge_records (tenant_id TEXT NOT NULL, knowledge_id TEXT NOT NULL, agent_app_id TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, index_status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, knowledge_id))`,
 	}
 	if s.backend == "sqlite" {
@@ -79,16 +79,21 @@ func (s *SQLStore) init(ctx context.Context) error {
 			return err
 		}
 		for _, statement := range []string{
+			`ALTER TABLE session_memory ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`,
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'`,
+			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`,
 		} {
 			if _, err := s.db.ExecContext(ctx, statement); err != nil {
 				return err
 			}
 		}
 	} else {
-		for name, definition := range map[string]string{"request_id": "TEXT NOT NULL DEFAULT ''", "trace_id": "TEXT NOT NULL DEFAULT ''", "status": "TEXT NOT NULL DEFAULT 'published'"} {
+		if err := s.ensureSQLiteColumn(ctx, "session_memory", "fencing_token", "BIGINT NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		for name, definition := range map[string]string{"request_id": "TEXT NOT NULL DEFAULT ''", "trace_id": "TEXT NOT NULL DEFAULT ''", "status": "TEXT NOT NULL DEFAULT 'published'", "fencing_token": "BIGINT NOT NULL DEFAULT 0"} {
 			if err := s.ensureSQLiteColumn(ctx, "artifacts", name, definition); err != nil {
 				return err
 			}
@@ -147,13 +152,9 @@ func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) e
 		if err != nil {
 			return err
 		}
-		if s.backend == "postgres" && event.FencingToken > 0 {
-			var current uint64
-			err = tx.QueryRowContext(ctx, `SELECT fencing_token FROM session_execution_leases WHERE tenant_id=$1 AND session_id=$2 AND expires_at > NOW()`, event.TenantID, event.SessionID).Scan(&current)
-			if err != nil || current != event.FencingToken {
-				tx.Rollback()
-				return ErrStaleFencingToken
-			}
+		if err = s.validateFencingToken(ctx, tx, event.TenantID, event.SessionID, event.FencingToken); err != nil {
+			tx.Rollback()
+			return err
 		}
 		var typ string
 		var payload []byte
@@ -212,7 +213,7 @@ func (s *SQLStore) ListSessionEvents(ctx context.Context, tenant, session string
 	return items, rows.Err()
 }
 func (s *SQLStore) ListMemory(ctx context.Context, tenant, session string) ([]MemoryRecord, error) {
-	rows, err := s.db.QueryContext(ctx, s.q(`SELECT memory_id,memory_key,value,updated_at FROM session_memory WHERE tenant_id=? AND session_id=? ORDER BY memory_key`), tenant, session)
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT memory_id,memory_key,value,updated_at,fencing_token FROM session_memory WHERE tenant_id=? AND session_id=? ORDER BY memory_key`), tenant, session)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +224,7 @@ func (s *SQLStore) ListMemory(ctx context.Context, tenant, session string) ([]Me
 		var updated string
 		m.TenantID = tenant
 		m.SessionID = session
-		if err := rows.Scan(&m.ID, &m.Key, &m.Value, &updated); err != nil {
+		if err := rows.Scan(&m.ID, &m.Key, &m.Value, &updated, &m.FencingToken); err != nil {
 			return nil, err
 		}
 		m.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
@@ -238,9 +239,30 @@ func (s *SQLStore) PutMemory(ctx context.Context, m MemoryRecord) error {
 	if m.UpdatedAt.IsZero() {
 		m.UpdatedAt = time.Now().UTC()
 	}
-	query := `INSERT INTO session_memory(tenant_id,session_id,memory_key,memory_id,value,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,session_id,memory_key) DO UPDATE SET memory_id=excluded.memory_id,value=excluded.value,updated_at=excluded.updated_at`
-	_, err := s.db.ExecContext(ctx, s.q(query), m.TenantID, m.SessionID, m.Key, m.ID, m.Value, m.UpdatedAt.Format(time.RFC3339Nano))
-	return err
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.validateFencingToken(ctx, tx, m.TenantID, m.SessionID, m.FencingToken); err != nil {
+		return err
+	}
+	query := `INSERT INTO session_memory(tenant_id,session_id,memory_key,memory_id,value,updated_at,fencing_token) VALUES(?,?,?,?,?,?,?) ON CONFLICT(tenant_id,session_id,memory_key) DO UPDATE SET memory_id=excluded.memory_id,value=excluded.value,updated_at=excluded.updated_at,fencing_token=excluded.fencing_token`
+	if _, err := tx.ExecContext(ctx, s.q(query), m.TenantID, m.SessionID, m.Key, m.ID, m.Value, m.UpdatedAt.Format(time.RFC3339Nano), m.FencingToken); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLStore) validateFencingToken(ctx context.Context, tx *sql.Tx, tenantID, sessionID string, token uint64) error {
+	if s.backend != "postgres" || token == 0 {
+		return nil
+	}
+	var current uint64
+	if err := tx.QueryRowContext(ctx, `SELECT fencing_token FROM session_execution_leases WHERE tenant_id=$1 AND session_id=$2`, tenantID, sessionID).Scan(&current); err != nil || current != token {
+		return ErrStaleFencingToken
+	}
+	return nil
 }
 func (s *SQLStore) Health(ctx context.Context) BackendHealth {
 	status := "healthy"

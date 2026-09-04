@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 const ControlPlaneSchemaVersion = 1
+const controlPlaneOperationTimeout = 5 * time.Second
 
 type persistedVersionCreation struct {
 	TenantID       string            `json:"tenant_id"`
@@ -34,9 +36,13 @@ type controlPlaneSnapshot struct {
 }
 
 type controlPlanePersistence interface {
-	Load() (controlPlaneSnapshot, int64, error)
-	Save(controlPlaneSnapshot, int64) (int64, error)
+	Load(context.Context) (controlPlaneSnapshot, int64, error)
+	Save(context.Context, controlPlaneSnapshot, int64) (int64, error)
 	Close() error
+}
+
+func controlPlaneOperationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), controlPlaneOperationTimeout)
 }
 
 type sqliteControlPlanePersistence struct{ db *sql.DB }
@@ -57,13 +63,15 @@ func MigrateSQLiteControlPlane(path string) error {
 		return fmt.Errorf("open control plane: %w", err)
 	}
 	defer db.Close()
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
 		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS control_plane_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision INTEGER NOT NULL, payload BLOB NOT NULL)`,
 	}
 	for _, statement := range statements {
-		if _, err := db.Exec(statement); err != nil {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate control plane: %w", err)
 		}
 	}
@@ -79,13 +87,15 @@ func MigratePostgresControlPlane(dsn string) error {
 		return fmt.Errorf("open control plane: %w", err)
 	}
 	defer db.Close()
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
 		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS control_plane_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision BIGINT NOT NULL, payload BYTEA NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS session_execution_leases (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, owner_id TEXT NOT NULL, fencing_token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (tenant_id, session_id))`,
 	} {
-		if _, err := db.Exec(statement); err != nil {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate control plane: %w", err)
 		}
 	}
@@ -100,7 +110,9 @@ func NewSQLiteControlPlane(path string) (ControlPlaneStore, error) {
 		return nil, fmt.Errorf("open control plane: %w", err)
 	}
 	var version int
-	if err := db.QueryRow(`SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
+	if err := db.QueryRowContext(ctx, `SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("control plane schema is not initialized: %w", err)
 	}
@@ -110,7 +122,7 @@ func NewSQLiteControlPlane(path string) (ControlPlaneStore, error) {
 	}
 	platform := NewMemoryPlatform()
 	persistence := &sqliteControlPlanePersistence{db: db}
-	snapshot, revision, err := persistence.Load()
+	snapshot, revision, err := persistence.Load(ctx)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -127,7 +139,9 @@ func NewPostgresControlPlane(dsn string) (ControlPlaneStore, error) {
 		return nil, fmt.Errorf("open control plane: %w", err)
 	}
 	var version int
-	if err := db.QueryRow(`SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
+	if err := db.QueryRowContext(ctx, `SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("control plane schema is not initialized: %w", err)
 	}
@@ -141,7 +155,9 @@ func NewPostgresControlPlane(dsn string) (ControlPlaneStore, error) {
 
 func loadPersistentControlPlane(persistence controlPlanePersistence) (ControlPlaneStore, error) {
 	platform := NewMemoryPlatform()
-	snapshot, revision, err := persistence.Load()
+	ctx, cancel := controlPlaneOperationContext()
+	defer cancel()
+	snapshot, revision, err := persistence.Load(ctx)
 	if err != nil {
 		persistence.Close()
 		return nil, err
@@ -152,10 +168,14 @@ func loadPersistentControlPlane(persistence controlPlanePersistence) (ControlPla
 	return platform, nil
 }
 
-func (p *sqliteControlPlanePersistence) Load() (controlPlaneSnapshot, int64, error) {
+func (p *sqliteControlPlanePersistence) Load(ctx context.Context) (controlPlaneSnapshot, int64, error) {
+	return loadControlPlaneSnapshot(ctx, p.db)
+}
+
+func loadControlPlaneSnapshot(ctx context.Context, db *sql.DB) (controlPlaneSnapshot, int64, error) {
 	var payload []byte
 	var revision int64
-	err := p.db.QueryRow(`SELECT revision, payload FROM control_plane_state WHERE singleton = 1`).Scan(&revision, &payload)
+	err := db.QueryRowContext(ctx, `SELECT revision, payload FROM control_plane_state WHERE singleton = 1`).Scan(&revision, &payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return controlPlaneSnapshot{}, 0, nil
 	}
@@ -169,18 +189,18 @@ func (p *sqliteControlPlanePersistence) Load() (controlPlaneSnapshot, int64, err
 	return snapshot, revision, nil
 }
 
-func (p *sqliteControlPlanePersistence) Save(snapshot controlPlaneSnapshot, _ int64) (int64, error) {
+func (p *sqliteControlPlanePersistence) Save(ctx context.Context, snapshot controlPlaneSnapshot, _ int64) (int64, error) {
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return 0, fmt.Errorf("encode control plane: %w", err)
 	}
-	_, err = p.db.ExecContext(context.Background(), `INSERT INTO control_plane_state(singleton, revision, payload) VALUES (1, 1, ?)
+	_, err = p.db.ExecContext(ctx, `INSERT INTO control_plane_state(singleton, revision, payload) VALUES (1, 1, ?)
 		ON CONFLICT(singleton) DO UPDATE SET revision = control_plane_state.revision + 1, payload = excluded.payload`, payload)
 	if err != nil {
 		return 0, fmt.Errorf("save control plane: %w", err)
 	}
 	var revision int64
-	if err := p.db.QueryRow(`SELECT revision FROM control_plane_state WHERE singleton = 1`).Scan(&revision); err != nil {
+	if err := p.db.QueryRowContext(ctx, `SELECT revision FROM control_plane_state WHERE singleton = 1`).Scan(&revision); err != nil {
 		return 0, fmt.Errorf("read control plane revision: %w", err)
 	}
 	return revision, nil
@@ -188,38 +208,25 @@ func (p *sqliteControlPlanePersistence) Save(snapshot controlPlaneSnapshot, _ in
 
 func (p *sqliteControlPlanePersistence) Close() error { return p.db.Close() }
 
-func (p *postgresControlPlanePersistence) Load() (controlPlaneSnapshot, int64, error) {
-	var payload []byte
-	var revision int64
-	err := p.db.QueryRow(`SELECT revision, payload FROM control_plane_state WHERE singleton = 1`).Scan(&revision, &payload)
-	if errors.Is(err, sql.ErrNoRows) {
-		return controlPlaneSnapshot{}, 0, nil
-	}
-	if err != nil {
-		return controlPlaneSnapshot{}, 0, fmt.Errorf("load control plane: %w", err)
-	}
-	var snapshot controlPlaneSnapshot
-	if err := json.Unmarshal(payload, &snapshot); err != nil {
-		return controlPlaneSnapshot{}, 0, fmt.Errorf("decode control plane: %w", err)
-	}
-	return snapshot, revision, nil
+func (p *postgresControlPlanePersistence) Load(ctx context.Context) (controlPlaneSnapshot, int64, error) {
+	return loadControlPlaneSnapshot(ctx, p.db)
 }
 
-func (p *postgresControlPlanePersistence) Save(snapshot controlPlaneSnapshot, expectedRevision int64) (int64, error) {
+func (p *postgresControlPlanePersistence) Save(ctx context.Context, snapshot controlPlaneSnapshot, expectedRevision int64) (int64, error) {
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return 0, fmt.Errorf("encode control plane: %w", err)
 	}
-	tx, err := p.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable})
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(83726104)`); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(83726104)`); err != nil {
 		return 0, err
 	}
 	var current int64
-	err = tx.QueryRow(`SELECT revision FROM control_plane_state WHERE singleton = 1 FOR UPDATE`).Scan(&current)
+	err = tx.QueryRowContext(ctx, `SELECT revision FROM control_plane_state WHERE singleton = 1 FOR UPDATE`).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
 		current = 0
 	} else if err != nil {
@@ -229,7 +236,7 @@ func (p *postgresControlPlanePersistence) Save(snapshot controlPlaneSnapshot, ex
 		return 0, errors.New("control plane revision changed")
 	}
 	next := current + 1
-	if _, err := tx.Exec(`INSERT INTO control_plane_state(singleton, revision, payload) VALUES (1, $1, $2)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO control_plane_state(singleton, revision, payload) VALUES (1, $1, $2)
 		ON CONFLICT(singleton) DO UPDATE SET revision = excluded.revision, payload = excluded.payload`, next, payload); err != nil {
 		return 0, err
 	}

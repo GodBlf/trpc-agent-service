@@ -170,6 +170,54 @@ func TestResponsesModelStreamsThroughPublicChatSSE(t *testing.T) {
 	}
 }
 
+func TestResponsesModelCancellationClosesUnconsumedStream(t *testing.T) {
+	providerStarted := make(chan struct{})
+	providerCancelled := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(providerStarted)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"message-1\",\"delta\":\"blocked\"}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		close(providerCancelled)
+	}))
+	defer provider.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	output, err := newResponsesModel("gpt-5.6-luna", provider.URL, "fixture-secret").GenerateContent(ctx, &model.Request{
+		Messages: []model.Message{{Role: model.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-providerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider stream did not start")
+	}
+	cancel()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-output:
+			if !ok {
+				goto streamClosed
+			}
+		case <-deadline:
+			t.Fatal("model output did not close after cancellation")
+		}
+	}
+
+streamClosed:
+	select {
+	case <-providerCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("provider stream was not closed after cancellation")
+	}
+}
+
 func TestFrameworkRunnerAdapterStreamsAndReusesRunner(t *testing.T) {
 	platform := activeTestPlatform(t)
 	var factoryCalls atomic.Int64

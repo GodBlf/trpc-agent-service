@@ -301,7 +301,12 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.channels.ListBindings(tenant.TenantID)})
+		items, err := h.channels.ListBindings(r.Context(), tenant.TenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
 		if !canOperate(tenant.Role) {
 			writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
@@ -316,13 +321,17 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
-		binding, err := h.channels.CreateBinding(tenant, request)
+		binding, err := h.channels.CreateBinding(r.Context(), tenant, request)
 		if errors.Is(err, ErrDuplicateEvent) {
 			writeError(w, http.StatusConflict, "channel_binding_exists", "channel binding already exists")
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel binding is invalid")
+			if h.platform.controlPlaneError() != nil {
+				writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			} else {
+				writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel binding is invalid")
+			}
 			return
 		}
 		store, release, err := h.acquireStore(tenant.TenantID)
@@ -369,18 +378,25 @@ func (h *AdminHandler) handleChannelBindingResource(w http.ResponseWriter, r *ht
 		var binding ChannelBinding
 		var err error
 		if request.Enabled != nil {
-			binding, err = h.channels.UpdateBinding(tenant.TenantID, id, *request.Enabled)
+			binding, err = h.channels.UpdateBinding(r.Context(), tenant.TenantID, id, *request.Enabled)
 		} else {
-			binding, err = h.channels.ReplaceSecret(tenant.TenantID, id, request.Secret)
+			binding, err = h.channels.ReplaceSecret(r.Context(), tenant.TenantID, id, request.Secret)
 		}
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
 			return
 		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			return
+		}
 		writeJSON(w, http.StatusOK, binding)
 	case http.MethodDelete:
-		if err := h.channels.DeleteBinding(tenant.TenantID, id); errors.Is(err, ErrNotFound) {
+		if err := h.channels.DeleteBinding(r.Context(), tenant.TenantID, id); errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
+			return
+		} else if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -749,7 +765,7 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 		writeStorageError(w, createErr)
 		return
 	}
-	if _, err := h.channels.CreateBinding(tenant, createChannelBindingRequest{
+	if _, err := h.channels.CreateBinding(r.Context(), tenant, createChannelBindingRequest{
 		Channel: ChannelMock, AppID: request.AppID, ConversationType: ConversationSingle,
 		ConversationID: "chat:" + sessionID, UserID: tenant.UserID, SessionID: sessionID,
 	}); err != nil {
@@ -1039,6 +1055,7 @@ type chatRunOptions struct {
 	traceID        string
 	traceParent    string
 	policyRevision uint64
+	fencingToken   uint64
 }
 
 type activeChatRun struct {
@@ -1062,7 +1079,11 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		return chatRunResponse{}, errors.New("forbidden")
 	}
 	if options.binding == nil {
-		if binding, ok := h.channels.BindingForSession(options.tenant.TenantID, options.sessionID); ok {
+		binding, ok, err := h.channels.BindingForSession(h.chatCtx, options.tenant.TenantID, options.sessionID)
+		if err != nil {
+			return chatRunResponse{}, err
+		}
+		if ok {
 			options.binding = &binding
 		}
 	}
@@ -1299,6 +1320,20 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	var usageKnown bool
 	deltaNumber := 0
 	for runtimeEvent := range events {
+		if token, parseErr := strconv.ParseUint(runtimeEvent.Data["fencing_token"], 10, 64); parseErr == nil && token > 0 {
+			options.fencingToken = token
+		}
+		if runtimeEvent.Type == "session.lease.acquired" {
+			payload := h.chatIdentityPayload(options, runtimeEvent.Data)
+			leaseKey := options.requestID + ":lease-" + strconv.FormatUint(options.fencingToken, 10)
+			if err := h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, leaseKey, runtimeEvent.Type, payload); err != nil {
+				return
+			}
+			if err := h.cancelSupersededChatRuns(ctx, store, options); err != nil {
+				return
+			}
+			continue
+		}
 		if tokens, known := runtimeUsage(runtimeEvent.Data); known {
 			usageTokens, usageKnown = tokens, true
 		}
@@ -1336,6 +1371,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 				return
 			}
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
+			if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+				return
+			}
 			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "runner_failed", false)); err != nil {
 				return
 			}
@@ -1412,6 +1450,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			Name:       "response-" + options.requestID + ".txt",
 			ContentRef: "session-event://" + options.tenant.TenantID + "/" + options.sessionID + "/" + options.requestID + ":completed",
 			RequestID:  options.requestID, TraceID: options.traceID, Status: "published",
+			FencingToken: options.fencingToken,
 		})
 		if artifactErr != nil {
 			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
@@ -1461,6 +1500,53 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
 	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
 	cancelTerminal()
+}
+
+func (h *AdminHandler) cancelSupersededChatRuns(ctx context.Context, store DataStore, options chatRunOptions) error {
+	events, err := store.ListSessionEvents(ctx, options.tenant.TenantID, options.sessionID, 0)
+	if err != nil {
+		return err
+	}
+	started := make(map[string]struct{})
+	terminal := make(map[string]struct{})
+	identities := make(map[string]map[string]string)
+	for _, event := range events {
+		switch {
+		case event.Type == "message.input" && strings.HasSuffix(event.IdempotencyKey, ":input"):
+			requestID := strings.TrimSuffix(event.IdempotencyKey, ":input")
+			var identity map[string]string
+			if json.Unmarshal(event.Payload, &identity) == nil {
+				identities[requestID] = identity
+			}
+		case event.Type == "run.started" && strings.HasSuffix(event.IdempotencyKey, ":started"):
+			started[strings.TrimSuffix(event.IdempotencyKey, ":started")] = struct{}{}
+		case (event.Type == "run.completed" || event.Type == "run.failed" || event.Type == "run.cancelled") && strings.HasSuffix(event.IdempotencyKey, ":terminal"):
+			terminal[strings.TrimSuffix(event.IdempotencyKey, ":terminal")] = struct{}{}
+		case event.Type == "run.completed" && strings.HasSuffix(event.IdempotencyKey, ":run-completed"):
+			terminal[strings.TrimSuffix(event.IdempotencyKey, ":run-completed")] = struct{}{}
+		}
+	}
+	for requestID := range started {
+		if requestID == options.requestID {
+			continue
+		}
+		if _, complete := terminal[requestID]; complete {
+			continue
+		}
+		payload := make(map[string]string, len(identities[requestID])+4)
+		for key, value := range identities[requestID] {
+			payload[key] = value
+		}
+		payload["tenant_id"] = options.tenant.TenantID
+		payload["session_id"] = options.sessionID
+		payload["request_id"] = requestID
+		payload["error"] = "lease_superseded"
+		payload["fencing_token"] = strconv.FormatUint(options.fencingToken, 10)
+		if err := h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, requestID+":terminal", "run.cancelled", payload); err != nil && !errors.Is(err, ErrDuplicateEvent) {
+			return err
+		}
+	}
+	return nil
 }
 
 func contextualAgentInput(ctx context.Context, store DataStore, options chatRunOptions) (string, error) {
@@ -1555,6 +1641,9 @@ func (h *AdminHandler) chatIdentityPayload(options chatRunOptions, values map[st
 		"tenant_id": options.tenant.TenantID, "app_id": options.appID, "session_id": options.sessionID,
 		"user_id": options.userID, "request_id": options.requestID, "trace_id": options.traceID,
 		"policy_revision": strconv.FormatUint(options.policyRevision, 10),
+	}
+	if options.fencingToken > 0 {
+		payload["fencing_token"] = strconv.FormatUint(options.fencingToken, 10)
 	}
 	if deployment, ok := h.platform.activeDeployment(options.tenant.TenantID, options.appID); ok {
 		payload["deployment_id"] = deployment.ID

@@ -220,6 +220,9 @@ func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
 	for event := range events {
 		data, err := json.Marshal(event)
 		if err != nil {

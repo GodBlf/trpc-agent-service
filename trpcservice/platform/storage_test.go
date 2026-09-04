@@ -35,6 +35,26 @@ func TestInMemoryStoreOrdersAndDeduplicatesEvents(t *testing.T) {
 	}
 }
 
+func TestInMemoryStoreRejectsStaleFencedMemoryAndArtifactWrites(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+	if err := store.AppendSessionEvent(ctx, SessionEvent{TenantID: "tenant", SessionID: "session", IdempotencyKey: "current", Type: "run.started", FencingToken: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMemory(ctx, MemoryRecord{TenantID: "tenant", SessionID: "session", Key: "stale", Value: "value", FencingToken: 1}); !errors.Is(err, ErrStaleFencingToken) {
+		t.Fatalf("stale Memory write error = %v", err)
+	}
+	if _, err := store.PutArtifact(ctx, Artifact{TenantID: "tenant", SessionID: "session", Name: "stale", ContentRef: "memory://stale", FencingToken: 1}); !errors.Is(err, ErrStaleFencingToken) {
+		t.Fatalf("stale Artifact write error = %v", err)
+	}
+	if err := store.PutMemory(ctx, MemoryRecord{TenantID: "tenant", SessionID: "session", Key: "current", Value: "value", FencingToken: 2}); err != nil {
+		t.Fatalf("current Memory write: %v", err)
+	}
+	if _, err := store.PutArtifact(ctx, Artifact{TenantID: "tenant", SessionID: "session", Name: "current", ContentRef: "memory://current", FencingToken: 2}); err != nil {
+		t.Fatalf("current Artifact write: %v", err)
+	}
+}
+
 func TestPersistedUnavailableSQLiteDoesNotFallBackToMemory(t *testing.T) {
 	config := filepath.Join(t.TempDir(), "backends.json")
 	if err := os.WriteFile(config, []byte(`{"tenant-a":{"backend":"sqlite","address":"/missing-parent/store.db"}}`), 0600); err != nil {
