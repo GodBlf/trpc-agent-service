@@ -343,7 +343,7 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 		}
 		store, release, err := h.acquireStore(r.Context(), tenant.TenantID)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		defer release()

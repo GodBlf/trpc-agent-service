@@ -39,6 +39,28 @@ func (saveFailingControlPlanePersistence) Save(context.Context, controlPlaneSnap
 
 func (saveFailingControlPlanePersistence) Close() error { return nil }
 
+type loadFailingAfterSaveControlPlanePersistence struct {
+	snapshot  controlPlaneSnapshot
+	revision  int64
+	failLoads bool
+}
+
+func (p *loadFailingAfterSaveControlPlanePersistence) Load(context.Context) (controlPlaneSnapshot, int64, error) {
+	if p.failLoads {
+		return controlPlaneSnapshot{}, 0, errors.New("database unavailable")
+	}
+	return p.snapshot, p.revision, nil
+}
+
+func (p *loadFailingAfterSaveControlPlanePersistence) Save(_ context.Context, snapshot controlPlaneSnapshot, revision int64) (int64, error) {
+	p.snapshot = snapshot
+	p.revision = revision + 1
+	p.failLoads = true
+	return p.revision, nil
+}
+
+func (loadFailingAfterSaveControlPlanePersistence) Close() error { return nil }
+
 func (p *cancellationObservingControlPlanePersistence) Load(ctx context.Context) (controlPlaneSnapshot, int64, error) {
 	p.enterOnce.Do(func() { close(p.entered) })
 	<-ctx.Done()
@@ -172,6 +194,32 @@ func TestRuntimeStatusDoesNotClassifyBackendClosingAsControlPlaneFailure(t *test
 	}
 	if strings.Contains(response.Body.String(), "control_plane_unavailable") || !strings.Contains(response.Body.String(), `"id":"dependency-storage"`) {
 		t.Fatalf("runtime status = %s", response.Body.String())
+	}
+}
+
+func TestChannelBindingReportsControlPlaneFailureAfterBindingIsPersisted(t *testing.T) {
+	platform := NewInMemoryControlPlane()
+	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
+	defer handler.Close()
+	if created, err := platform.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}); err != nil || !created {
+		t.Fatal("seed App")
+	}
+	platform.persistence = &loadFailingAfterSaveControlPlanePersistence{snapshot: controlPlaneSnapshotFrom(platform), revision: platform.persistenceRevision}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/chat/bindings", strings.NewReader(`{"channel":"mock","app_id":"app-one","conversation_type":"single","external_conversation_id":"conversation-one","external_user_id":"user-one"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	var apiError errorResponse
+	if err := json.NewDecoder(response.Body).Decode(&apiError); err != nil {
+		t.Fatal(err)
+	}
+	if apiError.Error.Code != "control_plane_unavailable" {
+		t.Fatalf("error code = %q", apiError.Error.Code)
 	}
 }
 
