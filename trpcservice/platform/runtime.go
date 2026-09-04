@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"net/http"
 	"strconv"
 	"sync"
@@ -23,7 +24,9 @@ type ComponentLifecycle string
 const (
 	ComponentGateway     ComponentRole      = "gateway"
 	ComponentWorker      ComponentRole      = "worker"
+	ComponentDependency  ComponentRole      = "dependency"
 	LifecycleHealthy     ComponentLifecycle = "healthy"
+	LifecycleDegraded    ComponentLifecycle = "degraded"
 	LifecycleUnavailable ComponentLifecycle = "unavailable"
 	LifecycleClosing     ComponentLifecycle = "closing"
 	LifecycleError       ComponentLifecycle = "error"
@@ -37,6 +40,11 @@ type RuntimeComponentStatus struct {
 	Active    int64              `json:"active_executions"`
 	Completed int64              `json:"completed_executions"`
 	Failed    int64              `json:"failed_executions"`
+}
+
+type RuntimeFaultConfiguration struct {
+	Scenario string `json:"scenario"`
+	DelayMS  int    `json:"delay_ms"`
 }
 
 type runtimeError struct {
@@ -55,6 +63,8 @@ type Runtime struct {
 	global         runtimeCounters
 	counterMu      sync.Mutex
 	tenantCounters map[string]*runtimeCounters
+	faultMu        sync.RWMutex
+	faults         map[string]RuntimeFaultConfiguration
 }
 
 type runtimeCounters struct{ active, complete, failed atomic.Int64 }
@@ -124,6 +134,7 @@ func runnerRequestFromGateway(request GatewayRequest) RunnerRequest {
 		TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID,
 		Channel: request.Channel, ExternalSubject: request.ExternalSubject, Input: request.Input, RequestID: request.RequestID,
 		TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision,
+		Version: request.Version,
 	}
 }
 
@@ -131,10 +142,48 @@ func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLife
 	if runner == nil {
 		runner = EchoRunner{}
 	}
-	return &Runtime{platform: platform, worker: NewStatelessWorker(runner), life: life, gates: sessionGates{items: make(map[string]*sessionGate)}, tenantCounters: make(map[string]*runtimeCounters)}
+	return &Runtime{platform: platform, worker: NewStatelessWorker(runner), life: life, gates: sessionGates{items: make(map[string]*sessionGate)}, tenantCounters: make(map[string]*runtimeCounters), faults: make(map[string]RuntimeFaultConfiguration)}
 }
 
 func (rt *Runtime) SetWorkerAvailable(available bool) { rt.worker.available.Store(available) }
+
+func (rt *Runtime) SetFault(tenantID, appID string, config RuntimeFaultConfiguration) {
+	rt.faultMu.Lock()
+	defer rt.faultMu.Unlock()
+	if config.Scenario == "none" {
+		delete(rt.faults, runtimeFaultKey(tenantID, appID))
+		return
+	}
+	rt.faults[runtimeFaultKey(tenantID, appID)] = config
+}
+
+func (rt *Runtime) applyFault(ctx context.Context, tenantID, appID string) error {
+	rt.faultMu.RLock()
+	config := rt.faults[runtimeFaultKey(tenantID, appID)]
+	rt.faultMu.RUnlock()
+	switch config.Scenario {
+	case "", "none":
+		return nil
+	case "runner_error", "tool_error":
+		return &runtimeError{code: config.Scenario}
+	case "runner_delay":
+		if config.DelayMS <= 0 || config.DelayMS > 5000 {
+			return &runtimeError{code: "invalid_runtime_fault"}
+		}
+		timer := time.NewTimer(time.Duration(config.DelayMS) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return &runtimeError{code: "request_cancelled", err: ctx.Err()}
+		case <-timer.C:
+			return nil
+		}
+	default:
+		return &runtimeError{code: "invalid_runtime_fault"}
+	}
+}
+
+func runtimeFaultKey(tenantID, appID string) string { return tenantID + "\x00" + appID }
 
 func (rt *Runtime) Close() error {
 	if streaming, ok := rt.worker.runner.(StreamingRunnerAdapter); ok {
@@ -160,15 +209,22 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 	if !rt.worker.available.Load() {
 		return nil, &runtimeError{code: "worker_unavailable"}
 	}
+	if err := rt.applyFault(ctx, tenant.TenantID, request.AppID); err != nil {
+		return nil, err
+	}
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return nil, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.activeDeployment(tenant.TenantID, request.AppID)
+	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
 	if !found {
 		return nil, &runtimeError{code: "active_deployment_not_found"}
 	}
+	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+		request.Version = &version
+	}
 	request.TenantID, request.DeploymentID, request.VersionID, request.UserID = tenant.TenantID, deployment.ID, deployment.VersionID, tenant.UserID
 	streamCtx, cancel := context.WithCancel(ctx)
+	streamCtx = context.WithValue(streamCtx, governanceExternalCompletionContextKey{}, true)
 	var releaseLife func()
 	if rt.life != nil {
 		var ok bool
@@ -185,7 +241,6 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}()
 	}
-	streamCtx = context.WithValue(streamCtx, governanceExternalCompletionContextKey{}, true)
 	releaseGate, err := rt.gates.acquire(streamCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
 	if err != nil {
 		if releaseLife != nil {
@@ -232,12 +287,18 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if !rt.worker.available.Load() {
 		return GatewayResponse{}, &runtimeError{code: "worker_unavailable"}
 	}
+	if err := rt.applyFault(ctx, tenant.TenantID, request.AppID); err != nil {
+		return GatewayResponse{}, err
+	}
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return GatewayResponse{}, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.activeDeployment(tenant.TenantID, request.AppID)
+	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
 	if !found {
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
+	}
+	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+		request.Version = &version
 	}
 	request.DeploymentID, request.VersionID = deployment.ID, deployment.VersionID
 	runCtx, cancel := context.WithCancel(ctx)
@@ -278,6 +339,10 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	request.TenantID, request.UserID = tenant.TenantID, tenant.UserID
 	result, err := rt.worker.Execute(runCtx, request)
 	if err != nil {
+		var runtimeErr *runtimeError
+		if errors.As(err, &runtimeErr) {
+			return GatewayResponse{}, runtimeErr
+		}
 		rt.global.failed.Add(1)
 		counters.failed.Add(1)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || runCtx.Err() != nil {
@@ -336,6 +401,26 @@ func (p *MemoryPlatform) activeDeployment(tenantID, appID string) (Deployment, b
 		}
 	}
 	return Deployment{}, false
+}
+
+func (p *MemoryPlatform) routeDeployment(tenantID, appID, requestID string) (Deployment, bool) {
+	deployment, found := p.activeDeployment(tenantID, appID)
+	if !found {
+		return deployment, false
+	}
+	if deployment.TargetVersionID == "" || deployment.CurrentVersionID == "" || deployment.GrayPercentage <= 0 || deployment.GrayPercentage >= 100 || requestID == "" {
+		return deployment, true
+	}
+	if uint64(grayBucket(requestID)) < uint64(deployment.GrayPercentage) {
+		deployment.VersionID = deployment.TargetVersionID
+	}
+	return deployment, true
+}
+
+func grayBucket(requestID string) int {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(requestID))
+	return int(hash.Sum32() % 100)
 }
 
 type sessionGate struct {
@@ -451,5 +536,27 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.runtime.StatusFor(tenant)})
+	items := h.runtime.StatusFor(tenant)
+	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	if err != nil {
+		items = appendDependencyStatus(items, "dependency-storage", LifecycleUnavailable)
+	} else {
+		defer releaseStore()
+		healthCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		health := store.Health(healthCtx)
+		cancel()
+		lifecycle := LifecycleHealthy
+		if health.Status == "unavailable" {
+			lifecycle = LifecycleUnavailable
+		} else if health.Status != "healthy" && health.Status != "" {
+			lifecycle = LifecycleDegraded
+		}
+		items = appendDependencyStatus(items, "dependency-"+health.Backend, lifecycle)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func appendDependencyStatus(items []RuntimeComponentStatus, id string, lifecycle ComponentLifecycle) []RuntimeComponentStatus {
+	available := lifecycle == LifecycleHealthy
+	return append(items, RuntimeComponentStatus{ID: id, Role: ComponentDependency, Available: available, Lifecycle: lifecycle})
 }

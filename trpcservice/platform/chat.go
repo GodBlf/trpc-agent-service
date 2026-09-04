@@ -47,6 +47,8 @@ type cancelChatRunRequest struct {
 
 type providerReplayContextKey struct{}
 
+const storageOperationTimeout = 100 * time.Millisecond
+
 func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, account string, body []byte) error {
 	if h.providers == nil {
 		return errors.New("provider runtime unavailable")
@@ -478,6 +480,13 @@ func (h *AdminHandler) handleMockFaults(w http.ResponseWriter, r *http.Request) 
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, h.channels.MockFaults(tenant.TenantID, r.URL.Query().Get("session_id")))
 	case http.MethodPost:
+		h.mu.Lock()
+		enabled := h.faultInjectionEnabled
+		h.mu.Unlock()
+		if !enabled {
+			writeError(w, http.StatusForbidden, "fault_injection_disabled", "fault injection is disabled")
+			return
+		}
 		if !canOperate(tenant.Role) {
 			writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
 			return
@@ -717,21 +726,27 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 	}
 	store, release, err := h.acquireStore(tenant.TenantID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	defer release()
-	if _, err := store.GetSessionState(r.Context(), tenant.TenantID, sessionID); err == nil {
+	sessionCtx, cancelSessionRead := boundedStorageContext(r.Context())
+	_, stateErr := store.GetSessionState(sessionCtx, tenant.TenantID, sessionID)
+	cancelSessionRead()
+	if stateErr == nil {
 		writeError(w, http.StatusConflict, "chat_session_exists", "chat session already exists")
 		return
-	} else if !errors.Is(err, ErrNotFound) {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+	} else if !errors.Is(stateErr, ErrNotFound) {
+		writeStorageError(w, stateErr)
 		return
 	}
-	if err := h.appendChatEvent(r.Context(), store, tenant.TenantID, sessionID, "session-created", "session.created", map[string]string{
+	createCtx, cancelCreate := boundedStorageContext(r.Context())
+	createErr := h.appendChatEvent(createCtx, store, tenant.TenantID, sessionID, "session-created", "session.created", map[string]string{
 		"app_id": request.AppID, "user_id": tenant.UserID,
-	}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
+	})
+	cancelCreate()
+	if createErr != nil {
+		writeStorageError(w, createErr)
 		return
 	}
 	if _, err := h.channels.CreateBinding(tenant, createChannelBindingRequest{
@@ -768,7 +783,7 @@ func (h *AdminHandler) handleSendChatMessage(w http.ResponseWriter, r *http.Requ
 	}
 	events, err := h.chatEvents(r.Context(), tenant.TenantID, sessionID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	if len(events) == 0 {
@@ -811,7 +826,7 @@ func (h *AdminHandler) handleCancelChatRun(w http.ResponseWriter, r *http.Reques
 	}
 	events, err := h.chatEvents(r.Context(), tenant.TenantID, sessionID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	if len(events) == 0 {
@@ -848,7 +863,7 @@ func (h *AdminHandler) handleCancelChatRun(w http.ResponseWriter, r *http.Reques
 func (h *AdminHandler) writeChatEvents(w http.ResponseWriter, r *http.Request, tenant TenantContext, sessionID string) {
 	events, err := h.chatEvents(r.Context(), tenant.TenantID, sessionID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	if len(events) == 0 {
@@ -874,13 +889,15 @@ func (h *AdminHandler) handleChatStream(w http.ResponseWriter, r *http.Request, 
 	}
 	store, release, err := h.acquireStore(tenant.TenantID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	defer release()
-	all, err := store.ListSessionEvents(r.Context(), tenant.TenantID, sessionID, 0)
+	initialCtx, cancelInitial := boundedStorageContext(r.Context())
+	all, err := store.ListSessionEvents(initialCtx, tenant.TenantID, sessionID, 0)
+	cancelInitial()
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		writeStorageError(w, err)
 		return
 	}
 	if len(all) == 0 {
@@ -948,7 +965,9 @@ func (h *AdminHandler) handleChatStream(w http.ResponseWriter, r *http.Request, 
 		case <-h.chatCtx.Done():
 			return
 		case <-ticker.C:
-			events, err := store.ListSessionEvents(r.Context(), tenant.TenantID, sessionID, after)
+			pollCtx, cancelPoll := boundedStorageContext(r.Context())
+			events, err := store.ListSessionEvents(pollCtx, tenant.TenantID, sessionID, after)
+			cancelPoll()
 			if err != nil {
 				return
 			}
@@ -1062,7 +1081,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	store, release, err := h.acquireStore(options.tenant.TenantID)
 	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	if err != nil {
-		return chatRunResponse{}, errors.New("storage_error")
+		return chatRunResponse{}, storageFailureError(err)
 	}
 	defer func() {
 		if !started {
@@ -1079,10 +1098,12 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		h.chatMu.Unlock()
 		return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: "running"}, nil
 	}
-	events, err := store.ListSessionEvents(h.chatCtx, options.tenant.TenantID, options.sessionID, 0)
+	storageCtx, cancelStorage := context.WithTimeout(h.chatCtx, storageOperationTimeout)
+	events, err := store.ListSessionEvents(storageCtx, options.tenant.TenantID, options.sessionID, 0)
+	cancelStorage()
 	if err != nil {
 		h.chatMu.Unlock()
-		return chatRunResponse{}, errors.New("storage_error")
+		return chatRunResponse{}, storageFailureError(err)
 	}
 	if err := h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.read", "ok"); err != nil {
 		h.chatMu.Unlock()
@@ -1141,30 +1162,41 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 	}
 	if !existingInput {
-		if err := store.AppendSessionEvent(h.chatCtx, SessionEvent{
+		appendCtx, cancelAppend := context.WithTimeout(h.chatCtx, storageOperationTimeout)
+		appendErr := store.AppendSessionEvent(appendCtx, SessionEvent{
 			TenantID: options.tenant.TenantID, SessionID: options.sessionID, IdempotencyKey: options.requestID + ":input",
 			Type: "message.input", Payload: inputPayload,
-		}); err != nil {
+		})
+		cancelAppend()
+		if appendErr != nil {
 			h.chatMu.Unlock()
-			if errors.Is(err, ErrDuplicateEvent) {
+			if errors.Is(appendErr, ErrDuplicateEvent) {
 				return chatRunResponse{}, errors.New("idempotency_key_reused")
 			}
-			return chatRunResponse{}, errors.New("storage_error")
+			return chatRunResponse{}, storageFailureError(appendErr)
 		}
 	}
 	if !existingStarted {
-		if err := h.appendChatEvent(h.chatCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":started", "run.started", map[string]string{
+		startedCtx, cancelStarted := context.WithTimeout(h.chatCtx, storageOperationTimeout)
+		startedErr := h.appendChatEvent(startedCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":started", "run.started", map[string]string{
 			"app_id": options.appID, "request_id": options.requestID,
-		}); err != nil {
+		})
+		cancelStarted()
+		if startedErr != nil {
 			h.chatMu.Unlock()
-			return chatRunResponse{}, errors.New("storage_error")
+			return chatRunResponse{}, storageFailureError(startedErr)
 		}
 	}
 	if err := h.governance.RecordSpan(h.governanceRequest(options), options.traceID, "storage.session.write", "ok"); err != nil {
 		h.chatMu.Unlock()
 		return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
 	}
-	runCtx, cancel := context.WithCancel(h.chatCtx)
+	policy, policyFound := h.governance.Policy(options.tenant.TenantID, options.appID)
+	if !policyFound {
+		h.chatMu.Unlock()
+		return chatRunResponse{}, &GovernanceError{Code: "policy_unavailable"}
+	}
+	runCtx, cancel := runtimeTimeoutContext(h.chatCtx, policy.runtimeTimeout())
 	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input}
 	h.chatWG.Add(1)
 	started = true
@@ -1182,6 +1214,15 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		h.runChat(runCtx, store, options)
 	}()
 	return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: "running"}, nil
+}
+
+func runtimeTimeoutContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	timer := time.AfterFunc(timeout, cancel)
+	return ctx, func() {
+		timer.Stop()
+		cancel()
+	}
 }
 
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
@@ -1527,7 +1568,25 @@ func (h *AdminHandler) chatEvents(ctx context.Context, tenantID, sessionID strin
 		return nil, err
 	}
 	defer release()
-	return store.ListSessionEvents(ctx, tenantID, sessionID, 0)
+	storageCtx, cancel := context.WithTimeout(ctx, storageOperationTimeout)
+	defer cancel()
+	return store.ListSessionEvents(storageCtx, tenantID, sessionID, 0)
+}
+
+func boundedStorageContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, storageOperationTimeout)
+}
+
+func writeStorageError(w http.ResponseWriter, err error) {
+	code := storageFailureError(err).Error()
+	switch code {
+	case "storage_timeout":
+		writeError(w, http.StatusGatewayTimeout, code, "storage operation timed out")
+	case "request_cancelled":
+		writeError(w, http.StatusRequestTimeout, code, "request was cancelled")
+	default:
+		writeError(w, http.StatusServiceUnavailable, code, "storage is unavailable")
+	}
 }
 
 func chatRunKey(tenantID, sessionID, requestID string) string {
@@ -1584,6 +1643,19 @@ func newRequestID() string {
 	return "request-" + hex.EncodeToString(idBytes)
 }
 
+func storageFailureError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("storage_timeout")
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.New("request_cancelled")
+	}
+	if errors.Is(err, errBackendRegistryClosing) {
+		return errors.New("service_closing")
+	}
+	return errors.New("storage_unavailable")
+}
+
 func writeChatStartError(w http.ResponseWriter, err error) {
 	var governanceErr *GovernanceError
 	if errors.As(err, &governanceErr) {
@@ -1608,6 +1680,14 @@ func writeChatStartError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
 	case "idempotency_key_reused":
 		writeError(w, http.StatusConflict, "idempotency_key_reused", "request id was already used with different input")
+	case "storage_timeout":
+		writeError(w, http.StatusGatewayTimeout, "storage_timeout", "storage operation timed out")
+	case "request_cancelled":
+		writeError(w, http.StatusRequestTimeout, "request_cancelled", "request was cancelled")
+	case "service_closing":
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+	case "storage_unavailable":
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "storage is unavailable")
 	default:
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
 	}

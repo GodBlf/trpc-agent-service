@@ -25,6 +25,9 @@ async function createActiveApp(page: Page, suffix: string) {
     const version = await request(`/api/v1/admin/deployments/${deploymentId}/versions`, "POST", { config: { runner: "echo" } }, { "Idempotency-Key": versionIdempotencyKey }) as { id: string };
     await request(`/api/v1/admin/deployments/${deploymentId}/transition`, "POST", { status: "published", version_id: version.id });
     await request(`/api/v1/admin/deployments/${deploymentId}/transition`, "POST", { status: "active" });
+    await request("/api/v1/admin/governance/policy", "POST", {
+      agent_app_id: appId, token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60,
+    });
     return { appId, deploymentId };
   }, { appId, deploymentId, appName, versionIdempotencyKey });
   return result;

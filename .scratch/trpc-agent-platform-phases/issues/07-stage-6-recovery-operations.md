@@ -1,7 +1,7 @@
 # Stage 6: Failure Recovery And Operations Console
 
 Type: task
-Status: needs-triage
+Status: resolved
 Blocked by: 06
 
 ## Goal

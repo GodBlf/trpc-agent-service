@@ -173,7 +173,7 @@ func TestStorageStartFailureReleasesGovernanceReservation(t *testing.T) {
 	})
 	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
 	response := client.do(http.MethodPost, "/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-storage-failure"})
-	assertChannelAPIError(t, response, http.StatusServiceUnavailable, "storage_error")
+	assertChannelAPIError(t, response, http.StatusServiceUnavailable, "storage_unavailable")
 	metrics := client.handler.governance.Metrics("tenant-one")
 	if metrics.Active != 0 || metrics.Tokens != 0 || metrics.Failed != 1 {
 		t.Fatalf("metrics after storage failure = %#v", metrics)

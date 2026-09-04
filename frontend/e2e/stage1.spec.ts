@@ -79,6 +79,14 @@ async function createActiveTenantApp(page: Page, suffix: string, ordinal: string
   await expect(page.getByText("published").first()).toBeVisible();
   await page.getByRole("button", { name: "激活" }).click();
   await expect(page.getByText("active").first()).toBeVisible();
+  await page.evaluate(async (appId) => {
+    const response = await fetch("/api/v1/admin/governance/policy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_app_id: appId, token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60 }),
+    });
+    if (!response.ok) throw new Error(`policy: ${response.status}`);
+  }, appId);
   return { tenantId, appId, deploymentId };
 }
 

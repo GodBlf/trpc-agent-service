@@ -1,0 +1,275 @@
+package platform
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+type unavailableHealthStore struct{ DataStore }
+
+func (s *unavailableHealthStore) Health(context.Context) BackendHealth {
+	return BackendHealth{Backend: "postgres", Status: "unavailable", Checked: time.Now().UTC()}
+}
+
+type slowListStore struct{ DataStore }
+
+func (s *slowListStore) ListSessionEvents(ctx context.Context, tenantID, sessionID string, after uint64) ([]SessionEvent, error) {
+	select {
+	case <-time.After(3 * storageOperationTimeout):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.DataStore.ListSessionEvents(ctx, tenantID, sessionID, after)
+}
+
+func TestRuntimeStatusReportsDependencyHealthWithoutDiagnostics(t *testing.T) {
+	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
+	defer handler.Close()
+	handler.ConfigureDataStore(&unavailableHealthStore{DataStore: NewInMemoryStore()})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/runtime/status", nil)
+	request = request.WithContext(WithTenantContext(request.Context(), TenantContext{TenantID: "tenant-one", Role: RoleTenantAdmin}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Items []RuntimeComponentStatus `json:"items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	var dependency *RuntimeComponentStatus
+	for index := range result.Items {
+		if result.Items[index].Role == ComponentDependency {
+			dependency = &result.Items[index]
+		}
+	}
+	if dependency == nil || dependency.Available || dependency.Lifecycle != LifecycleUnavailable || strings.Contains(response.Body.String(), "connection") {
+		t.Fatalf("dependency status=%#v body=%s", dependency, response.Body.String())
+	}
+}
+
+func TestStorageTimeoutUsesBoundedContextAndStableError(t *testing.T) {
+	handler := NewAdminHandler(activeTestPlatform(t), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
+	defer handler.Close()
+	handler.ConfigureDataStore(&slowListStore{DataStore: NewInMemoryStore()})
+	if _, err := handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-one"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := handler.startChatRun(chatRunOptions{
+		tenant: TenantContext{TenantID: "tenant-one", Role: RoleOperator, UserID: "operator"},
+		appID:  "app-one", sessionID: "session-one", input: "hello", requestID: "request-storage-timeout",
+	})
+	if err == nil || err.Error() != "storage_timeout" {
+		t.Fatalf("storage timeout error=%v", err)
+	}
+}
+
+func TestServerOwnedRuntimeTimeoutProducesOneCancelledTerminalEvent(t *testing.T) {
+	runner := &chatBlockingRunner{started: make(chan struct{}, 1), once: make(chan struct{})}
+	client := newChannelTestClient(t, runner)
+	client.activateApp("app-one", "deploy-one")
+	if _, err := client.handler.governance.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-one", AgentAppID: "app-one", RuntimeTimeoutMS: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-timeout"}, http.StatusAccepted, nil)
+	if err := waitForChatEvent(client, "session-one", "run.cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	events := chatEventsForTest(t, client, "session-one")
+	terminalCount := 0
+	for _, event := range events {
+		if event.IdempotencyKey == "request-timeout:terminal" {
+			terminalCount++
+		}
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal events=%d, want 1", terminalCount)
+	}
+}
+
+func TestDeploymentGrayRoutingIsDeterministicAndTenantScoped(t *testing.T) {
+	store := activeTestPlatform(t)
+	deployment, _ := store.deployment("tenant-one", "deploy-one")
+	second, _, ok := store.createVersion(deployment, "runtime-version-2", map[string]any{"model": "fake-v2"})
+	if !ok {
+		t.Fatal("create second version")
+	}
+	if _, _, ok := store.startRollout(deployment, second.ID, 50); !ok {
+		t.Fatal("start rollout")
+	}
+	requests := make(chan RunnerRequest, 32)
+	runtime := NewRuntime(store, capturingRunner{request: requests}, nil)
+	for index := 0; index < 20; index++ {
+		_, err := runtime.Handle(context.Background(), TenantContext{TenantID: "tenant-one", Role: RoleOperator}, GatewayRequest{
+			AppID: "app-one", SessionID: "session", Input: "hello", RequestID: fmt.Sprintf("request-%d", index),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	versions := map[string]bool{}
+	for index := 0; index < 20; index++ {
+		versions[(<-requests).VersionID] = true
+	}
+	if len(versions) != 2 || !versions["deploy-one-v1"] || !versions[second.ID] {
+		t.Fatalf("gray versions=%#v", versions)
+	}
+}
+
+func TestDeploymentRolloutAndRollbackRequireConfirmationAndAudit(t *testing.T) {
+	handler := NewAdminHandler(activeTestPlatform(t), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
+	defer handler.Close()
+	deployment, _ := handler.platform.deployment("tenant-one", "deploy-one")
+	second, _, ok := handler.platform.createVersion(deployment, "rollout-version-2", map[string]any{"model": "fake-v2"})
+	if !ok {
+		t.Fatal("create second version")
+	}
+	post := func(path, body string, role Role) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request = request.WithContext(WithTenantContext(request.Context(), TenantContext{TenantID: "tenant-one", Role: role, UserID: "operator"}))
+		request.Header.Set("X-Request-ID", "rollout-request")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := post("/api/v1/admin/deployments/deploy-one/rollout", fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":50,"confirm":false}`, second.ID), RoleOperator); response.Code != http.StatusBadRequest {
+		t.Fatalf("unconfirmed rollout=%d %s", response.Code, response.Body.String())
+	}
+	viewerHandler := NewAdminHandler(activeTestPlatform(t), DevelopmentIdentity{ID: "viewer", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleViewer}}})
+	defer viewerHandler.Close()
+	viewerRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/deployments/deploy-one/rollout", strings.NewReader(fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":50,"confirm":true}`, second.ID)))
+	viewerResponse := httptest.NewRecorder()
+	viewerHandler.ServeHTTP(viewerResponse, viewerRequest)
+	if viewerResponse.Code != http.StatusForbidden {
+		t.Fatalf("viewer rollout=%d %s", viewerResponse.Code, viewerResponse.Body.String())
+	}
+	response := post("/api/v1/admin/deployments/deploy-one/rollout", fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":50,"confirm":true}`, second.ID), RoleOperator)
+	if response.Code != http.StatusOK {
+		t.Fatalf("rollout=%d %s", response.Code, response.Body.String())
+	}
+	var updated Deployment
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.RolloutStatus != DeploymentRolloutInProgress || updated.TargetVersionID != second.ID || updated.CurrentVersionID != "deploy-one-v1" || updated.GrayPercentage != 50 {
+		t.Fatalf("rollout=%#v", updated)
+	}
+	previewRequest := httptest.NewRequest(http.MethodGet, "/api/v1/admin/deployments/deploy-one/rollback-preview", nil)
+	previewRequest = previewRequest.WithContext(WithTenantContext(previewRequest.Context(), TenantContext{TenantID: "tenant-one", Role: RoleOperator}))
+	previewResponse := httptest.NewRecorder()
+	handler.ServeHTTP(previewResponse, previewRequest)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("preview=%d %s", previewResponse.Code, previewResponse.Body.String())
+	}
+	if response := post("/api/v1/admin/deployments/deploy-one/rollback", `{"confirm":true}`, RoleOperator); response.Code != http.StatusOK {
+		t.Fatalf("rollback=%d %s", response.Code, response.Body.String())
+	}
+	audits := handler.governance.AuditEvents(AuditQuery{TenantID: "tenant-one", RequestID: "rollout-request"})
+	decisions := map[string]bool{}
+	for _, audit := range audits {
+		decisions[audit.Decision] = true
+	}
+	if !decisions["deployment.rollout.updated"] || !decisions["deployment.rollback.confirmed"] {
+		t.Fatalf("audit decisions=%#v", decisions)
+	}
+}
+
+func TestCapacityRunIsBoundedDeterministicAndTenantScoped(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	var result CapacityTestResult
+	client.post("/api/v1/admin/capacity", `{"agent_app_id":"app-one","concurrency":2,"runs":4,"timeout_ms":1000}`, nil, http.StatusAccepted, &result)
+	if result.Status != "running" || result.TenantID != "tenant-one" || result.TraceID == "" {
+		t.Fatalf("initial result=%#v", result)
+	}
+	time.Sleep(20 * time.Millisecond)
+	response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+result.ID, "", nil)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("capacity result=%d", response.StatusCode)
+	}
+	var completed CapacityTestResult
+	if err := json.NewDecoder(response.Body).Decode(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != "completed" || completed.Completed != 4 || completed.Failed != 0 || completed.EstimatedTokens != 0 || completed.FirstBottleneck == "" {
+		t.Fatalf("capacity result=%#v", completed)
+	}
+}
+
+func TestRollbackDoesNotCancelInFlightVersionExecution(t *testing.T) {
+	runner := &blockingRunner{entered: make(chan string, 1), release: make(chan struct{})}
+	client := newChannelTestClient(t, runner)
+	client.activateApp("app-one", "deploy-one")
+
+	var second DeploymentVersion
+	client.post("/api/v1/admin/deployments/deploy-one/versions", `{"config":{"runner":"fake-v2"}}`, map[string]string{"Idempotency-Key": "rollback-inflight"}, http.StatusCreated, &second)
+	client.post("/api/v1/admin/deployments/deploy-one/rollout", fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":100,"confirm":true}`, second.ID), nil, http.StatusOK, nil)
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-rollback-inflight"}, http.StatusAccepted, nil)
+
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("active run did not start")
+	}
+
+	client.post("/api/v1/admin/deployments/deploy-one/rollback", `{"confirm":true}`, nil, http.StatusOK, nil)
+	runner.release <- struct{}{}
+	if err := waitForChatEvent(client, "session-one", "run.completed"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeFaultInjectionIsDevelopmentOnlyAndStable(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	client.post("/api/v1/admin/operations/faults", `{"agent_app_id":"app-one","scenario":"tool_error","delay_ms":0}`, nil, http.StatusOK, nil)
+	client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
+	client.post("/api/v1/chat/sessions/session-one/messages", `{"input":"hello"}`, map[string]string{"X-Request-ID": "request-tool-error"}, http.StatusAccepted, nil)
+	if err := waitForChatEvent(client, "session-one", "run.failed"); err != nil {
+		t.Fatal(err)
+	}
+	client.handler.ConfigureFaultInjection(false)
+	response := client.do(http.MethodPost, "/api/v1/admin/operations/faults", `{"agent_app_id":"app-one","scenario":"none","delay_ms":0}`, nil)
+	assertChannelAPIError(t, response, http.StatusForbidden, "fault_injection_disabled")
+}
+
+func TestProductionModeAllowsChannelBindingsButBlocksFaultInjection(t *testing.T) {
+	provider := NewJWTIdentityProvider(JWTIdentityConfig{
+		Issuer: "issuer", Audience: "audience", HMACSecret: []byte("secret"),
+	}, map[string]DevelopmentIdentity{
+		"operator": {ID: "operator", Name: "Operator", Assignments: []TenantAssignment{
+			{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin},
+		}},
+	})
+	client := newChannelTestClient(t, EchoRunner{})
+	client.handler.ConfigureIdentityProvider(provider)
+	token := signTestJWT(t, []byte("secret"), map[string]any{
+		"iss": "issuer", "aud": "audience", "sub": "operator", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	client.post("/api/v1/auth/login", `{"token":"`+token+`"}`, nil, http.StatusOK, nil)
+	client.activateApp("app-one", "deploy-one")
+
+	var binding ChannelBinding
+	client.post("/api/v1/chat/bindings", `{"channel":"mock","app_id":"app-one","conversation_type":"single","external_conversation_id":"user","external_user_id":"user"}`, nil, http.StatusCreated, &binding)
+	if binding.ID == "" || binding.SessionID == "" {
+		t.Fatalf("binding = %#v", binding)
+	}
+
+	mockFaults := client.do(http.MethodPost, "/api/v1/chat/mock/faults", `{"scenario":"message_length"}`, nil)
+	assertChannelAPIError(t, mockFaults, http.StatusForbidden, "fault_injection_disabled")
+	runtimeFaults := client.do(http.MethodPost, "/api/v1/admin/operations/faults", `{"agent_app_id":"app-one","scenario":"tool_error","delay_ms":0}`, nil)
+	assertChannelAPIError(t, runtimeFaults, http.StatusForbidden, "fault_injection_disabled")
+}

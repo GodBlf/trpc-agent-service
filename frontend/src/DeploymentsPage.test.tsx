@@ -57,7 +57,7 @@ test("reuses a Version idempotency key after an ambiguous failure and rotates it
   if (!nextVersionForm) throw new Error("Version form was not rendered");
   fireEvent.change(nextConfig, { target: { value: '{"runner":"other"}' } });
   await userEvent.click(within(nextVersionForm).getByRole("button", { name: "创建版本" }));
-  await screen.findByText("v2");
+  await screen.findAllByText("v2");
   const nextKey = new Headers(fetchMock.mock.calls[5][1].headers).get("Idempotency-Key");
   expect(nextKey).toBeTruthy();
   expect(nextKey).not.toBe(firstKey);
@@ -83,4 +83,45 @@ test("shows an Active Deployment conflict and refreshes server-authoritative sta
   expect(screen.getByRole("heading", { name: "deploy-two" })).toBeInTheDocument();
   expect(screen.getAllByText("active")).toHaveLength(1);
   expect(screen.getAllByText("published").length).toBeGreaterThan(0);
+});
+
+test("manages rollout rollback and capacity results with confirmation", async () => {
+  const activeDeployment = { ...deployment, status: "active", version_id: "deploy-one-v1", rollout_status: "idle" };
+  const versions = [
+    { id: "deploy-one-v1", deployment_id: "deploy-one", agent_app_id: "app-one", number: 1, config: { runner: "one" }, created_at: "2026-01-01T00:00:00Z" },
+    { id: "deploy-one-v2", deployment_id: "deploy-one", agent_app_id: "app-one", number: 2, config: { runner: "two" }, created_at: "2026-01-02T00:00:00Z" },
+  ];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/v1/admin/deployments") return jsonResponse({ items: [activeDeployment] });
+    if (url === "/api/v1/admin/agent-apps") return jsonResponse({ items: [{ id: "app-one", tenant_id: "tenant-one", name: "App One", created_at: "2026-01-01T00:00:00Z" }] });
+    if (url === "/api/v1/admin/deployments/deploy-one/versions") return jsonResponse({ items: versions });
+    if (url === "/api/v1/admin/deployments/deploy-one/rollout" && init?.method === "POST") {
+      expect(JSON.parse(String(init.body))).toEqual({ target_version_id: "deploy-one-v2", gray_percentage: 25, confirm: true });
+      return jsonResponse({ ...activeDeployment, rollout_status: "rolling", target_version_id: "deploy-one-v2", current_version_id: "deploy-one-v1", previous_version_id: "deploy-one-v1", gray_percentage: 25 });
+    }
+    if (url === "/api/v1/admin/deployments/deploy-one/rollback-preview") return jsonResponse({ tenant_id: "tenant-one", agent_app_id: "app-one", deployment_id: "deploy-one", current_version_id: "deploy-one-v1", previous_version_id: "deploy-one-v1", active_executions: 0, expected_result: "active routing returns to the previous immutable Version" });
+    if (url === "/api/v1/admin/deployments/deploy-one/rollback" && init?.method === "POST") return jsonResponse({ ...activeDeployment, rollout_status: "completed", target_version_id: "deploy-one-v1", current_version_id: "deploy-one-v1", previous_version_id: "deploy-one-v1", gray_percentage: 100 });
+    if (url === "/api/v1/admin/capacity" && init?.method === "POST") return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "running", concurrency: 2, runs: 4, completed: 0, failed: 0, active: 2, safe_concurrency: 2, throughput_per_second: 0, model_latency_ms: 0, tool_latency_ms: 0, storage_latency_ms: 0, estimated_tokens: 0, estimated_cost: 0, first_bottleneck: "none", started_at: "2026-01-01T00:00:00Z" });
+    if (url === "/api/v1/admin/capacity/capacity-one") return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "completed", concurrency: 2, runs: 4, completed: 4, failed: 0, active: 0, safe_concurrency: 2, throughput_per_second: 10, model_latency_ms: 2, tool_latency_ms: 0, storage_latency_ms: 1, estimated_tokens: 20, estimated_cost: 0.2, first_bottleneck: "none", started_at: "2026-01-01T00:00:00Z", completed_at: "2026-01-01T00:00:01Z" });
+    throw new Error(`unexpected request ${url}`);
+  });
+  const confirmMock = vi.fn(() => true);
+  vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("confirm", confirmMock);
+  render(<DeploymentsPage identity={identity} />);
+  await userEvent.click(await screen.findByText("deploy-one"));
+  await screen.findAllByText("v2");
+  fireEvent.change(screen.getByLabelText("目标版本"), { target: { value: "deploy-one-v2" } });
+  fireEvent.change(screen.getByLabelText("灰度 %"), { target: { value: "25" } });
+  await userEvent.click(screen.getByRole("button", { name: "开始/推进灰度" }));
+  expect(await screen.findByText("rolling · 25%")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "回滚预览" }));
+  expect(await screen.findByText("active routing returns to the previous immutable Version")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "确认回滚" }));
+  await screen.findByText("completed · 100%");
+  await userEvent.click(screen.getByRole("button", { name: "容量评估" }));
+  expect(await screen.findByText("trace-one")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText("10.00")).toBeInTheDocument());
+  await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(2));
 });

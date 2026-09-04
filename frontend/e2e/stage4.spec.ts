@@ -17,6 +17,9 @@ test("manage and replay a Stage 4 provider route", async ({ page }, testInfo) =>
     const version = await request(`/api/v1/admin/deployments/${deploymentID}/versions`, { config: { runner: "echo" } }, { "Idempotency-Key": `stage4-${suffix}` });
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "published", version_id: version.id });
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "active" });
+    await request("/api/v1/admin/governance/policy", {
+      agent_app_id: appID, token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60,
+    });
   }, { appID, deploymentID, suffix });
 
   await page.getByRole("button", { name: "IM 通道" }).click();

@@ -107,7 +107,8 @@ func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) 
 		for _, version := range versions {
 			if version.ID == id {
 				if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
-					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID
+					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
+						deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
 				}
 				return version, true
 			}
@@ -182,6 +183,17 @@ type AdminHandler struct {
 	chatCtx                  context.Context
 	chatCancel               context.CancelFunc
 	chatWG                   sync.WaitGroup
+	capacityCtx              context.Context
+	capacityCancel           context.CancelFunc
+	capacityWG               sync.WaitGroup
+	capacityMu               sync.Mutex
+	capacityRuns             map[string]*capacityRun
+	life                     RuntimeLifecycle
+	drainState               DrainState
+	drainStartedAt           time.Time
+	drainCompletedAt         time.Time
+	drainError               string
+	faultInjectionEnabled    bool
 }
 
 // ConfigureIdentityProvider enables production identity mode. Development
@@ -189,6 +201,7 @@ type AdminHandler struct {
 func (h *AdminHandler) ConfigureIdentityProvider(provider IdentityProvider) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.faultInjectionEnabled = false
 	h.identityProvider = provider
 	h.sessions = make(map[string]*developmentSession)
 	h.productionSessions = make(map[string]*productionSession)
@@ -219,6 +232,7 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	failureCtx, failureCancel := context.WithCancel(context.Background())
 	chatCtx, chatCancel := context.WithCancel(context.Background())
+	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
@@ -227,8 +241,15 @@ func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *Ad
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
 		channels: channels, activeRuns: make(map[string]activeChatRun),
-		chatCtx: chatCtx, chatCancel: chatCancel,
+		chatCtx: chatCtx, chatCancel: chatCancel, capacityCtx: capacityCtx, capacityCancel: capacityCancel,
+		capacityRuns: make(map[string]*capacityRun), drainState: DrainIdle, faultInjectionEnabled: true,
 	}
+}
+
+func (h *AdminHandler) ConfigureFaultInjection(enabled bool) {
+	h.mu.Lock()
+	h.faultInjectionEnabled = enabled
+	h.mu.Unlock()
 }
 
 // ConfigureDataStore replaces the Stage 2 data backend. It is safe to call
@@ -284,6 +305,15 @@ func (h *AdminHandler) ConfigureBackendCatalog(redisAddress, sqlitePath string) 
 	}
 }
 
+func (h *AdminHandler) ConfigurePostgresBackend(dsn string) {
+	if dsn == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.backendCatalog["postgres"] = backendSelection{Backend: "postgres", Address: dsn}
+}
+
 func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -311,6 +341,7 @@ func (h *AdminHandler) Close() error {
 	h.closing = true
 	h.mu.Unlock()
 	h.chatCancel()
+	h.capacityCancel()
 	if h.providers != nil {
 		h.providers.Close()
 	}
@@ -318,6 +349,7 @@ func (h *AdminHandler) Close() error {
 	h.migrationCancel()
 	h.migrationWG.Wait()
 	h.chatWG.Wait()
+	h.capacityWG.Wait()
 	h.failureCancel()
 	runtimeErr := h.runtime.Close()
 	storeErr := h.backends.close()
@@ -349,6 +381,9 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 		governed.SetGovernance(h.governance)
 	}
 	h.runtime = NewRuntime(h.platform, runner, life)
+	h.mu.Lock()
+	h.life = life
+	h.mu.Unlock()
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -356,7 +391,7 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = auditWriter
 	started := time.Now()
 	defer func() {
-		auditCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+		auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := h.auditHTTPRequest(auditCtx, r, auditWriter, started); err != nil && auditWriter.buffered && (auditWriter.status == 0 || auditWriter.status < http.StatusBadRequest) {
 			auditWriter.auditUnavailable()

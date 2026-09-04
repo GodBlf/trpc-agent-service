@@ -68,7 +68,10 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		}
 		h.mu.Unlock()
 		sort.Strings(available)
-		writeJSON(w, http.StatusOK, map[string]any{"backend": store.Health(r.Context()).Backend, "health": store.Health(r.Context()), "available_backends": available})
+		healthCtx, cancel := boundedStorageContext(r.Context())
+		health := store.Health(healthCtx)
+		cancel()
+		writeJSON(w, http.StatusOK, map[string]any{"backend": health.Backend, "health": health, "available_backends": available})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -105,7 +108,10 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusInternalServerError, "backend_selection_not_persisted", "backend selection could not be persisted")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"backend": req.Backend, "health": store.Health(r.Context())})
+	healthCtx, cancel := boundedStorageContext(r.Context())
+	health := store.Health(healthCtx)
+	cancel()
+	writeJSON(w, http.StatusOK, map[string]any{"backend": req.Backend, "health": health})
 }
 
 func (h *AdminHandler) handleSessionData(w http.ResponseWriter, r *http.Request, store DataStore, tenant TenantContext, parts []string) {
@@ -115,22 +121,26 @@ func (h *AdminHandler) handleSessionData(w http.ResponseWriter, r *http.Request,
 	}
 	sessionID := parts[0]
 	if len(parts) == 1 && r.Method == http.MethodGet {
-		state, err := store.GetSessionState(r.Context(), tenant.TenantID, sessionID)
+		stateCtx, cancel := boundedStorageContext(r.Context())
+		state, err := store.GetSessionState(stateCtx, tenant.TenantID, sessionID)
+		cancel()
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "session_not_found", "session was not found")
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, state)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "events" && r.Method == http.MethodGet {
-		events, err := store.ListSessionEvents(r.Context(), tenant.TenantID, sessionID, 0)
+		eventsCtx, cancel := boundedStorageContext(r.Context())
+		events, err := store.ListSessionEvents(eventsCtx, tenant.TenantID, sessionID, 0)
+		cancel()
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": events})
@@ -147,9 +157,11 @@ func (h *AdminHandler) handleMemoryData(w http.ResponseWriter, r *http.Request, 
 	sessionID := parts[0]
 	switch r.Method {
 	case http.MethodGet:
-		items, err := store.ListMemory(r.Context(), tenant.TenantID, sessionID)
+		memoryCtx, cancel := boundedStorageContext(r.Context())
+		items, err := store.ListMemory(memoryCtx, tenant.TenantID, sessionID)
+		cancel()
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -167,13 +179,18 @@ func (h *AdminHandler) handleMemoryData(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		item := MemoryRecord{TenantID: tenant.TenantID, SessionID: sessionID, Key: req.Key, Value: req.Value}
-		if err := store.PutMemory(r.Context(), item); err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+		putCtx, cancelPut := boundedStorageContext(r.Context())
+		putErr := store.PutMemory(putCtx, item)
+		cancelPut()
+		if putErr != nil {
+			writeStorageError(w, putErr)
 			return
 		}
-		items, err := store.ListMemory(r.Context(), tenant.TenantID, sessionID)
+		listCtx, cancelList := boundedStorageContext(r.Context())
+		items, err := store.ListMemory(listCtx, tenant.TenantID, sessionID)
+		cancelList()
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		created := MemoryRecord{TenantID: tenant.TenantID, SessionID: sessionID, Key: req.Key}

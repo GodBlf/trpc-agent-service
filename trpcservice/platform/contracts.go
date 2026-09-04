@@ -84,6 +84,7 @@ type AgentApp struct {
 }
 
 type DeploymentStatus string
+type DeploymentRolloutStatus string
 
 const (
 	DeploymentDraft     DeploymentStatus = "draft"
@@ -92,14 +93,25 @@ const (
 	DeploymentPaused    DeploymentStatus = "paused"
 )
 
+const (
+	DeploymentRolloutIdle       DeploymentRolloutStatus = "idle"
+	DeploymentRolloutInProgress DeploymentRolloutStatus = "rolling"
+	DeploymentRolloutCompleted  DeploymentRolloutStatus = "completed"
+)
+
 type Deployment struct {
-	ID              string           `json:"id"`
-	TenantID        string           `json:"tenant_id"`
-	AgentAppID      string           `json:"agent_app_id"`
-	VersionID       string           `json:"version_id,omitempty"`
-	Status          DeploymentStatus `json:"status"`
-	DesiredReplicas int              `json:"desired_replicas"`
-	CreatedAt       time.Time        `json:"created_at"`
+	ID                string                  `json:"id"`
+	TenantID          string                  `json:"tenant_id"`
+	AgentAppID        string                  `json:"agent_app_id"`
+	VersionID         string                  `json:"version_id,omitempty"`
+	Status            DeploymentStatus        `json:"status"`
+	DesiredReplicas   int                     `json:"desired_replicas"`
+	RolloutStatus     DeploymentRolloutStatus `json:"rollout_status"`
+	CurrentVersionID  string                  `json:"current_version_id,omitempty"`
+	TargetVersionID   string                  `json:"target_version_id,omitempty"`
+	PreviousVersionID string                  `json:"previous_version_id,omitempty"`
+	GrayPercentage    int                     `json:"gray_percentage"`
+	CreatedAt         time.Time               `json:"created_at"`
 }
 
 type DeploymentVersion struct {
@@ -113,19 +125,30 @@ type DeploymentVersion struct {
 	Active       bool           `json:"-"`
 }
 
+type DeploymentRollbackPreview struct {
+	TenantID          string `json:"tenant_id"`
+	AgentAppID        string `json:"agent_app_id"`
+	DeploymentID      string `json:"deployment_id"`
+	CurrentVersionID  string `json:"current_version_id"`
+	PreviousVersionID string `json:"previous_version_id"`
+	ActiveExecutions  int64  `json:"active_executions"`
+	ExpectedResult    string `json:"expected_result"`
+}
+
 type GatewayRequest struct {
-	TenantID        string `json:"-"`
-	AppID           string `json:"app_id"`
-	SessionID       string `json:"session_id"`
-	UserID          string `json:"-"`
-	Channel         string `json:"-"`
-	ExternalSubject string `json:"-"`
-	Input           string `json:"input"`
-	RequestID       string `json:"-"`
-	TraceID         string `json:"-"`
-	DeploymentID    string `json:"-"`
-	VersionID       string `json:"-"`
-	PolicyRevision  uint64 `json:"-"`
+	TenantID        string             `json:"-"`
+	AppID           string             `json:"app_id"`
+	SessionID       string             `json:"session_id"`
+	UserID          string             `json:"-"`
+	Channel         string             `json:"-"`
+	ExternalSubject string             `json:"-"`
+	Input           string             `json:"input"`
+	RequestID       string             `json:"-"`
+	TraceID         string             `json:"-"`
+	DeploymentID    string             `json:"-"`
+	VersionID       string             `json:"-"`
+	Version         *DeploymentVersion `json:"-"`
+	PolicyRevision  uint64             `json:"-"`
 }
 
 type GatewayResponse struct {
@@ -176,6 +199,7 @@ type RunnerRequest struct {
 	TraceID          string
 	DeploymentID     string
 	VersionID        string
+	Version          *DeploymentVersion `json:"version,omitempty"`
 	PolicyRevision   uint64
 }
 

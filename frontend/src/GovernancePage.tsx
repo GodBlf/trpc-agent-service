@@ -10,6 +10,7 @@ const emptyPolicy = (appID = ""): TenantPolicy => ({
   denied_input_patterns: [], denied_output_patterns: [], redacted_patterns: [], allowed_im_users: [], allowed_im_subjects: [],
   allowed_provider_accounts: [], allowed_conversation_types: [],
   token_budget: 0, cost_budget: 0, cost_per_token: 0, tool_costs: {}, estimated_tokens_per_run: 0, rate_limit: 0, rate_window_seconds: 60,
+  runtime_timeout_ms: 30000,
 });
 
 export function GovernancePage({ identity }: { identity: Identity }) {
@@ -115,6 +116,7 @@ export function GovernancePage({ identity }: { identity: Identity }) {
         <NumberField label="单次预留 Token" value={policy.estimated_tokens_per_run} onChange={(value) => setPolicy({ ...policy, estimated_tokens_per_run: value })} />
         <NumberField label="每窗口请求数" value={policy.rate_limit} onChange={(value) => setPolicy({ ...policy, rate_limit: value })} />
         <NumberField label="限流窗口秒数" value={policy.rate_window_seconds} onChange={(value) => setPolicy({ ...policy, rate_window_seconds: value })} />
+        <NumberField label="运行超时 ms" value={policy.runtime_timeout_ms ?? 30000} onChange={(value) => setPolicy({ ...policy, runtime_timeout_ms: value })} />
       </div>
     </section>}
     {view === "确认" && <section className="governance-band"><div className="section-toolbar"><strong>危险 Tool 确认</strong></div>{confirmations.length === 0 ? <AsyncState kind="empty" /> : <div className="table-wrap"><table><thead><tr><th>Tool</th><th>参数摘要</th><th>Request</th><th>状态</th><th>过期时间</th><th>操作</th></tr></thead><tbody>{confirmations.map((item) => <tr key={item.id}><td>{item.tool_name}</td><td><code>{item.argument_summary}</code></td><td><code>{item.request_id}</code></td><td><span className={`status ${item.status}`}>{item.status}</span></td><td>{item.expires_at}</td><td><div className="row-actions"><button className="icon-button" title="批准" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, true)}><Check /></button><button className="icon-button" title="拒绝" disabled={!canDecide || item.status !== "pending"} onClick={() => void decide(item, false)}><X /></button></div></td></tr>)}</tbody></table></div>}</section>}

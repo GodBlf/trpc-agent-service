@@ -40,6 +40,7 @@ type TenantPolicy struct {
 	EstimatedTokensPerRun    int64              `json:"estimated_tokens_per_run"`
 	RateLimit                int                `json:"rate_limit"`
 	RateWindowSeconds        int                `json:"rate_window_seconds"`
+	RuntimeTimeoutMS         int                `json:"runtime_timeout_ms"`
 	UpdatedAt                time.Time          `json:"updated_at"`
 }
 
@@ -369,6 +370,8 @@ func governanceKey(tenantID, appID string) string    { return tenantID + "\x00" 
 func executionKey(tenantID, requestID string) string { return tenantID + "\x00" + requestID }
 
 const governanceCleanupTimeout = 2 * time.Second
+const defaultRuntimeTimeout = 30 * time.Second
+const maxRuntimeTimeoutMS = 300000
 
 func completeGovernance(ctx context.Context, center *GovernanceCenter, completion GovernanceCompletion) (string, error) {
 	if center == nil {
@@ -383,7 +386,7 @@ func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (
 	if err := ctx.Err(); err != nil {
 		return TenantPolicy{}, err
 	}
-	if policy.TenantID == "" || policy.AgentAppID == "" || policy.TokenBudget < 0 || policy.CostBudget < 0 || policy.CostPerToken < 0 || policy.EstimatedTokensPerRun < 0 || policy.RateLimit < 0 || policy.RateWindowSeconds < 0 {
+	if policy.TenantID == "" || policy.AgentAppID == "" || policy.TokenBudget < 0 || policy.CostBudget < 0 || policy.CostPerToken < 0 || policy.EstimatedTokensPerRun < 0 || policy.RateLimit < 0 || policy.RateWindowSeconds < 0 || policy.RuntimeTimeoutMS < 0 || policy.RuntimeTimeoutMS > maxRuntimeTimeoutMS {
 		return TenantPolicy{}, errors.New("invalid_policy")
 	}
 	normalizedToolCosts := make(map[string]float64, len(policy.ToolCosts))
@@ -434,6 +437,13 @@ func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (
 		return TenantPolicy{}, err
 	}
 	return clonePolicy(policy), nil
+}
+
+func (p TenantPolicy) runtimeTimeout() time.Duration {
+	if p.RuntimeTimeoutMS <= 0 {
+		return defaultRuntimeTimeout
+	}
+	return time.Duration(p.RuntimeTimeoutMS) * time.Millisecond
 }
 
 func (g *GovernanceCenter) Policy(tenantID, appID string) (TenantPolicy, bool) {

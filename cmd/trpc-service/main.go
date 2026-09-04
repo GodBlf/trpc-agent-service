@@ -31,6 +31,40 @@ func main() {
 	addr := flag.String("addr", defaultAddr, "HTTP listen address")
 	flag.Parse()
 
+	role := os.Getenv("TRPC_SERVICE_ROLE")
+	workerToken := os.Getenv("TRPC_WORKER_TOKEN")
+	if workerToken == "" {
+		workerToken = "development-worker"
+	}
+	if role == "worker" {
+		worker := platform.NewWorkerServer(platform.WorkerServerConfig{Token: workerToken})
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		})
+		mux.Handle("/internal/worker/", worker)
+		server := &http.Server{Addr: *addr, Handler: mux}
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			fmt.Printf("trpc-agent-service %s worker listening on %s\n", trpcservice.Version, *addr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("worker HTTP server: %v", err)
+			}
+		}()
+		<-stop
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("worker HTTP shutdown: %v", err)
+		}
+		return
+	}
+	if role != "" && role != "gateway" {
+		log.Fatalf("unsupported service role %q", role)
+	}
+
 	life := lifecycle.New()
 	store := platform.NewMemoryPlatform()
 	identity := platform.DevelopmentIdentity{
@@ -66,11 +100,27 @@ func main() {
 	default:
 		log.Fatalf("unsupported authentication mode %q", authMode)
 	}
+	faultInjectionEnabled := true
+	if os.Getenv("TRPC_FAULT_INJECTION") == "0" {
+		faultInjectionEnabled = false
+	}
+	if os.Getenv("TRPC_AUTH_MODE") == "production" {
+		faultInjectionEnabled = false
+	}
+	admin.ConfigureFaultInjection(faultInjectionEnabled)
 	if err := admin.ConfigureBackendSelections(os.Getenv("TRPC_BACKEND_SELECTIONS")); err != nil && os.Getenv("TRPC_BACKEND_SELECTIONS") != "" {
 		log.Fatalf("backend selections: %v", err)
 	}
-	admin.ConfigureRuntime(platform.NewFrameworkRunnerAdapter(store.DeploymentVersion, nil), life)
+	var runner platform.RunnerAdapter
+	workerURL := os.Getenv("TRPC_WORKER_URL")
+	if workerURL != "" {
+		runner = platform.NewRemoteRunnerAdapter(workerURL, workerToken)
+	} else {
+		runner = platform.NewFrameworkRunnerAdapter(store.DeploymentVersion, nil)
+	}
+	admin.ConfigureRuntime(runner, life)
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
+	admin.ConfigurePostgresBackend(os.Getenv("TRPC_POSTGRES_DSN"))
 	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
 	routePath := os.Getenv("TRPC_BOT_ROUTES_PATH")
 	if routePath == "" {
