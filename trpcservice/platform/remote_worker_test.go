@@ -90,7 +90,7 @@ func TestExecutionManifestRejectsTamperingExpiryAndUnknownKey(t *testing.T) {
 }
 
 func TestRemoteToolGovernanceCreatesSharedConfirmationAndFailsClosed(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RolePlatformAdmin}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RolePlatformAdmin}}})
 	defer handler.Close()
 	handler.ConfigureInternalGovernance("governance-secret")
 	policy, err := handler.governance.PutPolicy(context.Background(), TenantPolicy{

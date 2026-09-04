@@ -10,23 +10,23 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
 )
 
-func activeTestPlatform(t *testing.T) *MemoryPlatform {
+func activeTestPlatform(t *testing.T) *SnapshotControlPlane {
 	t.Helper()
-	store := NewMemoryPlatform()
-	store.seedTenant(TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator})
-	if !store.createApp(AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}) {
+	store := NewInMemoryControlPlane()
+	store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator})
+	if !store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}) {
 		t.Fatal("create app")
 	}
 	deployment := Deployment{ID: "deploy-one", TenantID: "tenant-one", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(deployment) {
+	if !store.createDeployment(context.Background(), deployment) {
 		t.Fatal("create deployment")
 	}
-	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
+	version, _, _ := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	published, _, ok := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
 	if !ok {
 		t.Fatal("publish")
 	}
-	if _, _, ok := store.transition(published, DeploymentActive, ""); !ok {
+	if _, _, ok := store.transition(context.Background(), published, DeploymentActive, ""); !ok {
 		t.Fatal("activate")
 	}
 	return store
@@ -207,20 +207,20 @@ func TestRuntimeStreamEmitsCancelledWhenLeaseIsLostWithoutWorkerEvent(t *testing
 
 func TestRuntimeDoesNotShareSessionGateAcrossTenants(t *testing.T) {
 	store := activeTestPlatform(t)
-	store.seedTenant(TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator})
-	if !store.createApp(AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}) {
+	store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator})
+	if !store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}) {
 		t.Fatal("create second app")
 	}
 	deployment := Deployment{ID: "deploy-two", TenantID: "tenant-two", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(deployment) {
+	if !store.createDeployment(context.Background(), deployment) {
 		t.Fatal("create second deployment")
 	}
-	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
+	version, _, _ := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	published, _, ok := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
 	if !ok {
 		t.Fatal("publish second")
 	}
-	if _, _, ok := store.transition(published, DeploymentActive, ""); !ok {
+	if _, _, ok := store.transition(context.Background(), published, DeploymentActive, ""); !ok {
 		t.Fatal("activate second")
 	}
 

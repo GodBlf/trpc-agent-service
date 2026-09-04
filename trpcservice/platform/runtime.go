@@ -240,14 +240,14 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return nil, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
 	if !found {
 		if err := rt.platform.controlPlaneError(); err != nil {
 			return nil, &runtimeError{code: "control_plane_unavailable", err: err}
 		}
 		return nil, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+	if version, found := rt.platform.DeploymentVersion(ctx, deployment.VersionID); found {
 		request.Version = &version
 	} else if err := rt.platform.controlPlaneError(); err != nil {
 		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
@@ -329,9 +329,11 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}
 		for event := range events {
-			if event.Data == nil {
-				event.Data = map[string]string{}
+			data := make(map[string]string, len(event.Data)+1)
+			for key, value := range event.Data {
+				data[key] = value
 			}
+			event.Data = data
 			if fencingToken > 0 {
 				event.Data["fencing_token"] = fmt.Sprint(fencingToken)
 			}
@@ -377,14 +379,14 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return GatewayResponse{}, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
 	if !found {
 		if err := rt.platform.controlPlaneError(); err != nil {
 			return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
 		}
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+	if version, found := rt.platform.DeploymentVersion(ctx, deployment.VersionID); found {
 		request.Version = &version
 	} else if err := rt.platform.controlPlaneError(); err != nil {
 		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
@@ -491,10 +493,10 @@ func (rt *Runtime) countersFor(tenantID string) *runtimeCounters {
 	return counters
 }
 
-func (p *MemoryPlatform) activeDeployment(tenantID, appID string) (Deployment, bool) {
+func (p *SnapshotControlPlane) activeDeployment(ctx context.Context, tenantID, appID string) (Deployment, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return Deployment{}, false
 	}
 	for _, deployment := range p.deployments {
@@ -505,8 +507,8 @@ func (p *MemoryPlatform) activeDeployment(tenantID, appID string) (Deployment, b
 	return Deployment{}, false
 }
 
-func (p *MemoryPlatform) routeDeployment(tenantID, appID, requestID string) (Deployment, bool) {
-	deployment, found := p.activeDeployment(tenantID, appID)
+func (p *SnapshotControlPlane) routeDeployment(ctx context.Context, tenantID, appID, requestID string) (Deployment, bool) {
+	deployment, found := p.activeDeployment(ctx, tenantID, appID)
 	if !found {
 		return deployment, false
 	}
@@ -583,7 +585,7 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 		requestID = time.Now().UTC().Format("20060102150405.000000000")
 	}
 	request.RequestID = requestID
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		code, message := "storage_unavailable", "tenant storage is unavailable"
 		if h.platform.controlPlaneError() != nil {
@@ -645,7 +647,7 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	items := h.runtime.StatusFor(tenant)
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		items = appendDependencyStatus(items, "dependency-storage", LifecycleUnavailable)
 	} else {

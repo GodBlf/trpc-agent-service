@@ -16,7 +16,7 @@
 | Session Event | `(tenant_id, session_id, sequence)` | event_id, idempotency_key, type, payload, fencing_token, occurred_at | sequence 连续；幂等 key 唯一；事实源 |
 | Projection Checkpoint | `(tenant_id, session_id, projection)` | last_sequence, updated_at | 只能从 N 推进到 N+1 |
 | Session State | `(tenant_id, session_id)` | projection_sequence, summary, updated_at | Session Event 的可重建投影 |
-| Memory | `(tenant_id, session_id, memory_key)` | value, updated_at | 权威值先提交 |
+| Memory | `(tenant_id, session_id, memory_key)` | value, updated_at, fencing_token | 权威值先提交；成功执行更新 `latest_agent_reply` |
 | Knowledge | `(tenant_id, knowledge_id)` | app_id, source, content_ref/content, index_status | 索引为派生状态 |
 | Artifact | `(tenant_id, artifact_id)` | session_id, request_id, trace_id, content_reference, status | 内容与元数据分离 |
 | Audit Event | `(tenant_id, audit_id)` | channel, user_id, session_id, agent_name, tool_name, decision, latency, error_type, cost, trace_id | 追加记录 |
@@ -49,6 +49,8 @@ erDiagram
 Session Event 的 `(tenant_id, session_id, idempotency_key)` 唯一。相同 key 与相同 type/payload 重试返回原结果；相同 key 携带不同内容返回冲突。append 在事务内读取当前最大 sequence 并写入下一条。持有 PostgreSQL Session Execution Lease 的 Gateway 把 fencing token 附在执行相关写入；数据库在同一事务内确认 token 等于该 Session 当前最高 token 后才插入事件。租约过期允许当前 token 完成有界收尾，但一旦新 owner 获得更高 token，旧 token 立即返回 `stale_fencing_token`，不能更改事件、Memory、Artifact、State、Summary 或执行终态。每次授予另写一条 token 唯一的 `session.lease.acquired`，新 owner 用当前 token 为遗留的未终结请求写入 `run.cancelled`。
 
 `SessionState.projection_sequence` 是参考实现的 Projection Checkpoint。物化器严格按 sequence 读取，遇到缺口立即失败，不跳到后续事件。Summary 只在已连续处理的事件上更新；删除派生 State 或 Summary 后，可以从 Session Event 重新构建。
+
+成功的 Agent 执行在发出 IM 回复前，将经过输出治理的最终回复写入 Memory 的 `latest_agent_reply` 稳定键。该记录携带本次 Session Execution Lease 的 fencing token；Memory 持久化失败时记录 `memory.write.failed`，并禁止写入成功终态或发送成功回复。参考实现不从模型自由文本自动抽取任意长期事实，避免把未验证内容当作用户画像。
 
 ## 执行与 Tool 状态
 

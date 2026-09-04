@@ -57,7 +57,7 @@ func TestProductionIdentityValidatesJWTAndTenantAssignment(t *testing.T) {
 			{TenantID: "tenant-b", TenantName: "B", Role: RoleViewer},
 		}},
 	})
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{})
 	handler.ConfigureIdentityProvider(provider)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -88,7 +88,7 @@ func TestProductionIdentityRejectsInvalidCredentialsAndDisablesDevelopmentSessio
 	provider := NewJWTIdentityProvider(JWTIdentityConfig{
 		Issuer: "issuer", Audience: "audience", HMACSecret: []byte("correct-secret"),
 	}, map[string]DevelopmentIdentity{"user": {ID: "user", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleViewer}}}})
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{{TenantID: "tenant-dev", Role: RolePlatformAdmin}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{{TenantID: "tenant-dev", Role: RolePlatformAdmin}}})
 	handler.ConfigureIdentityProvider(provider)
 	server := httptest.NewServer(handler)
 	defer server.Close()

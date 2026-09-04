@@ -266,8 +266,8 @@ type GovernanceCenter struct {
 	now           func() time.Time
 	path          string
 	policyStore   interface {
-		loadGovernancePolicies() (map[string]TenantPolicy, error)
-		saveGovernancePolicy(TenantPolicy) (TenantPolicy, error)
+		loadGovernancePolicies(context.Context) (map[string]TenantPolicy, error)
+		saveGovernancePolicy(context.Context, TenantPolicy) (TenantPolicy, error)
 	}
 }
 
@@ -305,13 +305,13 @@ func NewGovernanceCenter() *GovernanceCenter {
 }
 
 func (g *GovernanceCenter) configurePolicyStore(store interface {
-	loadGovernancePolicies() (map[string]TenantPolicy, error)
-	saveGovernancePolicy(TenantPolicy) (TenantPolicy, error)
+	loadGovernancePolicies(context.Context) (map[string]TenantPolicy, error)
+	saveGovernancePolicy(context.Context, TenantPolicy) (TenantPolicy, error)
 }) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.policyStore = store
-	shared, err := g.policyStore.loadGovernancePolicies()
+	shared, err := g.policyStore.loadGovernancePolicies(context.Background())
 	if err != nil {
 		return
 	}
@@ -323,7 +323,7 @@ func (g *GovernanceCenter) configurePolicyStore(store interface {
 		sort.Strings(keys)
 		imported := make(map[string]TenantPolicy, len(keys))
 		for _, key := range keys {
-			policy, saveErr := g.policyStore.saveGovernancePolicy(g.policies[key])
+			policy, saveErr := g.policyStore.saveGovernancePolicy(context.Background(), g.policies[key])
 			if saveErr != nil {
 				return
 			}
@@ -335,11 +335,11 @@ func (g *GovernanceCenter) configurePolicyStore(store interface {
 	g.policies = shared
 }
 
-func (g *GovernanceCenter) refreshPoliciesLocked() error {
+func (g *GovernanceCenter) refreshPoliciesLocked(ctx context.Context) error {
 	if g.policyStore == nil {
 		return nil
 	}
-	policies, err := g.policyStore.loadGovernancePolicies()
+	policies, err := g.policyStore.loadGovernancePolicies(ctx)
 	if err != nil {
 		return err
 	}
@@ -475,11 +475,11 @@ func (g *GovernanceCenter) PutPolicy(ctx context.Context, policy TenantPolicy) (
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	checkpoint := g.snapshotLocked()
-	if err := g.refreshPoliciesLocked(); err != nil {
+	if err := g.refreshPoliciesLocked(ctx); err != nil {
 		return TenantPolicy{}, err
 	}
 	if g.policyStore != nil {
-		persisted, err := g.policyStore.saveGovernancePolicy(policy)
+		persisted, err := g.policyStore.saveGovernancePolicy(ctx, policy)
 		if err != nil {
 			return TenantPolicy{}, err
 		}
@@ -513,10 +513,10 @@ func (p TenantPolicy) runtimeTimeout() time.Duration {
 	return time.Duration(p.RuntimeTimeoutMS) * time.Millisecond
 }
 
-func (g *GovernanceCenter) Policy(tenantID, appID string) (TenantPolicy, bool) {
+func (g *GovernanceCenter) Policy(ctx context.Context, tenantID, appID string) (TenantPolicy, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.refreshPoliciesLocked() != nil {
+	if g.refreshPoliciesLocked(ctx) != nil {
 		return TenantPolicy{}, false
 	}
 	policy, ok := g.policies[governanceKey(tenantID, appID)]
@@ -529,7 +529,7 @@ func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceReque
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := g.refreshPoliciesLocked(); err != nil {
+	if err := g.refreshPoliciesLocked(ctx); err != nil {
 		return GovernanceResult{}, &GovernanceError{Code: "control_plane_unavailable"}
 	}
 	checkpoint := g.snapshotLocked()
@@ -904,7 +904,7 @@ func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request Governance
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := g.refreshPoliciesLocked(); err != nil {
+	if err := g.refreshPoliciesLocked(ctx); err != nil {
 		return &GovernanceError{Code: "control_plane_unavailable", TraceID: traceID}
 	}
 	checkpoint := g.snapshotLocked()

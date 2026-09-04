@@ -339,7 +339,7 @@ func TestDeploymentToolPolicyGatesDeclarationsWithoutPreflightConfirmation(t *te
 }
 
 func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
 	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
 	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a", Input: "ship", RequiredTools: []string{"deploy"}}
 	result, _ := handler.governance.Evaluate(context.Background(), request)
@@ -363,7 +363,7 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	if decided.Status != ConfirmationApproved {
 		t.Fatalf("decision = %#v", decided)
 	}
-	store, release, err := handler.acquireStore("tenant-a")
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 }
 
 func TestConfirmationDecisionWaitsForPendingChatRunToExit(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
 	defer handler.Close()
 	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{
 		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
@@ -463,7 +463,7 @@ func TestConfirmationDecisionWaitsForPendingChatRunToExit(t *testing.T) {
 		t.Fatal(decisionResult.err)
 	}
 	decodeResponse(t, decisionResult.response, http.StatusOK, &ToolConfirmation{})
-	store, release, err := handler.acquireStore("tenant-a")
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,7 +509,7 @@ func TestConfirmationListReconcilesExpiryAndPersistsSessionEvent(t *testing.T) {
 	if len(listed.Items) != 1 || listed.Items[0].Status != ConfirmationExpired {
 		t.Fatalf("expired confirmations = %#v", listed.Items)
 	}
-	store, release, err := handler.acquireStore("tenant-a")
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}

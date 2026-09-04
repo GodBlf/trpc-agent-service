@@ -84,6 +84,7 @@ sequenceDiagram
     Runner-->>Worker: Agent Events
     Worker-->>Gateway: 内部 SSE Events
     Gateway->>Store: 按 fencing token 写 Session Event
+    Gateway->>Store: 按 fencing token 写 latest_agent_reply Memory
     Gateway->>Store: 连续推进 Session State / Summary Projection Checkpoint
     Gateway->>Gov: 写 Audit Event、Metrics、Trace Span
     Gateway->>Channel: ChannelReply
@@ -96,7 +97,7 @@ sequenceDiagram
 
 ## 5. 数据隔离与一致性
 
-Control Plane Store 保存 Tenant、Agent App、Deployment、Version、Channel Binding、Backend Selection、Governance Policy 与配置幂等记录。每次读取按共享 revision 刷新，Gateway 不以进程本地旧配置维持正确性；从旧本地治理文件升级且共享策略为空时，会一次性导入策略。Session Event 是运行数据事实源，Session State 与 Summary 是只允许连续推进的投影，`projection_sequence` 表示已经消费的最高事件序号；发现序号空洞时拒绝产生看似最新的状态。Memory 和 Knowledge 由租户数据管理接口写入，在 Agent 执行前按 Tenant/App/Session 查询并注入输入；当前执行链不会从模型输出自动提取并写回 Memory。Knowledge 权威文本先提交，向量索引属于最终一致派生物，即使索引处于 retry 状态，权威内容仍可读取。
+Control Plane Store 保存 Tenant、Agent App、Deployment、Version、Channel Binding、Backend Selection、Governance Policy 与配置幂等记录。每次读取按共享 revision 刷新，Gateway 不以进程本地旧配置维持正确性；从旧本地治理文件升级且共享策略为空时，会一次性导入策略。Session Event 是运行数据事实源，Session State 与 Summary 是只允许连续推进的投影，`projection_sequence` 表示已经消费的最高事件序号；发现序号空洞时拒绝产生看似最新的状态。Memory 和 Knowledge 可由租户数据管理接口写入，在 Agent 执行前按 Tenant/App/Session 查询并注入输入；此外，成功执行会在 IM 回复前把最终模型回复写入稳定键 `latest_agent_reply`，并携带当前 fencing token。该写入只保存确定性的最终回复，不声称从自由文本自动提取用户画像；写入失败会产生 `memory.write.failed`，本次执行不进入成功终态，也不继续发送 IM 成功回复。Knowledge 权威文本先提交，向量索引属于最终一致派生物，即使索引处于 retry 状态，权威内容仍可读取。
 
 Artifact 元数据记录 Tenant、Session、request_id、trace_id、状态与 content reference。参考实现把 Agent 完成回复发布为指向 `message.completed` 的 `session-event://` 引用；如果内容或元数据发布失败，写入 `artifact.publication.failed`，不报告虚假的 `run.completed`。生产对象内容应由 S3 适配器保存，SQL 只保存引用、校验和与发布状态。
 

@@ -47,7 +47,7 @@ func newChannelTestClientWithIdentity(t *testing.T, runner RunnerAdapter, identi
 
 func newChannelTestClientWithoutPolicy(t *testing.T, runner RunnerAdapter, identity DevelopmentIdentity) *channelTestClient {
 	t.Helper()
-	handler := NewAdminHandler(NewMemoryPlatform(), identity)
+	handler := NewAdminHandler(NewInMemoryControlPlane(), identity)
 	handler.ConfigureRuntime(runner, nil)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)

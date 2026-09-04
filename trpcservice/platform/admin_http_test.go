@@ -62,7 +62,7 @@ func requireJSONResponse(t *testing.T, client *http.Client, url, body, idempoten
 
 func newDevelopmentClient(t *testing.T, identity DevelopmentIdentity) (*httptest.Server, *http.Client) {
 	t.Helper()
-	server := httptest.NewServer(NewAdminHandler(NewMemoryPlatform(), identity))
+	server := httptest.NewServer(NewAdminHandler(NewInMemoryControlPlane(), identity))
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		server.Close()
@@ -72,7 +72,7 @@ func newDevelopmentClient(t *testing.T, identity DevelopmentIdentity) (*httptest
 }
 
 func TestDevelopmentIdentityCanOnlySwitchToServerApprovedTenant(t *testing.T) {
-	server := httptest.NewServer(NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{
+	server := httptest.NewServer(NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{
 		ID: "developer", Name: "Local Developer",
 		Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "Tenant A", Role: RolePlatformAdmin}},
 	}))
@@ -148,7 +148,7 @@ func TestDevelopmentIdentityConcurrentSwitchAndReadIsRaceFree(t *testing.T) {
 }
 
 func TestDevelopmentSessionsRemainBounded(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleViewer}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "developer", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleViewer}}})
 	for i := 0; i < maxDevelopmentSessions+20; i++ {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil))
@@ -490,7 +490,7 @@ func TestDeploymentLifecycleControlsRoutedExecution(t *testing.T) {
 }
 
 func TestAgentAppAllowsOnlyOneActiveDeployment(t *testing.T) {
-	store := NewMemoryPlatform()
+	store := NewInMemoryControlPlane()
 	handler := NewAdminHandler(store, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
 	runnerRequests := make(chan RunnerRequest, 1)
 	handler.ConfigureRuntime(capturingRunner{request: runnerRequests}, nil)
@@ -603,7 +603,7 @@ func TestAgentAppAllowsOnlyOneActiveDeployment(t *testing.T) {
 }
 
 func TestTwoTenantRoutesResolveScopedDeploymentVersions(t *testing.T) {
-	store := NewMemoryPlatform()
+	store := NewInMemoryControlPlane()
 	runs := make(chan capturedRun, 3)
 	handler := NewAdminHandler(store, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{
 		{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin},

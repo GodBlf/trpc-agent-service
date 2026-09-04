@@ -1,11 +1,20 @@
 package platform
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 )
+
+type failingExecutionMemoryStore struct{ DataStore }
+
+func (s failingExecutionMemoryStore) PutMemory(context.Context, MemoryRecord) error {
+	return errors.New("memory unavailable")
+}
 
 func TestChatSessionAPIPersistsHistoryAndPropagatesRequestID(t *testing.T) {
 	runs := make(chan RunnerRequest, 2)
@@ -164,5 +173,62 @@ func TestChatChannelRejectsOutOfOrderProviderSequence(t *testing.T) {
 	}
 	if inputs != 1 {
 		t.Fatalf("input events = %d, want 1", inputs)
+	}
+}
+
+func TestChatChannelPersistsCompletedReplyAsMemory(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	client.handler.ConfigureSessionLeases(&losingLeaseManager{lost: make(chan struct{})})
+	var binding ChannelBinding
+	client.post("/api/v1/chat/bindings", `{"channel":"mock","app_id":"app-one","conversation_type":"single","external_conversation_id":"conversation","external_user_id":"user"}`, nil, http.StatusCreated, &binding)
+
+	body := fmt.Sprintf(`{"binding_id":%q,"message_id":"message-one","sequence":1,"text":"remember this"}`, binding.ID)
+	client.post("/api/v1/chat/channels/mock/callback", body, signedMockCallback(t, binding, body), http.StatusAccepted, nil)
+	if err := waitForChatEvent(client, binding.SessionID, "run.completed"); err != nil {
+		t.Fatal(err)
+	}
+
+	response := client.do(http.MethodGet, "/api/v1/admin/memory/"+binding.SessionID, "", nil)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("memory status = %d", response.StatusCode)
+	}
+	var result struct {
+		Items []MemoryRecord `json:"items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Key != "latest_agent_reply" || result.Items[0].Value != "echo:remember this" || result.Items[0].FencingToken != 42 {
+		t.Fatalf("memory = %#v", result.Items)
+	}
+}
+
+func TestChatChannelDoesNotReplyWhenMemoryWriteFails(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	client.handler.ConfigureDataStore(failingExecutionMemoryStore{DataStore: NewInMemoryStore()})
+	var binding ChannelBinding
+	client.post("/api/v1/chat/bindings", `{"channel":"mock","app_id":"app-one","conversation_type":"single","external_conversation_id":"conversation","external_user_id":"user"}`, nil, http.StatusCreated, &binding)
+
+	body := fmt.Sprintf(`{"binding_id":%q,"message_id":"message-one","sequence":1,"text":"hello"}`, binding.ID)
+	client.post("/api/v1/chat/channels/mock/callback", body, signedMockCallback(t, binding, body), http.StatusAccepted, nil)
+	if err := waitForChatEvent(client, binding.SessionID, "run.failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	events := chatEventsForTest(t, client, binding.SessionID)
+	foundMemoryFailure := false
+	for _, event := range events {
+		if event.Type == "channel.reply" || event.Type == "run.completed" {
+			t.Fatalf("unexpected success event after Memory failure: %#v", event)
+		}
+		if event.Type == "memory.write.failed" {
+			foundMemoryFailure = true
+		}
+	}
+	if !foundMemoryFailure {
+		t.Fatalf("events = %#v", events)
 	}
 }

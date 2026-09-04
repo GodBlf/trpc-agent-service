@@ -22,4 +22,5 @@ either Gateway does not lose or diverge the authoritative configuration.
 
 ## Comments
 
+所有请求期 Control Plane 操作均接收调用方 `context.Context`，数据库 5 秒上限从该 context 派生；HTTP 取消或服务关闭会立即取消共享状态查询。`TestControlPlaneLoadStopsWhenHTTPRequestIsCanceled` 覆盖此行为。
 已由 `./scripts/stage7-compose-acceptance.sh` 和总门禁验证。

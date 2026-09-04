@@ -292,7 +292,7 @@ func TestGovernancePluginConsumesDangerousConfirmationAndRecordsToolCompletion(t
 
 func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(t *testing.T) {
 	platform := activeTestPlatform(t)
-	version, ok := platform.DeploymentVersion("deploy-one-v1")
+	version, ok := platform.DeploymentVersion(context.Background(), "deploy-one-v1")
 	if !ok {
 		t.Fatal("active deployment version not found")
 	}
@@ -302,7 +302,7 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 		TenantID: "tenant-one", AgentAppID: "app-one",
 		AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
 	})
-	adapter := NewFrameworkRunnerAdapter(func(id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
 		if id != version.ID {
 			return DeploymentVersion{}, false
 		}
@@ -341,7 +341,7 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 }
 
 func TestFrameworkRunnerAdapterRejectsUnknownVersionAndClose(t *testing.T) {
-	adapter := NewFrameworkRunnerAdapter(func(string) (DeploymentVersion, bool) { return DeploymentVersion{}, false }, nil)
+	adapter := NewFrameworkRunnerAdapter(func(context.Context, string) (DeploymentVersion, bool) { return DeploymentVersion{}, false }, nil)
 	if _, err := adapter.RunEvents(context.Background(), RunnerRequest{VersionID: "missing"}); err == nil || err.Error() != "deployment_version_scope_mismatch" {
 		t.Fatalf("unknown version error = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestFrameworkRunnerAdapterAppliesToolGovernanceAfterRunningPlainVersion(t *
 			Config: map[string]any{"runner": "tool", "tools": []any{"deploy"}, "deterministic_tool_call": "deploy"},
 		},
 	}
-	adapter := NewFrameworkRunnerAdapter(func(id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
 		version, ok := versions[id]
 		return version, ok
 	}, nil)
@@ -442,7 +442,7 @@ func TestFrameworkRunnerAdapterIsolatesTenantVersions(t *testing.T) {
 		"tenant-two-v1": {ID: "tenant-two-v1", TenantID: "tenant-two", AgentAppID: "app-two", DeploymentID: "deploy-two", Active: true},
 	}
 	var factoryCalls atomic.Int64
-	adapter := NewFrameworkRunnerAdapter(func(id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
 		version, ok := versions[id]
 		return version, ok
 	}, func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
@@ -531,11 +531,11 @@ func TestFrameworkRunnerAdapterRetiresInactiveVersion(t *testing.T) {
 	adapter := NewFrameworkRunnerAdapter(platform.DeploymentVersion, nil)
 	request := RunnerRequest{TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", SessionID: "session-one", UserID: "user-one", Input: "hello", RequestID: "request-one", VersionID: "deploy-one-v1"}
 	_ = collectRuntimeEvents(t, adapter, request)
-	deployment, ok := platform.deployment("tenant-one", "deploy-one")
+	deployment, ok := platform.deployment(context.Background(), "tenant-one", "deploy-one")
 	if !ok {
 		t.Fatal("deployment not found")
 	}
-	if _, _, ok := platform.transition(deployment, DeploymentPaused, ""); !ok {
+	if _, _, ok := platform.transition(context.Background(), deployment, DeploymentPaused, ""); !ok {
 		t.Fatal("pause deployment")
 	}
 	if _, err := adapter.RunEvents(context.Background(), request); err == nil || err.Error() != "deployment_version_inactive" {

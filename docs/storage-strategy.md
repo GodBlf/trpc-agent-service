@@ -17,7 +17,7 @@
 
 同一 Session 的写入顺序是：获得 Lease，持久化 input，写 started，执行 Runner，追加 delta/completed 或失败事件，发布 Artifact，写唯一运行终态，最后释放 Lease。每一步使用 request_id 派生的幂等 key。State 和 Summary 从事件 sequence 1 开始连续投影，不允许跳过；投影失败保留 checkpoint，恢复后从下一条继续。
 
-Memory 的权威写先进入 SQL/Redis，再发布索引任务。读取 Agent 上下文时先读权威 Memory；向量召回用于扩展候选，不得覆盖权威值。Knowledge 同样先提交来源和内容引用，再异步分块、embedding、upsert 向量，最后推进 index checkpoint。向量服务中断时状态为 retry_pending，指数退避并限制最大并发；删除或重建索引不影响权威内容。
+Memory 的权威写先进入 SQL/Redis，再发布索引任务。成功执行会在 IM 回复前更新 `latest_agent_reply`，PostgreSQL 事务同时校验 Session 当前 fencing token；失败时本次执行不能报告成功。读取 Agent 上下文时先读权威 Memory；向量召回用于扩展候选，不得覆盖权威值。Knowledge 同样先提交来源和内容引用，再异步分块、embedding、upsert 向量，最后推进 index checkpoint。向量服务中断时状态为 retry_pending，指数退避并限制最大并发；删除或重建索引不影响权威内容。
 
 Artifact 采用内容与元数据两阶段发布。S3 设计先把内容写到带 request_id 的临时 key，校验 checksum 后在 SQL 事务发布 metadata，成功后再把对象标记为可读。内容成功而 SQL 失败会留下可扫描的临时对象；SQL 成功而对象不可读时将 status 改为 recovery_required，API 不返回虚假成功。当前参考实现的内容是已持久化 Session Event，因而 metadata 引用可以通过事件事实源验证。
 

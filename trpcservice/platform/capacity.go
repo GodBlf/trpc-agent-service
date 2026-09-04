@@ -111,11 +111,11 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "invalid_capacity_request", "capacity test inputs are invalid")
 		return
 	}
-	if _, exists := h.platform.app(tenant.TenantID, request.AgentAppID); !exists {
+	if _, exists := h.platform.app(r.Context(), tenant.TenantID, request.AgentAppID); !exists {
 		writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 		return
 	}
-	if _, exists := h.platform.activeDeployment(tenant.TenantID, request.AgentAppID); !exists {
+	if _, exists := h.platform.activeDeployment(r.Context(), tenant.TenantID, request.AgentAppID); !exists {
 		writeError(w, http.StatusConflict, "active_deployment_not_found", "active Deployment is required")
 		return
 	}
@@ -143,7 +143,7 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
-	policy, _ := h.governance.Policy(tenant.TenantID, request.AgentAppID)
+	policy, _ := h.governance.Policy(r.Context(), tenant.TenantID, request.AgentAppID)
 	timeout := time.Duration(request.TimeoutMS) * time.Millisecond
 	if policy.RuntimeTimeoutMS > 0 && policy.runtimeTimeout() < timeout {
 		timeout = policy.runtimeTimeout()
@@ -266,7 +266,7 @@ func (h *AdminHandler) executeCapacityRun(ctx context.Context, run *capacityRun,
 }
 
 func (h *AdminHandler) capacityStorageLatency(tenant TenantContext) int64 {
-	store, release, err := h.acquireStore(tenant.TenantID)
+	store, release, err := h.acquireStore(h.capacityCtx, tenant.TenantID)
 	if err != nil {
 		return minCapacityTimeoutMS
 	}

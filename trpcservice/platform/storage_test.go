@@ -64,7 +64,7 @@ func TestPersistedUnavailableSQLiteDoesNotFallBackToMemory(t *testing.T) {
 	if err := handler.ConfigureBackendSelections(config); err != nil {
 		t.Fatal(err)
 	}
-	store, releaseStore, err := handler.acquireStore("tenant-a")
+	store, releaseStore, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}

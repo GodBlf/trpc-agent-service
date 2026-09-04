@@ -31,7 +31,7 @@ func (s *slowListStore) ListSessionEvents(ctx context.Context, tenantID, session
 }
 
 func TestRuntimeStatusReportsDependencyHealthWithoutDiagnostics(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
 	defer handler.Close()
 	handler.ConfigureDataStore(&unavailableHealthStore{DataStore: NewInMemoryStore()})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/runtime/status", nil)
@@ -102,12 +102,12 @@ func TestServerOwnedRuntimeTimeoutProducesOneCancelledTerminalEvent(t *testing.T
 
 func TestDeploymentGrayRoutingIsDeterministicAndTenantScoped(t *testing.T) {
 	store := activeTestPlatform(t)
-	deployment, _ := store.deployment("tenant-one", "deploy-one")
-	second, _, ok := store.createVersion(deployment, "runtime-version-2", map[string]any{"model": "fake-v2"})
+	deployment, _ := store.deployment(context.Background(), "tenant-one", "deploy-one")
+	second, _, ok := store.createVersion(context.Background(), deployment, "runtime-version-2", map[string]any{"model": "fake-v2"})
 	if !ok {
 		t.Fatal("create second version")
 	}
-	if _, _, ok := store.startRollout(deployment, second.ID, 50); !ok {
+	if _, _, ok := store.startRollout(context.Background(), deployment, second.ID, 50); !ok {
 		t.Fatal("start rollout")
 	}
 	requests := make(chan RunnerRequest, 32)
@@ -132,8 +132,8 @@ func TestDeploymentGrayRoutingIsDeterministicAndTenantScoped(t *testing.T) {
 func TestDeploymentRolloutAndRollbackRequireConfirmationAndAudit(t *testing.T) {
 	handler := NewAdminHandler(activeTestPlatform(t), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleTenantAdmin}}})
 	defer handler.Close()
-	deployment, _ := handler.platform.deployment("tenant-one", "deploy-one")
-	second, _, ok := handler.platform.createVersion(deployment, "rollout-version-2", map[string]any{"model": "fake-v2"})
+	deployment, _ := handler.platform.deployment(context.Background(), "tenant-one", "deploy-one")
+	second, _, ok := handler.platform.createVersion(context.Background(), deployment, "rollout-version-2", map[string]any{"model": "fake-v2"})
 	if !ok {
 		t.Fatal("create second version")
 	}
@@ -348,8 +348,8 @@ func TestDeploymentHighRiskOperationsFailClosedWhenAuditCannotPersist(t *testing
 		t.Fatal(err)
 	}
 	handler.governance.SetPersistencePath(filepath.Join(blocker, "governance.json"))
-	deployment, _ := handler.platform.deployment("tenant-one", "deploy-one")
-	second, _, ok := handler.platform.createVersion(deployment, "audit-failure-v2", map[string]any{"model": "fake-v2"})
+	deployment, _ := handler.platform.deployment(context.Background(), "tenant-one", "deploy-one")
+	second, _, ok := handler.platform.createVersion(context.Background(), deployment, "audit-failure-v2", map[string]any{"model": "fake-v2"})
 	if !ok {
 		t.Fatal("create second version")
 	}
@@ -366,17 +366,17 @@ func TestDeploymentHighRiskOperationsFailClosedWhenAuditCannotPersist(t *testing
 
 	rolloutResponse := post("/api/v1/admin/deployments/deploy-one/rollout", fmt.Sprintf(`{"target_version_id":%q,"gray_percentage":50,"confirm":true}`, second.ID))
 	assertChannelAPIError(t, rolloutResponse.Result(), http.StatusServiceUnavailable, "audit_unavailable")
-	current, _ := handler.platform.deployment("tenant-one", "deploy-one")
+	current, _ := handler.platform.deployment(context.Background(), "tenant-one", "deploy-one")
 	if current.VersionID != "deploy-one-v1" || current.TargetVersionID != "" || current.GrayPercentage != 0 {
 		t.Fatalf("rollout changed after audit failure: %#v", current)
 	}
 
-	if _, _, ok := handler.platform.startRollout(deployment, second.ID, 50); !ok {
+	if _, _, ok := handler.platform.startRollout(context.Background(), deployment, second.ID, 50); !ok {
 		t.Fatal("prepare rollback state")
 	}
 	rollbackResponse := post("/api/v1/admin/deployments/deploy-one/rollback", `{"confirm":true}`)
 	assertChannelAPIError(t, rollbackResponse.Result(), http.StatusServiceUnavailable, "audit_unavailable")
-	current, _ = handler.platform.deployment("tenant-one", "deploy-one")
+	current, _ = handler.platform.deployment(context.Background(), "tenant-one", "deploy-one")
 	if current.VersionID != "deploy-one-v1" || current.TargetVersionID != second.ID || current.GrayPercentage != 50 {
 		t.Fatalf("rollback changed after audit failure: %#v", current)
 	}

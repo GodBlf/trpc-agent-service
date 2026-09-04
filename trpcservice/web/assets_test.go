@@ -11,7 +11,7 @@ import (
 )
 
 func TestStage1HandlerServesPackagedConsoleAndKeepsStage0Endpoints(t *testing.T) {
-	admin := platform.NewAdminHandler(platform.NewMemoryPlatform(), platform.DevelopmentIdentity{
+	admin := platform.NewAdminHandler(platform.NewInMemoryControlPlane(), platform.DevelopmentIdentity{
 		ID: "developer", Assignments: []platform.TenantAssignment{{TenantID: "tenant-a", Role: platform.RolePlatformAdmin}},
 	})
 	handler := NewStage1Handler(platform.EchoRunner{}, platform.TenantContext{TenantID: "baseline"}, lifecycle.New(), admin)

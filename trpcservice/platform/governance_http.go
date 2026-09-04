@@ -86,7 +86,7 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 	switch r.Method {
 	case http.MethodGet:
 		appID := strings.TrimSpace(r.URL.Query().Get("app_id"))
-		policy, found := h.governance.Policy(tenant.TenantID, appID)
+		policy, found := h.governance.Policy(r.Context(), tenant.TenantID, appID)
 		if !found {
 			writeError(w, http.StatusNotFound, "policy_not_found", "governance policy was not found")
 			return
@@ -102,12 +102,12 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
 			return
 		}
-		if _, found := h.platform.app(tenant.TenantID, policy.AgentAppID); !found {
+		if _, found := h.platform.app(r.Context(), tenant.TenantID, policy.AgentAppID); !found {
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
 		policy.TenantID = tenant.TenantID
-		if existing, found := h.governance.Policy(tenant.TenantID, policy.AgentAppID); found {
+		if existing, found := h.governance.Policy(r.Context(), tenant.TenantID, policy.AgentAppID); found {
 			replacements := []string{}
 			for _, value := range policy.RedactedPatterns {
 				if value != "[REDACTED]" {
@@ -227,7 +227,7 @@ func (h *AdminHandler) finalizeRejectedConfirmation(ctx context.Context, confirm
 	}); err != nil {
 		return err
 	}
-	store, release, err := h.acquireStore(confirmation.TenantID)
+	store, release, err := h.acquireStore(ctx, confirmation.TenantID)
 	if err != nil {
 		return err
 	}
@@ -241,7 +241,7 @@ func (h *AdminHandler) finalizeRejectedConfirmation(ctx context.Context, confirm
 }
 
 func (h *AdminHandler) appendConfirmationSessionEvent(ctx context.Context, confirmation ToolConfirmation) error {
-	store, release, err := h.acquireStore(confirmation.TenantID)
+	store, release, err := h.acquireStore(ctx, confirmation.TenantID)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,9 +10,64 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+type cancellationObservingControlPlanePersistence struct {
+	entered    chan struct{}
+	canceled   chan struct{}
+	enterOnce  sync.Once
+	cancelOnce sync.Once
+}
+
+func (p *cancellationObservingControlPlanePersistence) Load(ctx context.Context) (controlPlaneSnapshot, int64, error) {
+	p.enterOnce.Do(func() { close(p.entered) })
+	<-ctx.Done()
+	p.cancelOnce.Do(func() { close(p.canceled) })
+	return controlPlaneSnapshot{}, 0, ctx.Err()
+}
+
+func (*cancellationObservingControlPlanePersistence) Save(context.Context, controlPlaneSnapshot, int64) (int64, error) {
+	return 0, nil
+}
+
+func (*cancellationObservingControlPlanePersistence) Close() error { return nil }
+
+func TestControlPlaneLoadStopsWhenHTTPRequestIsCanceled(t *testing.T) {
+	platform := NewInMemoryControlPlane()
+	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
+	defer handler.Close()
+	persistence := &cancellationObservingControlPlanePersistence{entered: make(chan struct{}), canceled: make(chan struct{})}
+	platform.persistence = persistence
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/agent-apps", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(done)
+	}()
+
+	select {
+	case <-persistence.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Control Plane load did not start")
+	}
+	cancel()
+	select {
+	case <-persistence.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("Control Plane load did not receive request cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request did not return after cancellation")
+	}
+}
 
 func TestSQLiteControlPlaneSurvivesGatewayRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "control-plane.db")

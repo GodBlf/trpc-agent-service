@@ -98,7 +98,7 @@ func (h *AdminHandler) handleAgentApps(w http.ResponseWriter, r *http.Request, p
 	if len(parts) == 0 {
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listApps(tenant.TenantID)})
+			writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listApps(r.Context(), tenant.TenantID)})
 		case http.MethodPost:
 			if !canMutate(tenant.Role) {
 				writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
@@ -114,7 +114,7 @@ func (h *AdminHandler) handleAgentApps(w http.ResponseWriter, r *http.Request, p
 				return
 			}
 			app := AgentApp{ID: request.ID, TenantID: tenant.TenantID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
-			if !h.platform.createApp(app) {
+			if !h.platform.createApp(r.Context(), app) {
 				writeError(w, http.StatusConflict, "agent_app_exists", "Agent App identifier already exists in this tenant")
 				return
 			}
@@ -128,7 +128,7 @@ func (h *AdminHandler) handleAgentApps(w http.ResponseWriter, r *http.Request, p
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 		return
 	}
-	app, exists := h.platform.app(tenant.TenantID, parts[0])
+	app, exists := h.platform.app(r.Context(), tenant.TenantID, parts[0])
 	if !exists {
 		writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 		return
@@ -138,10 +138,10 @@ func (h *AdminHandler) handleAgentApps(w http.ResponseWriter, r *http.Request, p
 
 func resourceKey(tenantID, id string) string { return tenantID + "\x00" + id }
 
-func (p *MemoryPlatform) createApp(app AgentApp) bool {
+func (p *SnapshotControlPlane) createApp(ctx context.Context, app AgentApp) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return false
 	}
 	key := resourceKey(app.TenantID, app.ID)
@@ -149,23 +149,23 @@ func (p *MemoryPlatform) createApp(app AgentApp) bool {
 		return false
 	}
 	p.apps[key] = app
-	return p.persistLocked()
+	return p.persistLockedContext(ctx)
 }
 
-func (p *MemoryPlatform) app(tenantID, id string) (AgentApp, bool) {
+func (p *SnapshotControlPlane) app(ctx context.Context, tenantID, id string) (AgentApp, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return AgentApp{}, false
 	}
 	app, ok := p.apps[resourceKey(tenantID, id)]
 	return app, ok
 }
 
-func (p *MemoryPlatform) listApps(tenantID string) []AgentApp {
+func (p *SnapshotControlPlane) listApps(ctx context.Context, tenantID string) []AgentApp {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLocked()
+	p.refreshLockedContext(ctx)
 	items := make([]AgentApp, 0)
 	for _, app := range p.apps {
 		if app.TenantID == tenantID {
@@ -186,7 +186,7 @@ func (h *AdminHandler) handleDeployments(w http.ResponseWriter, r *http.Request,
 		h.handleDeploymentCollection(w, r, tenant)
 		return
 	}
-	deployment, exists := h.platform.deployment(tenant.TenantID, parts[0])
+	deployment, exists := h.platform.deployment(r.Context(), tenant.TenantID, parts[0])
 	if !exists {
 		writeError(w, http.StatusNotFound, "deployment_not_found", "Deployment was not found")
 		return
@@ -241,7 +241,7 @@ func (h *AdminHandler) handleDeploymentRollout(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
-	updated, code, ok := h.platform.startRollout(deployment, request.TargetVersionID, request.GrayPercentage)
+	updated, code, ok := h.platform.startRollout(r.Context(), deployment, request.TargetVersionID, request.GrayPercentage)
 	if !ok {
 		writeError(w, http.StatusConflict, code, "Deployment rollout is not allowed")
 		return
@@ -254,7 +254,7 @@ func (h *AdminHandler) handleRollbackPreview(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 		return
 	}
-	preview, code, ok := h.platform.rollbackPreview(deployment)
+	preview, code, ok := h.platform.rollbackPreview(r.Context(), deployment)
 	if !ok {
 		writeError(w, http.StatusConflict, code, "Deployment rollback preview is unavailable")
 		return
@@ -285,7 +285,7 @@ func (h *AdminHandler) handleRollback(w http.ResponseWriter, r *http.Request, te
 		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
-	updated, code, ok := h.platform.rollback(deployment)
+	updated, code, ok := h.platform.rollback(r.Context(), deployment)
 	if !ok {
 		writeError(w, http.StatusConflict, code, "Deployment rollback is not allowed")
 		return
@@ -309,7 +309,7 @@ func (h *AdminHandler) recordDeploymentOperation(r *http.Request, tenant TenantC
 func (h *AdminHandler) handleDeploymentCollection(w http.ResponseWriter, r *http.Request, tenant TenantContext) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listDeployments(tenant.TenantID)})
+		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listDeployments(r.Context(), tenant.TenantID)})
 	case http.MethodPost:
 		if !canMutate(tenant.Role) {
 			writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
@@ -323,12 +323,12 @@ func (h *AdminHandler) handleDeploymentCollection(w http.ResponseWriter, r *http
 			writeError(w, http.StatusBadRequest, "invalid_deployment", "id and agent_app_id must be valid")
 			return
 		}
-		if _, exists := h.platform.app(tenant.TenantID, request.AgentAppID); !exists {
+		if _, exists := h.platform.app(r.Context(), tenant.TenantID, request.AgentAppID); !exists {
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
 		deployment := Deployment{ID: request.ID, TenantID: tenant.TenantID, AgentAppID: request.AgentAppID, Status: DeploymentDraft, DesiredReplicas: 1, CreatedAt: time.Now().UTC()}
-		if !h.platform.createDeployment(deployment) {
+		if !h.platform.createDeployment(r.Context(), deployment) {
 			writeError(w, http.StatusConflict, "deployment_exists", "Deployment identifier already exists")
 			return
 		}
@@ -351,7 +351,7 @@ func (h *AdminHandler) handleVersions(w http.ResponseWriter, r *http.Request, te
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listVersions(tenant.TenantID, deployment.ID)})
+		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listVersions(r.Context(), tenant.TenantID, deployment.ID)})
 	case http.MethodPost:
 		if !canMutate(tenant.Role) {
 			writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
@@ -373,7 +373,7 @@ func (h *AdminHandler) handleVersions(w http.ResponseWriter, r *http.Request, te
 			writeError(w, http.StatusBadRequest, "invalid_deployment_config", "config must be a non-empty JSON object")
 			return
 		}
-		version, code, ok := h.platform.createVersion(deployment, idempotencyKey, request.Config)
+		version, code, ok := h.platform.createVersion(r.Context(), deployment, idempotencyKey, request.Config)
 		if !ok {
 			writeError(w, http.StatusConflict, code, "Idempotency-Key was already used with different configuration")
 			return
@@ -413,7 +413,7 @@ func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "invalid_transition", "status is required")
 		return
 	}
-	updated, code, ok := h.platform.transition(deployment, request.Status, request.VersionID)
+	updated, code, ok := h.platform.transition(r.Context(), deployment, request.Status, request.VersionID)
 	if !ok {
 		message := "Deployment lifecycle transition is not allowed"
 		if code == "agent_app_already_has_active_deployment" {
@@ -431,10 +431,10 @@ func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusOK, updated)
 }
 
-func (p *MemoryPlatform) createDeployment(deployment Deployment) bool {
+func (p *SnapshotControlPlane) createDeployment(ctx context.Context, deployment Deployment) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -442,23 +442,23 @@ func (p *MemoryPlatform) createDeployment(deployment Deployment) bool {
 		return false
 	}
 	p.deployments[key] = deployment
-	return p.persistLocked()
+	return p.persistLockedContext(ctx)
 }
 
-func (p *MemoryPlatform) deployment(tenantID, id string) (Deployment, bool) {
+func (p *SnapshotControlPlane) deployment(ctx context.Context, tenantID, id string) (Deployment, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return Deployment{}, false
 	}
 	deployment, ok := p.deployments[resourceKey(tenantID, id)]
 	return deployment, ok
 }
 
-func (p *MemoryPlatform) listDeployments(tenantID string) []Deployment {
+func (p *SnapshotControlPlane) listDeployments(ctx context.Context, tenantID string) []Deployment {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLocked()
+	p.refreshLockedContext(ctx)
 	items := []Deployment{}
 	for _, item := range p.deployments {
 		if item.TenantID == tenantID {
@@ -469,11 +469,11 @@ func (p *MemoryPlatform) listDeployments(tenantID string) []Deployment {
 	return items
 }
 
-func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey string, config map[string]any) (DeploymentVersion, string, bool) {
+func (p *SnapshotControlPlane) createVersion(ctx context.Context, deployment Deployment, idempotencyKey string, config map[string]any) (DeploymentVersion, string, bool) {
 	canonical, _ := json.Marshal(config)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return DeploymentVersion{}, "control_plane_unavailable", false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -490,7 +490,7 @@ func (p *MemoryPlatform) createVersion(deployment Deployment, idempotencyKey str
 	version := DeploymentVersion{ID: fmt.Sprintf("%s-v%d", deployment.ID, number), TenantID: deployment.TenantID, AgentAppID: deployment.AgentAppID, DeploymentID: deployment.ID, Number: number, Config: cloneConfig(config), CreatedAt: time.Now().UTC()}
 	p.versions[key] = append(p.versions[key], version)
 	p.versionCreations[creationKey] = versionCreation{config: string(canonical), version: version}
-	if !p.persistLocked() {
+	if !p.persistLockedContext(ctx) {
 		return DeploymentVersion{}, "control_plane_unavailable", false
 	}
 	version.Config = cloneConfig(version.Config)
@@ -504,10 +504,10 @@ func cloneConfig(config map[string]any) map[string]any {
 	return result
 }
 
-func (p *MemoryPlatform) listVersions(tenantID, deploymentID string) []DeploymentVersion {
+func (p *SnapshotControlPlane) listVersions(ctx context.Context, tenantID, deploymentID string) []DeploymentVersion {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLocked()
+	p.refreshLockedContext(ctx)
 	source := p.versions[resourceKey(tenantID, deploymentID)]
 	items := make([]DeploymentVersion, len(source))
 	for i, version := range source {
@@ -517,10 +517,10 @@ func (p *MemoryPlatform) listVersions(tenantID, deploymentID string) []Deploymen
 	return items
 }
 
-func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus, versionID string) (Deployment, string, bool) {
+func (p *SnapshotControlPlane) transition(ctx context.Context, deployment Deployment, next DeploymentStatus, versionID string) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -551,16 +551,16 @@ func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus
 	}
 	current.Status = next
 	p.deployments[key] = current
-	if !p.persistLocked() {
+	if !p.persistLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	return current, "", true
 }
 
-func (p *MemoryPlatform) startRollout(deployment Deployment, targetVersionID string, grayPercentage int) (Deployment, string, bool) {
+func (p *SnapshotControlPlane) startRollout(ctx context.Context, deployment Deployment, targetVersionID string, grayPercentage int) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -589,16 +589,16 @@ func (p *MemoryPlatform) startRollout(deployment Deployment, targetVersionID str
 		current.RolloutStatus = DeploymentRolloutCompleted
 	}
 	p.deployments[key] = current
-	if !p.persistLocked() {
+	if !p.persistLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	return current, "", true
 }
 
-func (p *MemoryPlatform) rollbackPreview(deployment Deployment) (DeploymentRollbackPreview, string, bool) {
+func (p *SnapshotControlPlane) rollbackPreview(ctx context.Context, deployment Deployment) (DeploymentRollbackPreview, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return DeploymentRollbackPreview{}, "control_plane_unavailable", false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -613,10 +613,10 @@ func (p *MemoryPlatform) rollbackPreview(deployment Deployment) (DeploymentRollb
 	}, "", true
 }
 
-func (p *MemoryPlatform) rollback(deployment Deployment) (Deployment, string, bool) {
+func (p *SnapshotControlPlane) rollback(ctx context.Context, deployment Deployment) (Deployment, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.refreshLocked() {
+	if !p.refreshLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	key := resourceKey(deployment.TenantID, deployment.ID)
@@ -630,13 +630,13 @@ func (p *MemoryPlatform) rollback(deployment Deployment) (Deployment, string, bo
 	current.GrayPercentage = 100
 	current.RolloutStatus = DeploymentRolloutCompleted
 	p.deployments[key] = current
-	if !p.persistLocked() {
+	if !p.persistLockedContext(ctx) {
 		return Deployment{}, "control_plane_unavailable", false
 	}
 	return current, "", true
 }
 
-func (p *MemoryPlatform) hasVersionLocked(key, versionID string) bool {
+func (p *SnapshotControlPlane) hasVersionLocked(key, versionID string) bool {
 	if versionID == "" {
 		return false
 	}

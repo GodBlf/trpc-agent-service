@@ -28,3 +28,4 @@ Bounded Shutdown And Recovery.
 ## Comments
 
 中文交付物已由 `./scripts/verify-docs.sh` 校验，架构、数据模型和存储策略与实现一致。
+企业微信核心时序已补齐执行期 Memory 写入：最终回复在 IM 回复前写入 `latest_agent_reply`，携带 fencing token；单测和双 Gateway Compose 均从公开 Memory API 验证该结果。

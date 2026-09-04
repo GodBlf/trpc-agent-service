@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -30,10 +31,10 @@ func TestBackendSelectionWaitsForAcquiredLease(t *testing.T) {
 	tracked := &closeTrackingStore{DataStore: NewInMemoryStore(), closed: make(chan struct{})}
 	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RolePlatformAdmin}}})
 	defer handler.Close()
-	if err := handler.selectBackend("tenant-a", backendSelection{Backend: "inmemory"}, tracked); err != nil {
+	if err := handler.selectBackend(context.Background(), "tenant-a", backendSelection{Backend: "inmemory"}, tracked); err != nil {
 		t.Fatal(err)
 	}
-	_, release, err := handler.acquireStore("tenant-a")
+	_, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestConcurrentBackendSelectionsPersistOneFinalSelection(t *testing.T) {
 			if i == 0 {
 				selection.Address = "first"
 			}
-			if err := handler.selectBackend("tenant-a", selection, NewInMemoryStore()); err != nil {
+			if err := handler.selectBackend(context.Background(), "tenant-a", selection, NewInMemoryStore()); err != nil {
 				t.Errorf("selectBackend: %v", err)
 			}
 		}(i)

@@ -15,7 +15,10 @@ type governancePolicyStoreFixture struct {
 	loadErr  error
 }
 
-func (s *governancePolicyStoreFixture) loadGovernancePolicies() (map[string]TenantPolicy, error) {
+func (s *governancePolicyStoreFixture) loadGovernancePolicies(ctx context.Context) (map[string]TenantPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.loadErr != nil {
 		return nil, s.loadErr
 	}
@@ -26,7 +29,10 @@ func (s *governancePolicyStoreFixture) loadGovernancePolicies() (map[string]Tena
 	return result, nil
 }
 
-func (s *governancePolicyStoreFixture) saveGovernancePolicy(policy TenantPolicy) (TenantPolicy, error) {
+func (s *governancePolicyStoreFixture) saveGovernancePolicy(ctx context.Context, policy TenantPolicy) (TenantPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return TenantPolicy{}, err
+	}
 	if s.policies == nil {
 		s.policies = make(map[string]TenantPolicy)
 	}
@@ -50,7 +56,7 @@ func TestGovernancePolicyStoreImportsLegacyLocalPolicies(t *testing.T) {
 	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
 		t.Fatalf("imported policy = %#v, found = %v", policy, found)
 	}
-	if active, found := center.Policy("tenant-a", "app-a"); !found || active.Revision != 1 {
+	if active, found := center.Policy(context.Background(), "tenant-a", "app-a"); !found || active.Revision != 1 {
 		t.Fatalf("active policy = %#v, found = %v", active, found)
 	}
 }
@@ -81,7 +87,7 @@ func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a"}); err == nil {
 		t.Fatal("policy update succeeded without durable audit")
 	}
-	if _, found := center.Policy("tenant-a", "app-a"); found {
+	if _, found := center.Policy(context.Background(), "tenant-a", "app-a"); found {
 		t.Fatal("failed policy update remained active in memory")
 	}
 	center.policies[governanceKey("tenant-a", "app-a")] = TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", Revision: 1}
@@ -133,7 +139,7 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, found := reloaded.Policy("tenant-a", "app-a")
+	policy, found := reloaded.Policy(context.Background(), "tenant-a", "app-a")
 	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
 		t.Fatalf("policy = %#v, found = %v", policy, found)
 	}

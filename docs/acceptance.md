@@ -41,6 +41,7 @@ Stage 7 是本项目最后一个交付阶段，不存在后续验收阶段。验
 | 签名远程 Worker | `TestRemoteWorker*`、`TestExecutionManifest*` | 身份/version/trace 贯穿；篡改、过期、未知 key 拒绝 |
 | 危险 Tool | governance、remote Tool tests、Stage 7 Compose | approve/重复 approve、reject/重复 reject、Governance outage fail-closed、Worker 断连转 outcome_unknown 且不自动 replay |
 | Memory/Knowledge | `TestMemoryKnowledgeArtifactAndTraceCompletePublicWorkflow` | 权威记录影响后续 Runner 输入，跨 Tenant 空集合 |
+| IM 执行写 Memory | `TestChatChannelPersistsCompletedReplyAsMemory` | 最终回复在 IM 回复前写入稳定键并携带 fencing token |
 | Artifact/Audit/Trace | 同上及 governance HTTP tests | request/trace 关联，跨 Tenant 不可见 |
 | 有界关闭 | lifecycle/runtime/web tests | readiness 先撤、Wait 无泄漏、超时 Worker 退役 |
 | 故障恢复矩阵 | Stage 7 Compose | Worker loss/recovery、PostgreSQL outage/recovery、模型 timeout、Tool failure、Governance outage、IM retry/duplicate 都按指定 request_id 检查精确终态 |

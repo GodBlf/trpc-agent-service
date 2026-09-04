@@ -41,8 +41,8 @@ type controlPlanePersistence interface {
 	Close() error
 }
 
-func controlPlaneOperationContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), controlPlaneOperationTimeout)
+func controlPlaneOperationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, controlPlaneOperationTimeout)
 }
 
 type sqliteControlPlanePersistence struct{ db *sql.DB }
@@ -63,7 +63,7 @@ func MigrateSQLiteControlPlane(path string) error {
 		return fmt.Errorf("open control plane: %w", err)
 	}
 	defer db.Close()
-	ctx, cancel := controlPlaneOperationContext()
+	ctx, cancel := controlPlaneOperationContext(context.Background())
 	defer cancel()
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
@@ -87,7 +87,7 @@ func MigratePostgresControlPlane(dsn string) error {
 		return fmt.Errorf("open control plane: %w", err)
 	}
 	defer db.Close()
-	ctx, cancel := controlPlaneOperationContext()
+	ctx, cancel := controlPlaneOperationContext(context.Background())
 	defer cancel()
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
@@ -110,7 +110,7 @@ func NewSQLiteControlPlane(path string) (ControlPlaneStore, error) {
 		return nil, fmt.Errorf("open control plane: %w", err)
 	}
 	var version int
-	ctx, cancel := controlPlaneOperationContext()
+	ctx, cancel := controlPlaneOperationContext(context.Background())
 	defer cancel()
 	if err := db.QueryRowContext(ctx, `SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
 		db.Close()
@@ -120,7 +120,7 @@ func NewSQLiteControlPlane(path string) (ControlPlaneStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("control plane schema version %d is incompatible with required version %d", version, ControlPlaneSchemaVersion)
 	}
-	platform := NewMemoryPlatform()
+	platform := NewInMemoryControlPlane()
 	persistence := &sqliteControlPlanePersistence{db: db}
 	snapshot, revision, err := persistence.Load(ctx)
 	if err != nil {
@@ -139,7 +139,7 @@ func NewPostgresControlPlane(dsn string) (ControlPlaneStore, error) {
 		return nil, fmt.Errorf("open control plane: %w", err)
 	}
 	var version int
-	ctx, cancel := controlPlaneOperationContext()
+	ctx, cancel := controlPlaneOperationContext(context.Background())
 	defer cancel()
 	if err := db.QueryRowContext(ctx, `SELECT version FROM control_plane_schema WHERE singleton = 1`).Scan(&version); err != nil {
 		db.Close()
@@ -154,8 +154,8 @@ func NewPostgresControlPlane(dsn string) (ControlPlaneStore, error) {
 }
 
 func loadPersistentControlPlane(persistence controlPlanePersistence) (ControlPlaneStore, error) {
-	platform := NewMemoryPlatform()
-	ctx, cancel := controlPlaneOperationContext()
+	platform := NewInMemoryControlPlane()
+	ctx, cancel := controlPlaneOperationContext(context.Background())
 	defer cancel()
 	snapshot, revision, err := persistence.Load(ctx)
 	if err != nil {
@@ -248,7 +248,7 @@ func (p *postgresControlPlanePersistence) Save(ctx context.Context, snapshot con
 
 func (p *postgresControlPlanePersistence) Close() error { return p.db.Close() }
 
-func controlPlaneSnapshotFrom(platform *MemoryPlatform) controlPlaneSnapshot {
+func controlPlaneSnapshotFrom(platform *SnapshotControlPlane) controlPlaneSnapshot {
 	snapshot := controlPlaneSnapshot{
 		Tenants: platform.tenants, Apps: platform.apps, Deployments: platform.deployments,
 		Versions:           platform.versions,
@@ -266,7 +266,7 @@ func controlPlaneSnapshotFrom(platform *MemoryPlatform) controlPlaneSnapshot {
 	return snapshot
 }
 
-func applyControlPlaneSnapshot(platform *MemoryPlatform, snapshot controlPlaneSnapshot) {
+func applyControlPlaneSnapshot(platform *SnapshotControlPlane, snapshot controlPlaneSnapshot) {
 	if snapshot.Tenants != nil {
 		platform.tenants = snapshot.Tenants
 	}

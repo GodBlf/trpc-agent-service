@@ -220,7 +220,7 @@ func TestChatReplayResumesInterruptedRun(t *testing.T) {
 			client.activateApp("app-one", "deploy-one")
 			client.post("/api/v1/chat/sessions", `{"app_id":"app-one","session_id":"session-one"}`, nil, http.StatusCreated, nil)
 
-			store, releaseStore, err := client.handler.acquireStore("tenant-one")
+			store, releaseStore, err := client.handler.acquireStore(context.Background(), "tenant-one")
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -31,7 +31,7 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
 		return
@@ -119,7 +119,7 @@ func (h *AdminHandler) handleKnowledgeData(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, "invalid_knowledge", "Knowledge record is invalid")
 			return
 		}
-		if _, found := h.platform.app(tenant.TenantID, item.AgentAppID); !found {
+		if _, found := h.platform.app(r.Context(), tenant.TenantID, item.AgentAppID); !found {
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -181,7 +181,7 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusBadRequest, "invalid_backend", "backend is not available")
 		return
 	}
-	if err := h.selectBackend(tenant.TenantID, selection, store); err != nil {
+	if err := h.selectBackend(r.Context(), tenant.TenantID, selection, store); err != nil {
 		if closer, ok := store.(interface{ Close() error }); ok {
 			_ = closer.Close()
 		}

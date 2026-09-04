@@ -241,6 +241,8 @@ expect 200 "$(request a "$COOKIE_A" POST /api/v1/chat/mock/faults '{"scenario":"
 # header for request identity.
 curl --silent --show-error --fail --max-time 15 -b "$COOKIE_A" -H 'X-Gateway: a' -H 'Content-Type: application/json' -H "X-Mock-Signature: $SIGNATURE" -d "$CALLBACK_BODY" "$BASE_URL/api/v1/chat/channels/mock/callback" >"$RESPONSE"
 wait_request_event a "$COOKIE_A" session-im channel-stage7-message channel.delivery
+expect 200 "$(request b "$COOKIE_B" GET /api/v1/admin/memory/session-im)" read-im-memory-from-b
+jq -e '.items[] | select(.key == "latest_agent_reply" and .value == "framework:im retry" and .fencing_token > 0)' "$RESPONSE" >/dev/null
 expect 200 "$(request a "$COOKIE_A" POST /api/v1/chat/mock/faults '{"scenario":"none","session_id":"session-im"}')" clear-im-retry
 curl --silent --show-error --fail --max-time 15 -b "$COOKIE_A" -H 'X-Gateway: a' -H 'Content-Type: application/json' -H "X-Mock-Signature: $SIGNATURE" -d "$CALLBACK_BODY" "$BASE_URL/api/v1/chat/channels/mock/callback" >"$RESPONSE"
 request a "$COOKIE_A" GET /api/v1/admin/sessions/session-im/events >/dev/null
