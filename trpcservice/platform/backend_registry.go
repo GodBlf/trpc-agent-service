@@ -177,6 +177,8 @@ func newBackendStore(selection backendSelection) (DataStore, error) {
 		return NewRedisStore(selection.Address), nil
 	case "sqlite":
 		return NewSQLiteStore(selection.Address)
+	case "postgres":
+		return NewPostgresStore(selection.Address)
 	default:
 		return nil, errors.New("platform: unsupported backend")
 	}

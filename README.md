@@ -163,7 +163,7 @@ npm run dev
 
 ## 当前实现能力
 
-当前代码已覆盖到 Stage 5 的本地可运行验收范围：
+当前代码已覆盖到 Stage 6 的本地可运行验收范围：
 
 - **多租户管理**：Development Identity、租户切换、Agent 应用、部署版本与状态流转、Gateway/Worker 状态。
 - **存储与数据管理**：租户级 InMemory/Redis/SQLite/PostgreSQL 后端选择、事件回放、迁移与数据检查页面。
@@ -174,12 +174,17 @@ npm run dev
 - **生产身份与授权**：显式 production 模式验证 HS256 JWT 的签名、issuer、audience、expiry 和 subject，并只接受服务端 Identity Directory 中的 Tenant/Role 分配；Management Console 使用短期 HttpOnly Session。
 - **治理与安全**：Tenant/Agent App 策略覆盖 Tool/MCP allowlist、输入输出 Guardrail、危险 Tool 二次确认、外部 IM 用户/会话授权、脱敏、预算和 Tenant 限流，并在 Runner 执行前生效。
 - **审计与可观测性**：提供持久化 Audit Event 查询、Tenant 指标与成本、以及按 `request_id`/`trace_id` 检索的完整平台链路视图；管理界面提供策略、确认、审计和指标/Trace 工作流。
+- **Gateway/Worker 部署**：`TRPC_SERVICE_ROLE` 支持独立 Gateway/Worker 进程；Worker 内部接口使用 Bearer Token，并校验 Gateway 解析出的 Tenant/App/Deployment/Version 身份与不可变 Version 配置。
+- **故障恢复与运维**：优雅排水、组件与依赖健康、服务端运行超时、存储超时/不可用/关闭分类、Worker/依赖重启恢复、事件排水和终端事件唯一性。
+- **灰度与容量**：Deployment 灰度状态、确定性请求路由、回滚预览/确认和有界确定性容量评估；高风险操作均要求角色、确认和 Audit Event。
+- **Compose 恢复证据**：一键从零启动 Gateway/Worker/Redis/PostgreSQL，并复现 Worker 重启、PostgreSQL 中断、Runner/Tool 故障、IM 重试与重复回调、灰度回滚、容量和排水恢复。
 
 企微不使用自建应用，不接受 CorpID、AgentID、应用 Secret、Access Token、EncodingAESKey 或传统 HTTP 回调配置。真实凭据仅从被忽略的 `.env.local` 读取；自动化验收使用本地协议 fixture，不消费真实消息。
 
 Stage 5 配置、接口、安全语义与已知限制见 [`docs/stage-5-governance.md`](docs/stage-5-governance.md)。
+Stage 6 运维、Compose 恢复、Kubernetes 指南、风险清单与已知限制见 [`docs/stage-6-operations.md`](docs/stage-6-operations.md)。
 
-阶段 5 验证命令：
+阶段 6 验证命令：
 
 ```bash
 go test ./...
@@ -190,6 +195,13 @@ npm run typecheck
 npm test
 npm run build
 npm run test:e2e
+```
+
+Compose 验证命令：
+
+```bash
+./scripts/stage6-compose-smoke.sh
+./scripts/stage6-compose-recovery.sh
 ```
 
 `build.sh` 要求已安装 Node.js、npm 和前端依赖，依次构建 React 前端和 Go 二进制。生产前端资源会嵌入 `bin/trpc-service`，不需要单独部署静态站点。

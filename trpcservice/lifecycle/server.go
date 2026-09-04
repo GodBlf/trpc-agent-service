@@ -16,6 +16,7 @@ type Service struct {
 	done     chan struct{}
 	wg       sync.WaitGroup
 	shutdown sync.Once
+	cancel   sync.Once
 }
 
 func New() *Service { return &Service{done: make(chan struct{})} }
@@ -36,12 +37,26 @@ func (s *Service) Acquire() (release func(), ok bool) {
 // Shutdown stops new work and waits for active work until ctx expires.
 // Repeated calls are safe; each call observes the same completion state.
 func (s *Service) Shutdown(ctx context.Context) error {
-	s.shutdown.Do(func() {
+	s.BeginShutdown()
+	s.cancel.Do(func() {
 		s.mu.Lock()
-		s.closing = true
 		close(s.done)
 		s.mu.Unlock()
 	})
+	return s.Wait(ctx)
+}
+
+// BeginShutdown stops new work without waiting for active work.
+func (s *Service) BeginShutdown() {
+	s.shutdown.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		s.mu.Unlock()
+	})
+}
+
+// Wait waits for all already-registered work to finish until ctx expires.
+func (s *Service) Wait(ctx context.Context) error {
 	finished := make(chan struct{})
 	go func() { s.wg.Wait(); close(finished) }()
 	select {

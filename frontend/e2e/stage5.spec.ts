@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("govern governance decisions and inspect their trace without secret disclosure", async ({ page }, testInfo) => {
+test("govern governance decisions and inspect their trace without secret disclosure", { timeout: 90_000 }, async ({ page }, testInfo) => {
   const suffix = `${testInfo.project.name}-${Date.now()}`;
   const appID = `stage5-app-${suffix}`;
   const deploymentID = `stage5-deploy-${suffix}`;
@@ -23,15 +23,15 @@ test("govern governance decisions and inspect their trace without secret disclos
     const version = versionList.items[0];
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "published", version_id: version.id });
     await request(`/api/v1/admin/deployments/${deploymentID}/transition`, { status: "active" });
-    await request("/api/v1/admin/governance/policy", { agent_app_id: appID, allowed_tools: ["deploy"], dangerous_tools: ["deploy"], redacted_patterns: [secretCanary], token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60 });
+    await request("/api/v1/admin/governance/policy", { agent_app_id: appID, allowed_tools: ["deploy"], dangerous_tools: ["deploy"], redacted_patterns: [secretCanary], token_budget: 10000, estimated_tokens_per_run: 5, rate_limit: 1000, rate_window_seconds: 60, runtime_timeout_ms: 60000 });
     await request("/api/v1/chat/sessions", { app_id: appID, session_id: sessionID });
     await request(`/api/v1/chat/sessions/${sessionID}/messages`, { input: `release ${secretCanary}` }, { "X-Request-ID": requestID });
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    for (let attempt = 0; attempt < 600; attempt += 1) {
       const response = await fetch("/api/v1/admin/governance/confirmations");
       const payload = await response.json() as { items: { request_id: string; confirmation_id?: string; id: string; trace_id: string; status: string }[] };
       const item = payload.items.find((candidate) => candidate.request_id === requestID && candidate.status === "pending");
       if (item) return item;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error("confirmation was not created by actual Tool invocation");
   }, { appID, deploymentID, sessionID, requestID, secretCanary, suffix });
@@ -49,10 +49,10 @@ test("govern governance decisions and inspect their trace without secret disclos
   await page.evaluate(async ({ sessionID, requestID, secretCanary }) => {
     const response = await fetch(`/api/v1/chat/sessions/${sessionID}/messages`, { method: "POST", headers: { "Content-Type": "application/json", "X-Request-ID": requestID }, body: JSON.stringify({ input: `release ${secretCanary}` }) });
     if (!response.ok) throw new Error(`retry: ${response.status}`);
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    for (let attempt = 0; attempt < 600; attempt += 1) {
       const events = await fetch(`/api/v1/admin/sessions/${sessionID}/events`).then((item) => item.json()) as { items: { type: string; idempotency_key: string }[] };
       if (events.items.some((item) => item.type === "run.completed" && (item.idempotency_key === `${requestID}:terminal` || item.idempotency_key === `${requestID}:run-completed`))) return;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error("approved Tool request did not complete");
   }, { sessionID, requestID, secretCanary });

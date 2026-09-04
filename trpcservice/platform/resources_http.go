@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,6 +38,30 @@ func (h *AdminHandler) handleAdminResource(w http.ResponseWriter, r *http.Reques
 			h.handleRuntimeStatus(w, trusted)
 			return true
 		}
+	case "operations":
+		if len(parts) == 2 {
+			tenant, ok := trustedTenant(trusted)
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "identity_required", "authenticated identity is required")
+				return true
+			}
+			if parts[1] == "drain" {
+				h.handleOperationsDrain(w, r, tenant)
+				return true
+			}
+			if parts[1] == "faults" {
+				h.handleOperationsFaults(w, r, tenant)
+				return true
+			}
+		}
+	case "capacity":
+		trustedTenantContext, ok := trustedTenant(trusted)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "identity_required", "authenticated identity is required")
+			return true
+		}
+		h.handleCapacity(w, r, trustedTenantContext, parts[1:])
+		return true
 	}
 	return false
 }
@@ -172,9 +197,106 @@ func (h *AdminHandler) handleDeployments(w http.ResponseWriter, r *http.Request,
 		h.handleVersions(w, r, tenant, deployment, parts[2:])
 	case "transition":
 		h.handleTransition(w, r, tenant, deployment)
+	case "rollout":
+		h.handleDeploymentRollout(w, r, tenant, deployment)
+	case "rollback-preview":
+		h.handleRollbackPreview(w, r, tenant, deployment)
+	case "rollback":
+		h.handleRollback(w, r, tenant, deployment)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "resource was not found")
 	}
+}
+
+func (h *AdminHandler) handleDeploymentRollout(w http.ResponseWriter, r *http.Request, tenant TenantContext, deployment Deployment) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, deployment)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
+		return
+	}
+	if !canOperate(tenant.Role) {
+		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
+		return
+	}
+	var request struct {
+		TargetVersionID string `json:"target_version_id"`
+		GrayPercentage  int    `json:"gray_percentage"`
+		Confirm         bool   `json:"confirm"`
+	}
+	if err := decodeStrict(r, &request); err != nil || !request.Confirm {
+		writeError(w, http.StatusBadRequest, "rollout_confirmation_required", "target version and confirmation are required")
+		return
+	}
+	if err := h.recordDeploymentOperation(r, tenant, "deployment.rollout.updated"); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
+	updated, code, ok := h.platform.startRollout(deployment, request.TargetVersionID, request.GrayPercentage)
+	if !ok {
+		writeError(w, http.StatusConflict, code, "Deployment rollout is not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (h *AdminHandler) handleRollbackPreview(w http.ResponseWriter, r *http.Request, tenant TenantContext, deployment Deployment) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		return
+	}
+	preview, code, ok := h.platform.rollbackPreview(deployment)
+	if !ok {
+		writeError(w, http.StatusConflict, code, "Deployment rollback preview is unavailable")
+		return
+	}
+	if runtimeStatus := h.runtime.StatusFor(tenant); len(runtimeStatus) > 0 {
+		preview.ActiveExecutions = runtimeStatus[0].Active
+	}
+	writeJSON(w, http.StatusOK, preview)
+}
+
+func (h *AdminHandler) handleRollback(w http.ResponseWriter, r *http.Request, tenant TenantContext, deployment Deployment) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
+		return
+	}
+	if !canOperate(tenant.Role) {
+		writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
+		return
+	}
+	var request struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := decodeStrict(r, &request); err != nil || !request.Confirm {
+		writeError(w, http.StatusBadRequest, "rollback_confirmation_required", "rollback confirmation is required")
+		return
+	}
+	if err := h.recordDeploymentOperation(r, tenant, "deployment.rollback.confirmed"); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
+	updated, code, ok := h.platform.rollback(deployment)
+	if !ok {
+		writeError(w, http.StatusConflict, code, "Deployment rollback is not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (h *AdminHandler) recordDeploymentOperation(r *http.Request, tenant TenantContext, decision string) error {
+	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	if !validIdempotencyKey(requestID) {
+		requestID = newRequestID()
+	}
+	auditCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return h.governance.Record(auditCtx, AuditEvent{
+		TenantID: tenant.TenantID, UserID: tenant.UserID, Decision: decision,
+		RequestID: requestID, TraceID: newTraceID(), OccurredAt: time.Now().UTC(),
+	})
 }
 
 func (h *AdminHandler) handleDeploymentCollection(w http.ResponseWriter, r *http.Request, tenant TenantContext) {
@@ -406,4 +528,80 @@ func (p *MemoryPlatform) transition(deployment Deployment, next DeploymentStatus
 	current.Status = next
 	p.deployments[key] = current
 	return current, "", true
+}
+
+func (p *MemoryPlatform) startRollout(deployment Deployment, targetVersionID string, grayPercentage int) (Deployment, string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := resourceKey(deployment.TenantID, deployment.ID)
+	current := p.deployments[key]
+	if current.Status != DeploymentActive || current.VersionID == "" {
+		return Deployment{}, "deployment_not_active", false
+	}
+	if grayPercentage < 0 || grayPercentage > 100 {
+		return Deployment{}, "invalid_gray_percentage", false
+	}
+	if !p.hasVersionLocked(key, targetVersionID) {
+		return Deployment{}, "deployment_version_not_found", false
+	}
+	if current.CurrentVersionID == "" {
+		current.CurrentVersionID = current.VersionID
+	}
+	if current.PreviousVersionID == "" || current.TargetVersionID != targetVersionID {
+		current.PreviousVersionID = current.VersionID
+	}
+	current.TargetVersionID = targetVersionID
+	current.GrayPercentage = grayPercentage
+	current.RolloutStatus = DeploymentRolloutInProgress
+	if grayPercentage == 100 {
+		current.VersionID = targetVersionID
+		current.CurrentVersionID = targetVersionID
+		current.RolloutStatus = DeploymentRolloutCompleted
+	}
+	p.deployments[key] = current
+	return current, "", true
+}
+
+func (p *MemoryPlatform) rollbackPreview(deployment Deployment) (DeploymentRollbackPreview, string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	key := resourceKey(deployment.TenantID, deployment.ID)
+	current := p.deployments[key]
+	if current.Status != DeploymentActive || current.PreviousVersionID == "" || !p.hasVersionLocked(key, current.PreviousVersionID) {
+		return DeploymentRollbackPreview{}, "rollback_version_unavailable", false
+	}
+	return DeploymentRollbackPreview{
+		TenantID: current.TenantID, AgentAppID: current.AgentAppID, DeploymentID: current.ID,
+		CurrentVersionID: current.VersionID, PreviousVersionID: current.PreviousVersionID,
+		ExpectedResult: "active routing returns to the previous immutable Version",
+	}, "", true
+}
+
+func (p *MemoryPlatform) rollback(deployment Deployment) (Deployment, string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := resourceKey(deployment.TenantID, deployment.ID)
+	current := p.deployments[key]
+	if current.Status != DeploymentActive || current.PreviousVersionID == "" || !p.hasVersionLocked(key, current.PreviousVersionID) {
+		return Deployment{}, "rollback_version_unavailable", false
+	}
+	current.VersionID = current.PreviousVersionID
+	current.CurrentVersionID = current.PreviousVersionID
+	current.TargetVersionID = current.PreviousVersionID
+	current.GrayPercentage = 100
+	current.RolloutStatus = DeploymentRolloutCompleted
+	p.deployments[key] = current
+	return current, "", true
+}
+
+func (p *MemoryPlatform) hasVersionLocked(key, versionID string) bool {
+	if versionID == "" {
+		return false
+	}
+	for _, version := range p.versions[key] {
+		if version.ID == versionID {
+			return true
+		}
+	}
+	return false
 }

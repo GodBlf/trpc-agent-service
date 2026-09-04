@@ -83,7 +83,7 @@ export default function App() {
         </header>
         <main>
           <div className="page-heading"><div><h2>{active}</h2><p>由后端提供的实时平台数据</p></div></div>
-          {active === "租户" ? <TenantsPage identity={identity} identityChanged={load} /> : active === "Agent 应用" ? <AppsPage identity={identity} onOpenChat={openChat} /> : active === "部署" ? <DeploymentsPage identity={identity} onOpenChat={openChat} /> : active === "Chat" ? <ChatPage key={identity.active_tenant_id} identity={identity} initialAppID={chatAppID} /> : active === "IM 通道" ? <ChannelsPage identity={identity} /> : active === "运行节点" ? <RuntimePage /> : active === "数据管理" ? <DataPage key={identity.active_tenant_id} identity={identity} /> : active === "治理观测" ? <GovernancePage key={identity.active_tenant_id} identity={identity} /> : <AsyncState kind="empty" />}
+          {active === "租户" ? <TenantsPage identity={identity} identityChanged={load} /> : active === "Agent 应用" ? <AppsPage identity={identity} onOpenChat={openChat} /> : active === "部署" ? <DeploymentsPage identity={identity} onOpenChat={openChat} /> : active === "Chat" ? <ChatPage key={identity.active_tenant_id} identity={identity} initialAppID={chatAppID} /> : active === "IM 通道" ? <ChannelsPage identity={identity} /> : active === "运行节点" ? <RuntimePage key={identity.active_tenant_id} identity={identity} /> : active === "数据管理" ? <DataPage key={identity.active_tenant_id} identity={identity} /> : active === "治理观测" ? <GovernancePage key={identity.active_tenant_id} identity={identity} /> : <AsyncState kind="empty" />}
         </main>
       </section>
     </div>
