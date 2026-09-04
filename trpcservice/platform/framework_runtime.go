@@ -2,16 +2,21 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	serviceagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	openaimodel "trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
@@ -29,6 +34,62 @@ type StreamingRunnerAdapter interface {
 }
 
 type AgentFactory func(context.Context, DeploymentVersion) (frameworkagent.Agent, error)
+
+type ModelProviderProfile struct {
+	ID       string
+	BaseURL  string
+	APIKey   string
+	Model    string
+	Protocol string
+}
+
+const (
+	ModelProtocolChatCompletions = "chat_completions"
+	ModelProtocolResponses       = "responses"
+)
+
+// OpenAICompatibleAgentFactory keeps provider credentials server-owned while
+// allowing immutable Deployment Versions to select an approved model.
+func OpenAICompatibleAgentFactory(profile ModelProviderProfile) AgentFactory {
+	return func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
+		provider, _ := version.Config["provider_profile"].(string)
+		if provider != profile.ID || profile.ID == "" || profile.BaseURL == "" || profile.APIKey == "" {
+			return nil, errors.New("model_provider_unavailable")
+		}
+		modelName, _ := version.Config["model"].(string)
+		if modelName == "" {
+			modelName = profile.Model
+		}
+		if modelName == "" {
+			return nil, errors.New("model_not_configured")
+		}
+		var configuredModel model.Model
+		switch profile.Protocol {
+		case "", ModelProtocolChatCompletions:
+			configuredModel = openaimodel.New(modelName, openaimodel.WithBaseURL(profile.BaseURL), openaimodel.WithAPIKey(profile.APIKey))
+		case ModelProtocolResponses:
+			configuredModel = newResponsesModel(modelName, profile.BaseURL, profile.APIKey)
+		default:
+			return nil, errors.New("model_protocol_unsupported")
+		}
+		options := []llmagent.Option{llmagent.WithModel(configuredModel)}
+		if instruction, _ := version.Config["prompt"].(string); instruction != "" {
+			options = append(options, llmagent.WithInstruction(instruction))
+		}
+		if raw, ok := version.Config["generation_config"]; ok {
+			encoded, err := json.Marshal(raw)
+			if err != nil {
+				return nil, errors.New("generation_config_invalid")
+			}
+			var generation model.GenerationConfig
+			if err := json.Unmarshal(encoded, &generation); err != nil {
+				return nil, errors.New("generation_config_invalid")
+			}
+			options = append(options, llmagent.WithGenerationConfig(generation))
+		}
+		return llmagent.New(version.AgentAppID, options...), nil
+	}
+}
 
 type governanceReplayContextKey struct{}
 type governanceAdmissionContextKey struct{}
@@ -48,24 +109,62 @@ func DefaultAgentFactory() AgentFactory {
 			if !declared {
 				return nil, fmt.Errorf("deterministic Tool %q is not declared", toolName)
 			}
-			return serviceagent.NewDeterministicToolAgent(version.AgentAppID, toolName), nil
+			delay, err := deterministicToolDelay(version.Config["deterministic_tool_delay_ms"])
+			if err != nil {
+				return nil, err
+			}
+			return serviceagent.NewDeterministicToolAgentWithDelay(version.AgentAppID, toolName, delay), nil
 		}
-		return serviceagent.NewDeterministicAgent(version.AgentAppID), nil
+		delay, err := deterministicFixtureDelay(version.Config["deterministic_response_delay_ms"], "response")
+		if err != nil {
+			return nil, err
+		}
+		return serviceagent.NewDeterministicAgentWithDelay(version.AgentAppID, delay), nil
 	}
 }
 
-type FrameworkRunnerAdapter struct {
-	resolve    func(string) (DeploymentVersion, bool)
-	factory    AgentFactory
-	mu         sync.Mutex
-	runners    map[string]frameworkrunner.Runner
-	runs       map[string]map[uint64]context.CancelFunc
-	nextRun    uint64
-	closed     bool
-	governance *GovernanceCenter
+func deterministicToolDelay(value any) (time.Duration, error) {
+	return deterministicFixtureDelay(value, "Tool")
 }
 
-func NewFrameworkRunnerAdapter(resolve func(string) (DeploymentVersion, bool), factory AgentFactory) *FrameworkRunnerAdapter {
+func deterministicFixtureDelay(value any, kind string) (time.Duration, error) {
+	if value == nil {
+		return 0, nil
+	}
+	var milliseconds int64
+	switch typed := value.(type) {
+	case int:
+		milliseconds = int64(typed)
+	case int64:
+		milliseconds = typed
+	case float64:
+		if typed != float64(int64(typed)) {
+			return 0, fmt.Errorf("deterministic %s delay is invalid", kind)
+		}
+		milliseconds = int64(typed)
+	default:
+		return 0, fmt.Errorf("deterministic %s delay is invalid", kind)
+	}
+	if milliseconds < 0 || milliseconds > 30000 {
+		return 0, fmt.Errorf("deterministic %s delay is invalid", kind)
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
+}
+
+type FrameworkRunnerAdapter struct {
+	resolve        func(context.Context, string) (DeploymentVersion, bool, error)
+	factory        AgentFactory
+	mu             sync.Mutex
+	runners        map[string]frameworkrunner.Runner
+	runs           map[string]map[uint64]context.CancelFunc
+	nextRun        uint64
+	closed         bool
+	governance     *GovernanceCenter
+	toolGovernance ToolGovernance
+	runWG          sync.WaitGroup
+}
+
+func NewFrameworkRunnerAdapter(resolve func(context.Context, string) (DeploymentVersion, bool, error), factory AgentFactory) *FrameworkRunnerAdapter {
 	if factory == nil {
 		factory = DefaultAgentFactory()
 	}
@@ -78,7 +177,10 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 	if a.closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok := a.resolve(versionID)
+	version, ok, err := a.resolve(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok || version.ID != versionID {
 		return nil, errors.New("deployment_version_not_found")
 	}
@@ -93,12 +195,23 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 		return nil, fmt.Errorf("agent_factory: %w", err)
 	}
 	options := []frameworkrunner.Option{}
-	if a.governance != nil {
-		options = append(options, frameworkrunner.WithPlugins(&governanceRuntimePlugin{center: a.governance}))
+	if a.governance != nil || a.toolGovernance != nil {
+		options = append(options, frameworkrunner.WithPlugins(&governanceRuntimePlugin{center: a.governance, tools: a.toolGovernance}))
 	}
 	runner := frameworkrunner.NewRunner(version.AgentAppID, agent, options...)
 	a.runners[versionID] = runner
 	return runner, nil
+}
+
+type ToolGovernance interface {
+	AuthorizeTool(context.Context, GovernanceRequest, string, string, []byte) error
+	CompleteTool(context.Context, GovernanceRequest, string, string, error) error
+}
+
+func (a *FrameworkRunnerAdapter) SetToolGovernance(governance ToolGovernance) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.toolGovernance = governance
 }
 
 func (a *FrameworkRunnerAdapter) SetGovernance(center *GovernanceCenter) {
@@ -107,7 +220,10 @@ func (a *FrameworkRunnerAdapter) SetGovernance(center *GovernanceCenter) {
 	a.governance = center
 }
 
-type governanceRuntimePlugin struct{ center *GovernanceCenter }
+type governanceRuntimePlugin struct {
+	center *GovernanceCenter
+	tools  ToolGovernance
+}
 
 func (p *governanceRuntimePlugin) Name() string { return "platform-governance" }
 
@@ -128,7 +244,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 				}
 				return &frameworkagent.BeforeAgentResult{Context: context.WithValue(ctx, governanceAdmissionContextKey{}, true)}, nil
 			}
-			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.before_agent", "ok"); err != nil {
+			if err := p.center.RecordSpan(runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, "plugin.before_agent", "ok"); err != nil {
 				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
 			}
 		}
@@ -140,6 +256,9 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 			return upstream, nil
 		}
 		updated := upstream.Clone()
+		// Runner completion notices are keyed by the original event ID. Clone
+		// generates a new ID, so preserve it or completion-aware Agents time out.
+		updated.ID = upstream.ID
 		buffer := p.center.RequiresBufferedOutput(request.TenantID, request.AppID)
 		for index := range updated.Response.Choices {
 			choice := &updated.Response.Choices[index]
@@ -158,7 +277,7 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 	})
 	registry.AfterAgent(func(ctx context.Context, _ *frameworkagent.AfterAgentArgs) (*frameworkagent.AfterAgentResult, error) {
 		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
-			if err := p.center.RecordSpan(GovernanceRequest{TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID, SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel, ExternalSubject: request.ExternalSubject}, request.TraceID, "plugin.after_agent", "ok"); err != nil {
+			if err := p.center.RecordSpan(runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, "plugin.after_agent", "ok"); err != nil {
 				return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
 			}
 		}
@@ -166,31 +285,33 @@ func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
 	})
 	registry.BeforeTool(func(ctx context.Context, args *frameworktool.BeforeToolArgs) (*frameworktool.BeforeToolResult, error) {
 		request, ok := RunnerIdentityFromContext(ctx)
-		if !ok || p.center == nil {
+		if !ok || (p.center == nil && p.tools == nil) {
 			return nil, nil
 		}
-		err := p.center.AuthorizeTool(ctx, GovernanceRequest{
-			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
-			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
-		}, request.TraceID, args.ToolName, args.Arguments)
-		if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
-			if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
-				return &frameworktool.BeforeToolResult{CustomResult: replay}, nil
+		governance := p.tools
+		if governance == nil {
+			governance = p.center
+		}
+		err := governance.AuthorizeTool(ctx, runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, args.ToolName, args.Arguments)
+		if p.center != nil {
+			if _, replayEnabled := ctx.Value(governanceReplayContextKey{}).(bool); replayEnabled && IsGovernanceError(err, "confirmation_consumed") {
+				if replay, ok := p.center.ToolReplayResult(request.TenantID, request.RequestID, args.ToolName); ok {
+					return &frameworktool.BeforeToolResult{CustomResult: replay}, nil
+				}
 			}
 		}
 		return nil, err
 	})
 	registry.AfterTool(func(ctx context.Context, args *frameworktool.AfterToolArgs) (*frameworktool.AfterToolResult, error) {
 		request, ok := RunnerIdentityFromContext(ctx)
-		if !ok || p.center == nil {
+		if !ok || (p.center == nil && p.tools == nil) {
 			return nil, nil
 		}
-		err := p.center.CompleteTool(ctx, GovernanceRequest{
-			TenantID: request.TenantID, AgentAppID: request.AppID, UserID: request.UserID,
-			SessionID: request.SessionID, RequestID: request.RequestID, Channel: request.Channel,
-			ExternalSubject: request.ExternalSubject, PolicyRevision: request.PolicyRevision,
-		}, request.TraceID, args.ToolName, args.Error)
+		governance := p.tools
+		if governance == nil {
+			governance = p.center
+		}
+		err := governance.CompleteTool(ctx, runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, args.ToolName, args.Error)
 		return nil, err
 	})
 }
@@ -230,7 +351,10 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	if closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok := a.resolve(request.VersionID)
+	version, ok, err := a.resolve(ctx, request.VersionID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok || version.TenantID != request.TenantID || version.AgentAppID != request.AppID || version.DeploymentID != request.DeploymentID {
 		return nil, errors.New("deployment_version_scope_mismatch")
 	}
@@ -297,12 +421,6 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 		cancelled := false
 		awaitingConfirmation := false
 		defer func() {
-			go func() {
-				for range upstream {
-				}
-			}()
-		}()
-		defer func() {
 			if governanceOwned && !awaitingConfirmation {
 				completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, rawOutput, usageTokens, usageKnown, errorType, cancelled))
 			}
@@ -344,6 +462,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 				}
 				if upstreamEvent.IsError() {
 					errorText := upstreamEvent.Response.Error.Error()
+					log.Printf("framework runtime event failed: %s", errorText)
 					if strings.Contains(errorText, "confirmation_required") {
 						awaitingConfirmation = true
 					} else {
@@ -352,6 +471,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 					data := runtimeEventData(request, map[string]string{"error": errorText})
 					addRuntimeUsage(data, usageTokens, usageKnown)
 					a.emit(runCtx, results, RuntimeEvent{Type: "run.failed", Data: data})
+					cancelAndDrainRunnerEvents(cancel, upstream)
 					return
 				}
 				content := eventContent(upstreamEvent)
@@ -379,12 +499,9 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 						cancelled, errorType = true, "cancelled"
 						return
 					}
-					// The framework may still be unwinding its flow after the
-					// callback error. Cancel and drain its event channel before
-					// releasing the request ID so an approved retry can start.
-					cancel()
-					for range upstream {
-					}
+					// Cancellation is the ownership boundary. A non-cooperative
+					// upstream must not keep an unbounded drain goroutine alive.
+					cancelAndDrainRunnerEvents(cancel, upstream)
 					return
 				}
 				eventType := "message.delta"
@@ -415,6 +532,24 @@ func withRunnerIdentity(ctx context.Context, request RunnerRequest) context.Cont
 	return context.WithValue(ctx, runnerIdentityKey{}, request)
 }
 
+const runnerEventDrainTimeout = 2 * time.Second
+
+func cancelAndDrainRunnerEvents(cancel context.CancelFunc, upstream <-chan *event.Event) {
+	cancel()
+	timer := time.NewTimer(runnerEventDrainTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case _, ok := <-upstream:
+			if !ok {
+				return
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func RunnerIdentityFromContext(ctx context.Context) (RunnerRequest, bool) {
 	request, ok := ctx.Value(runnerIdentityKey{}).(RunnerRequest)
 	return request, ok
@@ -424,7 +559,8 @@ func runtimeEventData(request RunnerRequest, values map[string]string) map[strin
 	data := map[string]string{
 		"tenant_id": request.TenantID, "app_id": request.AppID, "deployment_id": request.DeploymentID,
 		"version_id": request.VersionID, "session_id": request.SessionID, "request_id": request.RequestID, "trace_id": request.TraceID,
-		"user_id": request.UserID, "channel": request.Channel, "external_subject": request.ExternalSubject,
+		"traceparent": request.TraceParent,
+		"user_id":     request.UserID, "channel": request.Channel, "external_subject": request.ExternalSubject,
 	}
 	for key, value := range values {
 		data[key] = value
@@ -482,6 +618,7 @@ func (a *FrameworkRunnerAdapter) registerRun(versionID string, cancel context.Ca
 		return 0, false
 	}
 	a.nextRun++
+	a.runWG.Add(1)
 	if a.runs[versionID] == nil {
 		a.runs[versionID] = make(map[uint64]context.CancelFunc)
 	}
@@ -493,7 +630,11 @@ func (a *FrameworkRunnerAdapter) unregisterRun(versionID string, runID uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if runs := a.runs[versionID]; runs != nil {
+		if _, ok := runs[runID]; !ok {
+			return
+		}
 		delete(runs, runID)
+		a.runWG.Done()
 		if len(runs) == 0 {
 			delete(a.runs, versionID)
 		}
@@ -553,6 +694,7 @@ func (a *FrameworkRunnerAdapter) Close() error {
 			firstErr = err
 		}
 	}
+	a.runWG.Wait()
 	return firstErr
 }
 

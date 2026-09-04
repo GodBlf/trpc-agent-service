@@ -31,8 +31,15 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	if h.isClosing() {
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
 		return
 	}
@@ -48,10 +55,93 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 		h.handleSessionData(w, r, store, tenant, parts[1:])
 	case "memory":
 		h.handleMemoryData(w, r, store, tenant, parts[1:])
+	case "artifacts":
+		h.handleArtifactData(w, r, store, tenant)
+	case "knowledge":
+		h.handleKnowledgeData(w, r, store, tenant)
 	case "migrations":
 		h.handleMigration(w, r, store, tenant, parts[1:])
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "resource was not found")
+	}
+}
+
+func (h *AdminHandler) handleArtifactData(w http.ResponseWriter, r *http.Request, store DataStore, tenant TenantContext) {
+	artifacts, ok := store.(ArtifactStore)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "artifact_backend_unsupported", "Artifact backend is not configured")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := artifacts.ListArtifacts(r.Context(), tenant.TenantID, strings.TrimSpace(r.URL.Query().Get("session_id")))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	case http.MethodPost:
+		if !canOperate(tenant.Role) {
+			writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
+			return
+		}
+		var item Artifact
+		if err := decodeStrict(r, &item); err != nil || item.SessionID == "" || item.Name == "" || item.ContentRef == "" {
+			writeError(w, http.StatusBadRequest, "invalid_artifact", "Artifact metadata is invalid")
+			return
+		}
+		item.TenantID = tenant.TenantID
+		created, err := artifacts.PutArtifact(r.Context(), item)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
+	}
+}
+
+func (h *AdminHandler) handleKnowledgeData(w http.ResponseWriter, r *http.Request, store DataStore, tenant TenantContext) {
+	knowledge, ok := store.(KnowledgeStore)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "knowledge_backend_unsupported", "Knowledge backend is not configured")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := knowledge.ListKnowledge(r.Context(), tenant.TenantID, strings.TrimSpace(r.URL.Query().Get("app_id")))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	case http.MethodPost:
+		if !canOperate(tenant.Role) {
+			writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
+			return
+		}
+		var item KnowledgeRecord
+		if err := decodeStrict(r, &item); err != nil || item.AgentAppID == "" || item.Source == "" || item.Content == "" {
+			writeError(w, http.StatusBadRequest, "invalid_knowledge", "Knowledge record is invalid")
+			return
+		}
+		if _, found, err := h.platform.app(r.Context(), tenant.TenantID, item.AgentAppID); err != nil || !found {
+			if writeControlPlaneError(w, err) {
+				return
+			}
+			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
+			return
+		}
+		item.TenantID = tenant.TenantID
+		created, err := knowledge.PutKnowledge(r.Context(), item)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET or POST")
 	}
 }
 
@@ -101,9 +191,12 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusBadRequest, "invalid_backend", "backend is not available")
 		return
 	}
-	if err := h.selectBackend(tenant.TenantID, selection, store); err != nil {
+	if err := h.selectBackend(r.Context(), tenant.TenantID, selection, store); err != nil {
 		if closer, ok := store.(interface{ Close() error }); ok {
 			_ = closer.Close()
+		}
+		if writeControlPlaneError(w, err) {
+			return
 		}
 		writeError(w, http.StatusInternalServerError, "backend_selection_not_persisted", "backend selection could not be persisted")
 		return
@@ -305,5 +398,5 @@ func (h *AdminHandler) handleMigration(w http.ResponseWriter, r *http.Request, _
 }
 
 func isDataPath(path string) bool {
-	return strings.HasPrefix(path, "/api/v1/admin/storage") || strings.HasPrefix(path, "/api/v1/admin/sessions") || strings.HasPrefix(path, "/api/v1/admin/memory") || strings.HasPrefix(path, "/api/v1/admin/migrations")
+	return strings.HasPrefix(path, "/api/v1/admin/storage") || strings.HasPrefix(path, "/api/v1/admin/sessions") || strings.HasPrefix(path, "/api/v1/admin/memory") || strings.HasPrefix(path, "/api/v1/admin/artifacts") || strings.HasPrefix(path, "/api/v1/admin/knowledge") || strings.HasPrefix(path, "/api/v1/admin/migrations")
 }

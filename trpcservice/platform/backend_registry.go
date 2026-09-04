@@ -37,6 +37,26 @@ func (r *backendRegistry) setSelections(selections map[string]backendSelection) 
 	r.selections = copyBackendSelections(selections)
 }
 
+func (r *backendRegistry) syncSelections(selections map[string]backendSelection) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for tenantID, current := range r.selections {
+		next, exists := selections[tenantID]
+		if exists && next == current {
+			continue
+		}
+		r.retireLocked(r.stores[tenantID])
+		delete(r.stores, tenantID)
+	}
+	for tenantID, next := range selections {
+		if current, exists := r.selections[tenantID]; !exists || current != next {
+			r.retireLocked(r.stores[tenantID])
+			delete(r.stores, tenantID)
+		}
+	}
+	r.selections = copyBackendSelections(selections)
+}
+
 func (r *backendRegistry) selectionSnapshot() map[string]backendSelection {
 	r.mu.Lock()
 	defer r.mu.Unlock()

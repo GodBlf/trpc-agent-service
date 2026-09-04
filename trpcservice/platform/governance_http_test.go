@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -338,7 +339,7 @@ func TestDeploymentToolPolicyGatesDeclarationsWithoutPreflightConfirmation(t *te
 }
 
 func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
 	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"}})
 	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a", Input: "ship", RequiredTools: []string{"deploy"}}
 	result, _ := handler.governance.Evaluate(context.Background(), request)
@@ -362,7 +363,7 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	if decided.Status != ConfirmationApproved {
 		t.Fatalf("decision = %#v", decided)
 	}
-	store, release, err := handler.acquireStore("tenant-a")
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +409,79 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	}
 }
 
+func TestConfirmationDecisionWaitsForPendingChatRunToExit(t *testing.T) {
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
+	defer handler.Close()
+	_, _ = handler.governance.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
+	})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", UserID: "operator", SessionID: "session-a", RequestID: "request-a", Input: "ship"}
+	result, err := handler.governance.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = handler.governance.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", []byte(`{"target":"production"}`))
+	var pending *GovernanceError
+	if !errors.As(err, &pending) {
+		t.Fatalf("pending confirmation error = %v", err)
+	}
+	done := make(chan struct{})
+	handler.chatMu.Lock()
+	handler.activeRuns[chatRunKey("tenant-a", "session-a", "request-a")] = activeChatRun{input: "ship", done: done}
+	handler.chatMu.Unlock()
+	server, client := newHandlerClient(t, handler)
+	defer server.Close()
+
+	type responseResult struct {
+		response *http.Response
+		err      error
+	}
+	responseDone := make(chan responseResult, 1)
+	go func() {
+		httpRequest, requestErr := http.NewRequest(http.MethodPost, server.URL+"/api/v1/admin/governance/confirmations/"+pending.ConfirmationID+"/decision", strings.NewReader(`{"approve":false}`))
+		if requestErr == nil {
+			httpRequest.Header.Set("Content-Type", "application/json")
+		}
+		if requestErr != nil {
+			responseDone <- responseResult{err: requestErr}
+			return
+		}
+		response, requestErr := client.Do(httpRequest)
+		responseDone <- responseResult{response: response, err: requestErr}
+	}()
+	select {
+	case result := <-responseDone:
+		if result.response != nil {
+			result.response.Body.Close()
+		}
+		t.Fatal("decision returned before the pending run exited")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(done)
+	decisionResult := <-responseDone
+	if decisionResult.err != nil {
+		t.Fatal(decisionResult.err)
+	}
+	decodeResponse(t, decisionResult.response, http.StatusOK, &ToolConfirmation{})
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListSessionEvents(context.Background(), "tenant-a", "session-a", 0)
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := chatTerminalEvent(events, "request-a")
+	if terminal == nil || terminal.Type != "run.failed" {
+		t.Fatalf("rejected confirmation terminal = %#v", terminal)
+	}
+	metrics := handler.governance.Metrics("tenant-a")
+	if metrics.Active != 0 || metrics.Failed != 1 {
+		t.Fatalf("rejected confirmation metrics = %#v", metrics)
+	}
+}
+
 func TestConfirmationListReconcilesExpiryAndPersistsSessionEvent(t *testing.T) {
 	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
 	handler := NewAdminHandler(nil, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RoleOperator}}})
@@ -435,7 +509,7 @@ func TestConfirmationListReconcilesExpiryAndPersistsSessionEvent(t *testing.T) {
 	if len(listed.Items) != 1 || listed.Items[0].Status != ConfirmationExpired {
 		t.Fatalf("expired confirmations = %#v", listed.Items)
 	}
-	store, release, err := handler.acquireStore("tenant-a")
+	store, release, err := handler.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}

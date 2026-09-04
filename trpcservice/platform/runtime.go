@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"net/http"
 	"strconv"
@@ -56,7 +57,7 @@ func (e *runtimeError) Error() string { return e.code }
 func (e *runtimeError) Unwrap() error { return e.err }
 
 type Runtime struct {
-	platform       *MemoryPlatform
+	platform       ControlPlaneStore
 	worker         *StatelessWorker
 	life           RuntimeLifecycle
 	gates          sessionGates
@@ -65,6 +66,7 @@ type Runtime struct {
 	tenantCounters map[string]*runtimeCounters
 	faultMu        sync.RWMutex
 	faults         map[string]RuntimeFaultConfiguration
+	leases         SessionLeaseManager
 }
 
 type runtimeCounters struct{ active, complete, failed atomic.Int64 }
@@ -86,7 +88,10 @@ func NewStatelessWorker(runner RunnerAdapter) *StatelessWorker {
 func (w *StatelessWorker) Execute(ctx context.Context, request GatewayRequest) (GatewayResponse, error) {
 	result, err := w.runner.Run(ctx, runnerRequestFromGateway(request))
 	if err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			w.lastError.Store(true)
+			w.available.Store(false)
+		} else if !errors.Is(err, context.Canceled) {
 			w.lastError.Store(true)
 		}
 		return GatewayResponse{}, err
@@ -133,16 +138,30 @@ func runnerRequestFromGateway(request GatewayRequest) RunnerRequest {
 	return RunnerRequest{
 		TenantID: request.TenantID, AppID: request.AppID, SessionID: request.SessionID, UserID: request.UserID,
 		Channel: request.Channel, ExternalSubject: request.ExternalSubject, Input: request.Input, RequestID: request.RequestID,
-		TraceID: request.TraceID, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision,
-		Version: request.Version,
+		TraceID: request.TraceID, TraceParent: request.TraceParent, DeploymentID: request.DeploymentID, VersionID: request.VersionID, PolicyRevision: request.PolicyRevision,
+		FencingToken: request.FencingToken, Version: request.Version,
 	}
 }
 
-func NewRuntime(platform *MemoryPlatform, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {
+func NewRuntime(platform ControlPlaneStore, runner RunnerAdapter, life RuntimeLifecycle) *Runtime {
 	if runner == nil {
 		runner = EchoRunner{}
 	}
 	return &Runtime{platform: platform, worker: NewStatelessWorker(runner), life: life, gates: sessionGates{items: make(map[string]*sessionGate)}, tenantCounters: make(map[string]*runtimeCounters), faults: make(map[string]RuntimeFaultConfiguration)}
+}
+
+func (rt *Runtime) SetSessionLeaseManager(manager SessionLeaseManager) { rt.leases = manager }
+
+func (rt *Runtime) acquireSession(ctx context.Context, tenantID, sessionID string) (uint64, <-chan struct{}, func(), error) {
+	if rt.leases != nil {
+		lease, err := rt.leases.Acquire(ctx, tenantID, sessionID)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return lease.FencingToken, lease.Lost, lease.Release, nil
+	}
+	release, err := rt.gates.acquire(ctx, tenantID+"\x00"+sessionID)
+	return 0, nil, release, err
 }
 
 func (rt *Runtime) SetWorkerAvailable(available bool) { rt.worker.available.Store(available) }
@@ -186,10 +205,16 @@ func (rt *Runtime) applyFault(ctx context.Context, tenantID, appID string) error
 func runtimeFaultKey(tenantID, appID string) string { return tenantID + "\x00" + appID }
 
 func (rt *Runtime) Close() error {
+	var runnerErr error
 	if streaming, ok := rt.worker.runner.(StreamingRunnerAdapter); ok {
-		return streaming.Close()
+		runnerErr = streaming.Close()
 	}
-	return nil
+	if rt.leases != nil {
+		if err := rt.leases.Close(); runnerErr == nil {
+			runnerErr = err
+		}
+	}
+	return runnerErr
 }
 
 func (rt *Runtime) RetireVersion(versionID string) error {
@@ -215,11 +240,16 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return nil, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found, err := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	if err != nil {
+		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
+	}
 	if !found {
 		return nil, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
+		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
+	} else if found {
 		request.Version = &version
 	}
 	request.TenantID, request.DeploymentID, request.VersionID, request.UserID = tenant.TenantID, deployment.ID, deployment.VersionID, tenant.UserID
@@ -241,13 +271,23 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}()
 	}
-	releaseGate, err := rt.gates.acquire(streamCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
+	fencingToken, leaseLost, releaseGate, err := rt.acquireSession(streamCtx, tenant.TenantID, request.SessionID)
 	if err != nil {
 		if releaseLife != nil {
 			releaseLife()
 		}
 		cancel()
 		return nil, &runtimeError{code: "request_cancelled", err: err}
+	}
+	request.FencingToken = fencingToken
+	if leaseLost != nil {
+		go func() {
+			select {
+			case <-leaseLost:
+				cancel()
+			case <-streamCtx.Done():
+			}
+		}()
 	}
 	events, err := rt.worker.ExecuteEvents(streamCtx, request)
 	if err != nil {
@@ -281,15 +321,42 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 			rt.global.active.Add(-1)
 			counters.active.Add(-1)
 		}()
+		if fencingToken > 0 {
+			select {
+			case <-streamCtx.Done():
+				return
+			case output <- RuntimeEvent{Type: "session.lease.acquired", Data: map[string]string{"fencing_token": fmt.Sprint(fencingToken)}}:
+			}
+		}
 		for event := range events {
+			data := make(map[string]string, len(event.Data)+1)
+			for key, value := range event.Data {
+				data[key] = value
+			}
+			event.Data = data
+			if fencingToken > 0 {
+				event.Data["fencing_token"] = fmt.Sprint(fencingToken)
+			}
 			switch event.Type {
 			case "run.completed", "run.failed", "run.cancelled":
 				terminalEvent = event.Type
 			}
 			select {
 			case <-streamCtx.Done():
+				terminalEvent = "run.cancelled"
+				select {
+				case output <- RuntimeEvent{Type: "run.cancelled", Data: map[string]string{"error": "request_cancelled", "fencing_token": fmt.Sprint(fencingToken)}}:
+				default:
+				}
 				return
 			case output <- event:
+			}
+		}
+		if streamCtx.Err() != nil && terminalEvent == "" {
+			terminalEvent = "run.cancelled"
+			select {
+			case output <- RuntimeEvent{Type: "run.cancelled", Data: map[string]string{"error": "request_cancelled", "fencing_token": fmt.Sprint(fencingToken)}}:
+			default:
 			}
 		}
 	}()
@@ -312,11 +379,16 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return GatewayResponse{}, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found, err := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	if err != nil {
+		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
+	}
 	if !found {
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(deployment.VersionID); found {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
+		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
+	} else if found {
 		request.Version = &version
 	}
 	request.DeploymentID, request.VersionID = deployment.ID, deployment.VersionID
@@ -338,11 +410,21 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 			}
 		}()
 	}
-	releaseGate, err := rt.gates.acquire(runCtx, tenant.TenantID+"\x00"+request.AppID+"\x00"+request.SessionID)
+	fencingToken, leaseLost, releaseGate, err := rt.acquireSession(runCtx, tenant.TenantID, request.SessionID)
 	if err != nil {
 		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
 	}
 	defer releaseGate()
+	request.FencingToken = fencingToken
+	if leaseLost != nil {
+		go func() {
+			select {
+			case <-leaseLost:
+				cancel()
+			case <-runCtx.Done():
+			}
+		}()
+	}
 
 	if err := runCtx.Err(); err != nil {
 		return GatewayResponse{}, &runtimeError{code: "request_cancelled", err: err}
@@ -411,29 +493,32 @@ func (rt *Runtime) countersFor(tenantID string) *runtimeCounters {
 	return counters
 }
 
-func (p *MemoryPlatform) activeDeployment(tenantID, appID string) (Deployment, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *SnapshotControlPlane) activeDeployment(ctx context.Context, tenantID, appID string) (Deployment, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return Deployment{}, false, p.persistenceErr
+	}
 	for _, deployment := range p.deployments {
 		if deployment.TenantID == tenantID && deployment.AgentAppID == appID && deployment.Status == DeploymentActive && deployment.VersionID != "" {
-			return deployment, true
+			return deployment, true, nil
 		}
 	}
-	return Deployment{}, false
+	return Deployment{}, false, nil
 }
 
-func (p *MemoryPlatform) routeDeployment(tenantID, appID, requestID string) (Deployment, bool) {
-	deployment, found := p.activeDeployment(tenantID, appID)
-	if !found {
-		return deployment, false
+func (p *SnapshotControlPlane) routeDeployment(ctx context.Context, tenantID, appID, requestID string) (Deployment, bool, error) {
+	deployment, found, err := p.activeDeployment(ctx, tenantID, appID)
+	if err != nil || !found {
+		return deployment, false, err
 	}
 	if deployment.TargetVersionID == "" || deployment.CurrentVersionID == "" || deployment.GrayPercentage <= 0 || deployment.GrayPercentage >= 100 || requestID == "" {
-		return deployment, true
+		return deployment, true, nil
 	}
 	if uint64(grayBucket(requestID)) < uint64(deployment.GrayPercentage) {
 		deployment.VersionID = deployment.TargetVersionID
 	}
-	return deployment, true
+	return deployment, true, nil
 }
 
 func grayBucket(requestID string) int {
@@ -500,9 +585,15 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 		requestID = time.Now().UTC().Format("20060102150405.000000000")
 	}
 	request.RequestID = requestID
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		code, message := "storage_unavailable", "tenant storage is unavailable"
+		if errors.Is(err, errControlPlaneUnavailable) {
+			code, message = "control_plane_unavailable", "control plane is unavailable"
+		} else if h.life != nil && h.life.IsClosing() {
+			code, message = "service_closing", "service is closing"
+		}
+		writeError(w, http.StatusServiceUnavailable, code, message)
 		return
 	}
 	defer releaseStore()
@@ -527,7 +618,7 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 		case "request_cancelled":
 			status = http.StatusRequestTimeout
-		case "service_closing", "worker_unavailable":
+		case "service_closing", "worker_unavailable", "control_plane_unavailable":
 			status = http.StatusServiceUnavailable
 		}
 		writeError(w, status, code, "routed execution failed")
@@ -556,8 +647,12 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	items := h.runtime.StatusFor(tenant)
-	store, releaseStore, err := h.acquireStore(tenant.TenantID)
+	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
+		if errors.Is(err, errControlPlaneUnavailable) {
+			writeControlPlaneError(w, err)
+			return
+		}
 		items = appendDependencyStatus(items, "dependency-storage", LifecycleUnavailable)
 	} else {
 		defer releaseStore()

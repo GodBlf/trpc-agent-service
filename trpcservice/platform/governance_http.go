@@ -86,7 +86,10 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 	switch r.Method {
 	case http.MethodGet:
 		appID := strings.TrimSpace(r.URL.Query().Get("app_id"))
-		policy, found := h.governance.Policy(tenant.TenantID, appID)
+		policy, found, err := h.governance.Policy(r.Context(), tenant.TenantID, appID)
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		if !found {
 			writeError(w, http.StatusNotFound, "policy_not_found", "governance policy was not found")
 			return
@@ -102,12 +105,18 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
 			return
 		}
-		if _, found := h.platform.app(tenant.TenantID, policy.AgentAppID); !found {
+		if _, found, err := h.platform.app(r.Context(), tenant.TenantID, policy.AgentAppID); err != nil || !found {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
 		policy.TenantID = tenant.TenantID
-		if existing, found := h.governance.Policy(tenant.TenantID, policy.AgentAppID); found {
+		if existing, found, err := h.governance.Policy(r.Context(), tenant.TenantID, policy.AgentAppID); err != nil {
+			writeControlPlaneError(w, err)
+			return
+		} else if found {
 			replacements := []string{}
 			for _, value := range policy.RedactedPatterns {
 				if value != "[REDACTED]" {
@@ -122,6 +131,10 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 		}
 		updated, err := h.governance.PutPolicy(r.Context(), policy)
 		if err != nil {
+			if errors.Is(err, errControlPlaneUnavailable) {
+				writeControlPlaneError(w, err)
+				return
+			}
 			if err.Error() == "invalid_policy" {
 				writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
 			} else {
@@ -191,11 +204,57 @@ func (h *AdminHandler) handleConfirmationDecision(w http.ResponseWriter, r *http
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "confirmation event could not be persisted")
 		return
 	}
+	if !h.waitForChatRunExit(r.Context(), confirmation) {
+		writeError(w, http.StatusServiceUnavailable, "request_cancelled", "confirmation decision was interrupted")
+		return
+	}
+	if confirmation.Status == ConfirmationRejected || confirmation.Status == ConfirmationExpired {
+		if err := h.finalizeRejectedConfirmation(r.Context(), confirmation); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "storage_error", "rejected confirmation could not be finalized")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, confirmation)
 }
 
+func (h *AdminHandler) waitForChatRunExit(ctx context.Context, confirmation ToolConfirmation) bool {
+	key := chatRunKey(confirmation.TenantID, confirmation.SessionID, confirmation.RequestID)
+	h.chatMu.Lock()
+	active, running := h.activeRuns[key]
+	h.chatMu.Unlock()
+	if !running || active.done == nil {
+		return true
+	}
+	select {
+	case <-active.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (h *AdminHandler) finalizeRejectedConfirmation(ctx context.Context, confirmation ToolConfirmation) error {
+	if _, err := completeGovernance(ctx, h.governance, GovernanceCompletion{
+		TenantID: confirmation.TenantID, AgentAppID: confirmation.AgentAppID, RequestID: confirmation.RequestID,
+		UserID: confirmation.UserID, SessionID: confirmation.SessionID, ErrorType: "confirmation_rejected",
+	}); err != nil {
+		return err
+	}
+	store, release, err := h.acquireStore(ctx, confirmation.TenantID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	payload := map[string]string{
+		"tenant_id": confirmation.TenantID, "app_id": confirmation.AgentAppID, "session_id": confirmation.SessionID,
+		"user_id": confirmation.UserID, "request_id": confirmation.RequestID, "trace_id": confirmation.TraceID,
+		"policy_revision": strconv.FormatUint(confirmation.PolicyRevision, 10), "error": "confirmation_rejected",
+	}
+	return h.appendCriticalChatEvent(ctx, store, confirmation.TenantID, confirmation.SessionID, confirmation.RequestID+":terminal", "run.failed", payload)
+}
+
 func (h *AdminHandler) appendConfirmationSessionEvent(ctx context.Context, confirmation ToolConfirmation) error {
-	store, release, err := h.acquireStore(confirmation.TenantID)
+	store, release, err := h.acquireStore(ctx, confirmation.TenantID)
 	if err != nil {
 		return err
 	}

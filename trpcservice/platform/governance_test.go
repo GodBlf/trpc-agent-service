@@ -10,6 +10,73 @@ import (
 	"time"
 )
 
+type governancePolicyStoreFixture struct {
+	policies map[string]TenantPolicy
+	loadErr  error
+}
+
+func (s *governancePolicyStoreFixture) loadGovernancePolicies(ctx context.Context) (map[string]TenantPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.loadErr != nil {
+		return nil, s.loadErr
+	}
+	result := make(map[string]TenantPolicy, len(s.policies))
+	for key, policy := range s.policies {
+		result[key] = clonePolicy(policy)
+	}
+	return result, nil
+}
+
+func (s *governancePolicyStoreFixture) saveGovernancePolicy(ctx context.Context, policy TenantPolicy) (TenantPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return TenantPolicy{}, err
+	}
+	if s.policies == nil {
+		s.policies = make(map[string]TenantPolicy)
+	}
+	key := governanceKey(policy.TenantID, policy.AgentAppID)
+	policy.Revision = s.policies[key].Revision + 1
+	policy.UpdatedAt = time.Now().UTC()
+	s.policies[key] = clonePolicy(policy)
+	return clonePolicy(policy), nil
+}
+
+func TestGovernancePolicyStoreImportsLegacyLocalPolicies(t *testing.T) {
+	center := NewGovernanceCenter()
+	center.policies[governanceKey("tenant-a", "app-a")] = TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"search"}, Revision: 7,
+	}
+	store := &governancePolicyStoreFixture{}
+
+	center.configurePolicyStore(store)
+
+	policy, found := store.policies[governanceKey("tenant-a", "app-a")]
+	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
+		t.Fatalf("imported policy = %#v, found = %v", policy, found)
+	}
+	if active, found, err := center.Policy(context.Background(), "tenant-a", "app-a"); err != nil || !found || active.Revision != 1 {
+		t.Fatalf("active policy = %#v, found = %v, error = %v", active, found, err)
+	}
+}
+
+func TestGovernanceAuthorizeToolFailsClosedWhenPolicyStoreIsUnavailable(t *testing.T) {
+	store := &governancePolicyStoreFixture{policies: map[string]TenantPolicy{
+		governanceKey("tenant-a", "app-a"): {TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"search"}, Revision: 1},
+	}}
+	center := NewGovernanceCenter()
+	center.configurePolicyStore(store)
+	store.loadErr = errors.New("control plane unavailable")
+
+	err := center.AuthorizeTool(context.Background(), GovernanceRequest{
+		TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", PolicyRevision: 1,
+	}, "trace-a", "search", nil)
+	if !IsGovernanceError(err, "control_plane_unavailable") {
+		t.Fatalf("AuthorizeTool error = %v", err)
+	}
+}
+
 func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 	blocker := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(blocker, []byte("block"), 0600); err != nil {
@@ -20,8 +87,8 @@ func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a"}); err == nil {
 		t.Fatal("policy update succeeded without durable audit")
 	}
-	if _, found := center.Policy("tenant-a", "app-a"); found {
-		t.Fatal("failed policy update remained active in memory")
+	if _, found, err := center.Policy(context.Background(), "tenant-a", "app-a"); err != nil || found {
+		t.Fatalf("failed policy update remained active in memory: found = %v, error = %v", found, err)
 	}
 	center.policies[governanceKey("tenant-a", "app-a")] = TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", Revision: 1}
 	_, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Input: "hello"})
@@ -72,9 +139,9 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, found := reloaded.Policy("tenant-a", "app-a")
-	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
-		t.Fatalf("policy = %#v, found = %v", policy, found)
+	policy, found, err := reloaded.Policy(context.Background(), "tenant-a", "app-a")
+	if err != nil || !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
+		t.Fatalf("policy = %#v, found = %v, error = %v", policy, found, err)
 	}
 	audits := reloaded.AuditEvents(AuditQuery{TenantID: "tenant-a", Limit: 10})
 	if len(audits) != 2 || audits[0].Decision != "authorization.denied" {
@@ -126,7 +193,7 @@ func TestGovernancePersistenceRestoresActiveExecutionAndToolStart(t *testing.T) 
 	if _, err := reloaded.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Tokens: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if status := reloaded.Confirmations("tenant-a")[0].Status; status != ConfirmationCompleted {
+	if status := reloaded.Confirmations("tenant-a")[0].Status; status != ConfirmationOutcomeUnknown {
 		t.Fatalf("restored Tool confirmation status = %q", status)
 	}
 }
@@ -610,5 +677,35 @@ func TestGovernanceCenterReservesAndAttributesConfiguredToolCost(t *testing.T) {
 	_, err = center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-b", RequiredTools: []string{"unknown"}, Input: "hello"})
 	if !IsGovernanceError(err, "tool_pricing_unknown") {
 		t.Fatalf("unknown Tool pricing error = %v", err)
+	}
+}
+
+func TestGovernanceMarksExecutingToolOutcomeUnknownAfterWorkerLoss(t *testing.T) {
+	center := NewGovernanceCenter()
+	_, _ = center.PutPolicy(context.Background(), TenantPolicy{
+		TenantID: "tenant-a", AgentAppID: "app-a", AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
+	})
+	request := GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", SessionID: "session-a", RequestID: "request-worker-loss"}
+	result, _ := center.Evaluate(context.Background(), request)
+	arguments := []byte(`{"target":"stage7"}`)
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); !IsGovernanceError(err, "confirmation_required") {
+		t.Fatalf("initial authorization = %v", err)
+	}
+	confirmation := center.Confirmations("tenant-a")[0]
+	if _, err := center.DecideConfirmation(context.Background(), "tenant-a", confirmation.ID, "operator", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); err != nil {
+		t.Fatal(err)
+	}
+	if err := center.MarkExecutingToolsOutcomeUnknown(context.Background(), request, result.TraceID); err != nil {
+		t.Fatal(err)
+	}
+	confirmation = center.Confirmations("tenant-a")[0]
+	if confirmation.Status != ConfirmationOutcomeUnknown {
+		t.Fatalf("confirmation status = %q", confirmation.Status)
+	}
+	if err := center.AuthorizeTool(context.Background(), request, result.TraceID, "deploy", arguments); !IsGovernanceError(err, "confirmation_consumed") {
+		t.Fatalf("outcome-unknown retry = %v", err)
 	}
 }

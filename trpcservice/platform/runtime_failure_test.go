@@ -27,6 +27,31 @@ type blockingFailureStore struct {
 	once    sync.Once
 }
 
+type unavailableControlPlanePersistence struct{}
+
+func (unavailableControlPlanePersistence) Load(context.Context) (controlPlaneSnapshot, int64, error) {
+	return controlPlaneSnapshot{}, 0, errors.New("database unavailable")
+}
+
+func (unavailableControlPlanePersistence) Save(context.Context, controlPlaneSnapshot, int64) (int64, error) {
+	return 0, errors.New("database unavailable")
+}
+
+func (unavailableControlPlanePersistence) Close() error { return nil }
+
+func TestRoutedRunReportsControlPlaneUnavailableWhenBackendSelectionCannotLoad(t *testing.T) {
+	platform := activeTestPlatform(t)
+	platform.persistence = unavailableControlPlanePersistence{}
+	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-one", Role: RoleOperator}}})
+	defer handler.Close()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/run", strings.NewReader(`{"app_id":"app-one","session_id":"session-one","input":"hello"}`))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	assertAPIError(t, response.Result(), http.StatusServiceUnavailable, "control_plane_unavailable")
+}
+
 func (s *blockingFailureStore) AppendSessionEvent(ctx context.Context, event SessionEvent) error {
 	if event.Type == "run.failed" {
 		s.once.Do(func() { s.entered <- struct{}{} })

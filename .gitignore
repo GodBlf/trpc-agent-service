@@ -22,3 +22,4 @@ vendor/
 
 data/*
 !data/README.md
+.scratch/evidence/

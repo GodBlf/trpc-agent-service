@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
@@ -45,15 +46,63 @@ type identityResponse struct {
 	AuthMode       string             `json:"auth_mode"`
 }
 
-// MemoryPlatform owns Stage 1 resource state. It is intentionally process-local;
-// Stage 2 replaces storage through the frozen adapter boundary.
-type MemoryPlatform struct {
-	mu               sync.RWMutex
-	tenants          map[string]Tenant
-	apps             map[string]AgentApp
-	deployments      map[string]Deployment
-	versions         map[string][]DeploymentVersion
-	versionCreations map[versionCreationKey]versionCreation
+// SnapshotControlPlane applies Control Plane domain rules to an in-memory snapshot.
+// Durable constructors attach SQLite or PostgreSQL persistence; the bare
+// constructor remains the test-only implementation.
+type SnapshotControlPlane struct {
+	mu                  sync.RWMutex
+	tenants             map[string]Tenant
+	apps                map[string]AgentApp
+	deployments         map[string]Deployment
+	versions            map[string][]DeploymentVersion
+	versionCreations    map[versionCreationKey]versionCreation
+	channelBindings     map[string]ChannelBinding
+	backendSelections   map[string]backendSelection
+	governancePolicies  map[string]TenantPolicy
+	persistence         controlPlanePersistence
+	persistenceErr      error
+	persistenceRevision int64
+}
+
+// ControlPlaneStore is the authoritative Gateway resource boundary. The
+// operations stay package-private so persistence cannot bypass domain rules.
+type ControlPlaneStore interface {
+	seedTenant(context.Context, TenantAssignment) error
+	createTenant(context.Context, Tenant) (bool, error)
+	tenant(context.Context, string) (Tenant, bool, error)
+	DeploymentVersion(context.Context, string) (DeploymentVersion, bool, error)
+	listTenants(context.Context) ([]Tenant, error)
+	listTenantsFor(context.Context, TenantContext) ([]Tenant, error)
+	createApp(context.Context, AgentApp) (bool, error)
+	app(context.Context, string, string) (AgentApp, bool, error)
+	listApps(context.Context, string) ([]AgentApp, error)
+	createDeployment(context.Context, Deployment) (bool, error)
+	deployment(context.Context, string, string) (Deployment, bool, error)
+	listDeployments(context.Context, string) ([]Deployment, error)
+	createVersion(context.Context, Deployment, string, map[string]any) (DeploymentVersion, string, bool, error)
+	listVersions(context.Context, string, string) ([]DeploymentVersion, error)
+	transition(context.Context, Deployment, DeploymentStatus, string) (Deployment, string, bool, error)
+	startRollout(context.Context, Deployment, string, int) (Deployment, string, bool, error)
+	rollbackPreview(context.Context, Deployment) (DeploymentRollbackPreview, string, bool, error)
+	rollback(context.Context, Deployment) (Deployment, string, bool, error)
+	activeDeployment(context.Context, string, string) (Deployment, bool, error)
+	routeDeployment(context.Context, string, string, string) (Deployment, bool, error)
+	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
+	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
+	loadBackendSelections(context.Context) (map[string]backendSelection, error)
+	saveBackendSelection(context.Context, string, backendSelection) error
+	loadGovernancePolicies(context.Context) (map[string]TenantPolicy, error)
+	saveGovernancePolicy(context.Context, TenantPolicy) (TenantPolicy, error)
+	Close() error
+}
+
+var errControlPlaneUnavailable = errors.New("control_plane_unavailable")
+
+func controlPlanePersistenceError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", errControlPlaneUnavailable, err)
 }
 
 type versionCreationKey struct {
@@ -67,42 +116,205 @@ type versionCreation struct {
 	version DeploymentVersion
 }
 
-func NewMemoryPlatform() *MemoryPlatform {
-	return &MemoryPlatform{
+func NewInMemoryControlPlane() *SnapshotControlPlane {
+	return &SnapshotControlPlane{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
-		versionCreations: make(map[versionCreationKey]versionCreation),
+		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding),
+		backendSelections: make(map[string]backendSelection), governancePolicies: make(map[string]TenantPolicy),
 	}
 }
 
-func (p *MemoryPlatform) seedTenant(assignment TenantAssignment) {
+func (p *SnapshotControlPlane) loadBackendSelections(ctx context.Context) (map[string]backendSelection, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, exists := p.tenants[assignment.TenantID]; !exists {
-		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
 	}
+	return copyBackendSelections(p.backendSelections), nil
 }
 
-func (p *MemoryPlatform) createTenant(tenant Tenant) bool {
+func (p *SnapshotControlPlane) saveBackendSelection(ctx context.Context, tenantID string, selection backendSelection) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, exists := p.tenants[tenant.ID]; exists {
+	if !p.refreshLockedContext(ctx) {
+		return p.persistenceErr
+	}
+	previous, existed := p.backendSelections[tenantID]
+	p.backendSelections[tenantID] = selection
+	if p.persistLockedContext(ctx) {
+		return nil
+	}
+	if existed {
+		p.backendSelections[tenantID] = previous
+	} else {
+		delete(p.backendSelections, tenantID)
+	}
+	return p.persistenceErr
+}
+
+func (p *SnapshotControlPlane) loadGovernancePolicies(ctx context.Context) (map[string]TenantPolicy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	policies := make(map[string]TenantPolicy, len(p.governancePolicies))
+	for key, policy := range p.governancePolicies {
+		policies[key] = clonePolicy(policy)
+	}
+	return policies, nil
+}
+
+func (p *SnapshotControlPlane) saveGovernancePolicy(ctx context.Context, policy TenantPolicy) (TenantPolicy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return TenantPolicy{}, p.persistenceErr
+	}
+	key := governanceKey(policy.TenantID, policy.AgentAppID)
+	previous, existed := p.governancePolicies[key]
+	policy.Revision = previous.Revision + 1
+	policy.UpdatedAt = time.Now().UTC()
+	p.governancePolicies[key] = clonePolicy(policy)
+	if p.persistLockedContext(ctx) {
+		return clonePolicy(policy), nil
+	}
+	if existed {
+		p.governancePolicies[key] = previous
+	} else {
+		delete(p.governancePolicies, key)
+	}
+	return TenantPolicy{}, p.persistenceErr
+}
+
+func (p *SnapshotControlPlane) loadChannelBindings(ctx context.Context) (map[string]ChannelBinding, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	items := make(map[string]ChannelBinding, len(p.channelBindings))
+	for key, binding := range p.channelBindings {
+		items[key] = binding
+	}
+	return items, nil
+}
+
+func (p *SnapshotControlPlane) mutateChannelBindings(ctx context.Context, mutate func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	previous := p.channelBindings
+	bindings := make(map[string]ChannelBinding, len(previous))
+	for key, binding := range previous {
+		bindings[key] = binding
+	}
+	if err := mutate(bindings); err != nil {
+		return nil, err
+	}
+	p.channelBindings = bindings
+	if !p.persistLockedContext(ctx) {
+		p.channelBindings = previous
+		return nil, p.persistenceErr
+	}
+	result := make(map[string]ChannelBinding, len(bindings))
+	for key, binding := range bindings {
+		result[key] = binding
+	}
+	return result, nil
+}
+
+func (p *SnapshotControlPlane) persistLockedContext(ctx context.Context) bool {
+	if p.persistence == nil {
+		return true
+	}
+	operationCtx, cancel := controlPlaneOperationContext(ctx)
+	defer cancel()
+	revision, err := p.persistence.Save(operationCtx, controlPlaneSnapshotFrom(p), p.persistenceRevision)
+	p.persistenceErr = controlPlanePersistenceError(err)
+	if err == nil {
+		p.persistenceRevision = revision
+	}
+	return p.persistenceErr == nil
+}
+
+func (p *SnapshotControlPlane) refreshLockedContext(ctx context.Context) bool {
+	if p.persistence == nil {
+		return true
+	}
+	operationCtx, cancel := controlPlaneOperationContext(ctx)
+	defer cancel()
+	snapshot, revision, err := p.persistence.Load(operationCtx)
+	p.persistenceErr = controlPlanePersistenceError(err)
+	if err != nil {
 		return false
 	}
-	p.tenants[tenant.ID] = tenant
+	if revision > p.persistenceRevision {
+		applyControlPlaneSnapshot(p, snapshot)
+		p.persistenceRevision = revision
+	}
 	return true
 }
 
-func (p *MemoryPlatform) tenant(id string) (Tenant, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	tenant, ok := p.tenants[id]
-	return tenant, ok
+func (p *SnapshotControlPlane) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.persistence == nil {
+		return nil
+	}
+	err := p.persistence.Close()
+	p.persistence = nil
+	return err
 }
 
-func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *SnapshotControlPlane) seedTenant(ctx context.Context, assignment TenantAssignment) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return p.persistenceErr
+	}
+	if _, exists := p.tenants[assignment.TenantID]; !exists {
+		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+		if !p.persistLockedContext(ctx) {
+			return p.persistenceErr
+		}
+	}
+	return nil
+}
+
+func (p *SnapshotControlPlane) createTenant(ctx context.Context, tenant Tenant) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return false, p.persistenceErr
+	}
+	if _, exists := p.tenants[tenant.ID]; exists {
+		return false, nil
+	}
+	p.tenants[tenant.ID] = tenant
+	ok := p.persistLockedContext(ctx)
+	return ok, p.persistenceErr
+}
+
+func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return Tenant{}, false, p.persistenceErr
+	}
+	tenant, ok := p.tenants[id]
+	return tenant, ok, nil
+}
+
+func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string) (DeploymentVersion, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return DeploymentVersion{}, false, p.persistenceErr
+	}
 	for _, versions := range p.versions {
 		for _, version := range versions {
 			if version.ID == id {
@@ -110,27 +322,33 @@ func (p *MemoryPlatform) DeploymentVersion(id string) (DeploymentVersion, bool) 
 					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
 						deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
 				}
-				return version, true
+				return version, true, nil
 			}
 		}
 	}
-	return DeploymentVersion{}, false
+	return DeploymentVersion{}, false, nil
 }
 
-func (p *MemoryPlatform) listTenants() []Tenant {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
 	items := make([]Tenant, 0, len(p.tenants))
 	for _, tenant := range p.tenants {
 		items = append(items, tenant)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	return items
+	return items, nil
 }
 
-func (p *MemoryPlatform) listTenantsFor(tenant TenantContext) []Tenant {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant TenantContext) ([]Tenant, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
 	items := make([]Tenant, 0, len(tenant.Assignments))
 	for _, candidate := range p.tenants {
 		if tenantCanSee(tenant, candidate.ID) {
@@ -138,7 +356,7 @@ func (p *MemoryPlatform) listTenantsFor(tenant TenantContext) []Tenant {
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	return items
+	return items, nil
 }
 
 type developmentSession struct {
@@ -154,7 +372,7 @@ type productionSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
-	platform                 *MemoryPlatform
+	platform                 ControlPlaneStore
 	identity                 DevelopmentIdentity
 	identityProvider         IdentityProvider
 	productionSessions       map[string]*productionSession
@@ -194,6 +412,7 @@ type AdminHandler struct {
 	drainCompletedAt         time.Time
 	drainError               string
 	faultInjectionEnabled    bool
+	internalGovernanceToken  string
 }
 
 // ConfigureIdentityProvider enables production identity mode. Development
@@ -207,7 +426,7 @@ func (h *AdminHandler) ConfigureIdentityProvider(provider IdentityProvider) {
 	h.productionSessions = make(map[string]*productionSession)
 	if source, ok := provider.(interface{ Assignments() []TenantAssignment }); ok {
 		for _, assignment := range source.Assignments() {
-			h.platform.seedTenant(assignment)
+			_ = h.platform.seedTenant(context.Background(), assignment)
 		}
 	}
 }
@@ -217,23 +436,25 @@ func (h *AdminHandler) ConfigureGovernance(center *GovernanceCenter) {
 		return
 	}
 	h.governance = center
+	center.configurePolicyStore(h.platform)
 	if governed, ok := h.runtime.worker.runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
 		governed.SetGovernance(center)
 	}
 }
 
-func NewAdminHandler(platform *MemoryPlatform, identity DevelopmentIdentity) *AdminHandler {
+func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *AdminHandler {
 	if platform == nil {
-		platform = NewMemoryPlatform()
+		platform = NewInMemoryControlPlane()
 	}
 	for _, assignment := range identity.Assignments {
-		platform.seedTenant(assignment)
+		_ = platform.seedTenant(context.Background(), assignment)
 	}
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	failureCtx, failureCancel := context.WithCancel(context.Background())
 	chatCtx, chatCancel := context.WithCancel(context.Background())
 	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
+	channels.configurePersistence(platform.loadChannelBindings, platform.mutateChannelBindings)
 	return &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),
@@ -270,7 +491,12 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.backendSelectionPath = path
-	if path == "" {
+	selections, err := h.platform.loadBackendSelections(context.Background())
+	if err != nil {
+		return err
+	}
+	if len(selections) > 0 || path == "" {
+		h.backends.setSelections(selections)
 		return nil
 	}
 	data, err := os.ReadFile(path)
@@ -280,11 +506,16 @@ func (h *AdminHandler) ConfigureBackendSelections(path string) error {
 	if err != nil {
 		return err
 	}
-	var selections map[string]backendSelection
-	if err := json.Unmarshal(data, &selections); err != nil {
+	var importedSelections map[string]backendSelection
+	if err := json.Unmarshal(data, &importedSelections); err != nil {
 		return err
 	}
-	h.backends.setSelections(selections)
+	h.backends.setSelections(importedSelections)
+	for tenantID, selection := range importedSelections {
+		if err := h.platform.saveBackendSelection(context.Background(), tenantID, selection); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 func (h *AdminHandler) ConfigureMigration(sourceAddress, destinationPath, checkpointPath string) {
@@ -314,9 +545,12 @@ func (h *AdminHandler) ConfigurePostgresBackend(dsn string) {
 	h.backendCatalog["postgres"] = backendSelection{Backend: "postgres", Address: dsn}
 }
 
-func (h *AdminHandler) selectBackend(tenantID string, selection backendSelection, store DataStore) error {
+func (h *AdminHandler) selectBackend(ctx context.Context, tenantID string, selection backendSelection, store DataStore) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := h.platform.saveBackendSelection(ctx, tenantID, selection); err != nil {
+		return err
+	}
 	next := h.backends.selectionSnapshot()
 	next[tenantID] = selection
 	if h.backendSelectionPath != "" {
@@ -356,7 +590,16 @@ func (h *AdminHandler) Close() error {
 	if runtimeErr != nil {
 		return runtimeErr
 	}
-	return storeErr
+	if storeErr != nil {
+		return storeErr
+	}
+	return h.platform.Close()
+}
+
+func (h *AdminHandler) isClosing() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closing
 }
 
 func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
@@ -369,7 +612,12 @@ func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
 	}
 }
 
-func (h *AdminHandler) acquireStore(tenantID string) (DataStore, func(), error) {
+func (h *AdminHandler) acquireStore(ctx context.Context, tenantID string) (DataStore, func(), error) {
+	selections, err := h.platform.loadBackendSelections(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", errControlPlaneUnavailable, err)
+	}
+	h.backends.syncSelections(selections)
 	return h.backends.acquire(tenantID)
 }
 
@@ -386,7 +634,15 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 	h.mu.Unlock()
 }
 
+func (h *AdminHandler) ConfigureSessionLeases(manager SessionLeaseManager) {
+	h.runtime.SetSessionLeaseManager(manager)
+}
+
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/internal/governance/tool/") {
+		h.handleInternalGovernance(w, r)
+		return
+	}
 	auditWriter := &auditResponseWriter{ResponseWriter: w, buffered: r.Method != http.MethodGet || r.URL.Path == "/api/v1/auth/me"}
 	w = auditWriter
 	started := time.Now()
@@ -551,7 +807,11 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listTenantsFor(trusted)})
+		items, err := h.platform.listTenantsFor(r.Context(), trusted)
+		if writeControlPlaneError(w, err) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
 		if trusted.Role != RolePlatformAdmin {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
@@ -568,7 +828,11 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
-		if !h.platform.createTenant(tenant) {
+		created, err := h.platform.createTenant(r.Context(), tenant)
+		if writeControlPlaneError(w, err) {
+			return
+		}
+		if !created {
 			writeError(w, http.StatusConflict, "tenant_exists", "tenant identifier already exists")
 			return
 		}
@@ -595,12 +859,23 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
-	tenant, exists := h.platform.tenant(id)
+	tenant, exists, err := h.platform.tenant(r.Context(), id)
+	if writeControlPlaneError(w, err) {
+		return
+	}
 	if !exists {
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, tenant)
+}
+
+func writeControlPlaneError(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, errControlPlaneUnavailable) {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+	return true
 }
 
 var resourceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{2,62}$`)

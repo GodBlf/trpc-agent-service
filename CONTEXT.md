@@ -34,6 +34,10 @@ _Avoid_: Agent App, Node
 承载 Gateway、Worker 或 Channel Adapter 等运行单元的可调度平台运行单元。
 _Avoid_: Worker, Host
 
+**Control Plane Store**:
+保存 Tenant、Agent App、Deployment、Deployment Version、Backend Selection、Channel 路由和 Governance Policy 的权威共享状态；多节点部署使用 PostgreSQL，SQLite 仅用于单节点开发，InMemory 仅用于测试。
+_Avoid_: MemoryPlatform, Local Control File, Session Store
+
 ## Conversation And Data
 
 **Channel Binding**:
@@ -48,6 +52,18 @@ _Avoid_: Conversation, Chat
 按会话顺序记录的消息、状态变化或 Agent 执行事件。
 _Avoid_: Log, Message
 
+**Projection Checkpoint**:
+记录 Session State 或 Summary 已连续投影到的最高 Session Event sequence；它不能跳过尚未处理的事件。
+_Avoid_: Migration Checkpoint, Session Sequence, Snapshot
+
+**Session Execution Lease**:
+允许一个 Gateway 在限定时间内独占执行某个 Tenant Session 的可续租资格；每次授予都产生新的 fencing token，租约丢失必须取消对应执行。
+_Avoid_: Sticky Session, Process Lock, Session Ownership
+
+**Fencing Token**:
+Session Execution Lease 每次授予时递增的序号，Storage Adapter 用它拒绝失去租约的旧 Gateway 继续写入 Session Event。
+_Avoid_: Sequence, Lock ID, Request ID
+
 **Memory**:
 可跨 Session 检索的长期信息。
 _Avoid_: Session History, Context
@@ -55,6 +71,14 @@ _Avoid_: Session History, Context
 **Summary**:
 对 Session 历史进行压缩后的上下文表示。
 _Avoid_: Memory, Snapshot
+
+**Artifact**:
+Agent 执行产生或消费的文件型内容及其租户归属、版本和存储引用；大对象内容与控制面元数据分离保存。
+_Avoid_: Knowledge, Session Event, Attachment Metadata
+
+**Knowledge**:
+Agent App 可检索的租户隔离知识集合，包括文档来源、切片及其向量索引引用。
+_Avoid_: Memory, Artifact, Prompt
 
 **Failure Event**:
 描述 Agent 执行失败的 Session Event，例如 `run.failed`，必须可被管理界面检查。
@@ -72,6 +96,14 @@ _Avoid_: In-Memory Progress, Cursor
 用于安全、合规和运营追踪的审计记录。
 _Avoid_: Application Log, Trace
 
+**Tool Outcome**:
+Tool 副作用执行结果的治理状态；当 Tool 已开始但结果无法持久化时标记为 outcome_unknown，禁止把它等同于未执行并自动重放。
+_Avoid_: Runner Error, Delivery Status
+
+**Execution Record**:
+控制面中一条 Agent 执行的权威状态记录，绑定 request、trace、Session Lease、Deployment Version、Governance Policy revision、预算预留和最终结果。
+_Avoid_: Session Event, Platform Trace, Runner Invocation
+
 ## Delivery And Integration
 
 **Phase**:
@@ -86,6 +118,10 @@ _Avoid_: tenant_id request field, User Context
 平台 Worker 调用 Agent runtime 的稳定端口及其具体实现之间的适配边界。
 _Avoid_: Worker, Agent App
 
+**Execution Manifest**:
+Gateway 为一次执行签发的不可变、可验证声明，绑定 Tenant、Agent App、Deployment Version、Governance Policy revision、请求身份和 Worker 必须执行的治理规则。
+_Avoid_: Runner Request, Deployment Configuration, Client Policy
+
 **Framework Runtime**:
 由 `trpc-agent-go` 提供的 Agent 执行能力，包括 Agent、Runner、模型消息和运行事件；平台通过 Runner Adapter 使用它，不直接把其内部类型暴露给外部接口。
 _Avoid_: Worker, Platform Runtime
@@ -94,12 +130,16 @@ _Avoid_: Worker, Platform Runtime
 根据已发布 Deployment Version 构建租户 Agent 运行实例的稳定平台能力；它决定 Agent 配置如何进入 Framework Runtime。
 _Avoid_: Runner, Agent Registry
 
+**Model Provider Profile**:
+服务端拥有的模型提供方配置，保存 OpenAI-compatible endpoint、密钥引用和允许的模型范围；Deployment Version 只能引用它，不能保存或提交模型凭据。
+_Avoid_: Model Configuration, Deployment Secret, Client Provider
+
 **Channel Adapter**:
 将外部 IM 入站/出站消息转换为平台消息和 Runner Event 的通道集成边界。
 _Avoid_: Channel Binding, Webhook Handler
 
 **Storage Adapter**:
-对 Session、Memory、Summary、Artifact、Knowledge 和 Audit Event 等平台数据提供统一访问契约的后端适配边界。
+平台对后端存储实现的统称；Session、Memory、Artifact、Knowledge 和 Audit Event 使用各自独立的存储端口，并由 Tenant 的 Backend Selection 组合路由。
 _Avoid_: Database Driver, Repository (as a backend choice)
 
 **Backend Selection**:
@@ -109,6 +149,10 @@ _Avoid_: Client-Selected Backend, Database Preference
 **Public Error Contract**:
 面向 API 消费者的稳定错误码与脱敏消息，不包含后端地址、路径、凭据或驱动细节。
 _Avoid_: Raw Driver Error, Internal Diagnostic
+
+**Public API Contract**:
+Management Console 和外部调用方依赖的 HTTP 路径、请求响应语义、SSE envelope 与稳定错误码；内部 Go 接口、数据库结构和 Gateway/Worker 协议不属于该兼容边界。
+_Avoid_: Internal Worker Protocol, Database Schema
 
 **Deployment Version**:
 Agent App 一次可发布、可路由并可回滚的配置版本。
@@ -191,3 +235,11 @@ _Avoid_: Audit Event, Application Log
 **Governance Center**:
 承载 Governance Policy、Audit Event、Tool Confirmation、预算/限流计数和 Platform Trace 的服务端边界。
 _Avoid_: Framework Runtime, Management Console
+
+**Governance API**:
+供 Worker 在 Tool 执行边界持久化治理决定、Tool Confirmation 和执行结果的内部服务接口；它不属于 Public API Contract。
+_Avoid_: Admin API, Governance Policy, Tool Callback
+
+**Control Plane Outbox**:
+与控制面状态变更在同一 PostgreSQL 事务内写入的待发布记录，用于可靠导出 Audit Event、指标或 Trace。
+_Avoid_: Application Log, Best-Effort Callback

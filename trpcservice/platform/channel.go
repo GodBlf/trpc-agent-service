@@ -84,6 +84,39 @@ type ChannelCoordinator struct {
 	acceptedMessages map[string]struct{}
 	adapter          ChannelAdapter
 	adapters         map[string]ChannelAdapter
+	load             func(context.Context) (map[string]ChannelBinding, error)
+	mutate           func(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
+}
+
+func (c *ChannelCoordinator) configurePersistence(load func(context.Context) (map[string]ChannelBinding, error), mutate func(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.load = load
+	c.mutate = mutate
+}
+
+func (c *ChannelCoordinator) refreshLocked(ctx context.Context) error {
+	if c.load == nil {
+		return nil
+	}
+	bindings, err := c.load(ctx)
+	if err != nil {
+		return err
+	}
+	c.bindings = bindings
+	return nil
+}
+
+func (c *ChannelCoordinator) mutateLocked(ctx context.Context, mutate func(map[string]ChannelBinding) error) error {
+	if c.mutate == nil {
+		return mutate(c.bindings)
+	}
+	bindings, err := c.mutate(ctx, mutate)
+	if err != nil {
+		return err
+	}
+	c.bindings = bindings
+	return nil
 }
 
 func NewChannelCoordinator(adapter ChannelAdapter) *ChannelCoordinator {
@@ -123,7 +156,7 @@ func (c *ChannelCoordinator) MockFaults(tenantID, sessionID string) MockFaultCon
 	return mock.Faults(tenantID, sessionID)
 }
 
-func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createChannelBindingRequest) (ChannelBinding, error) {
+func (c *ChannelCoordinator) CreateBinding(ctx context.Context, tenant TenantContext, request createChannelBindingRequest) (ChannelBinding, error) {
 	if request.Channel != ChannelMock {
 		return ChannelBinding{}, errors.New("platform: unsupported channel")
 	}
@@ -161,77 +194,107 @@ func (c *ChannelCoordinator) CreateBinding(tenant TenantContext, request createC
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, existing := range c.bindings {
-		if existing.TenantID == binding.TenantID && existing.Channel == binding.Channel && existing.ConversationID == binding.ConversationID && existing.AppID == binding.AppID {
-			return ChannelBinding{}, ErrDuplicateEvent
+	if err := c.mutateLocked(ctx, func(bindings map[string]ChannelBinding) error {
+		for _, existing := range bindings {
+			if existing.TenantID == binding.TenantID && existing.Channel == binding.Channel && existing.ConversationID == binding.ConversationID && existing.AppID == binding.AppID {
+				return ErrDuplicateEvent
+			}
 		}
+		bindings[binding.ID] = binding
+		return nil
+	}); err != nil {
+		return ChannelBinding{}, err
 	}
-	c.bindings[binding.ID] = binding
 	return binding, nil
 }
 
-func (c *ChannelCoordinator) UpdateBinding(tenantID, id string, enabled bool) (ChannelBinding, error) {
+func (c *ChannelCoordinator) UpdateBinding(ctx context.Context, tenantID, id string, enabled bool) (ChannelBinding, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	binding, ok := c.bindings[id]
-	if !ok || binding.TenantID != tenantID {
-		return ChannelBinding{}, ErrNotFound
+	var binding ChannelBinding
+	if err := c.mutateLocked(ctx, func(bindings map[string]ChannelBinding) error {
+		var ok bool
+		binding, ok = bindings[id]
+		if !ok || binding.TenantID != tenantID {
+			return ErrNotFound
+		}
+		binding.Enabled = enabled
+		bindings[id] = binding
+		return nil
+	}); err != nil {
+		return ChannelBinding{}, err
 	}
-	binding.Enabled = enabled
-	c.bindings[id] = binding
 	binding.Secret = ""
 	return binding, nil
 }
 
-func (c *ChannelCoordinator) ReplaceSecret(tenantID, id, secret string) (ChannelBinding, error) {
+func (c *ChannelCoordinator) ReplaceSecret(ctx context.Context, tenantID, id, secret string) (ChannelBinding, error) {
 	secret = strings.TrimSpace(secret)
 	if len(secret) < 8 || len(secret) > 512 {
 		return ChannelBinding{}, errors.New("platform: invalid channel secret")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	binding, ok := c.bindings[id]
-	if !ok || binding.TenantID != tenantID {
-		return ChannelBinding{}, ErrNotFound
+	var binding ChannelBinding
+	if err := c.mutateLocked(ctx, func(bindings map[string]ChannelBinding) error {
+		var ok bool
+		binding, ok = bindings[id]
+		if !ok || binding.TenantID != tenantID {
+			return ErrNotFound
+		}
+		binding.Secret = secret
+		bindings[id] = binding
+		return nil
+	}); err != nil {
+		return ChannelBinding{}, err
 	}
-	binding.Secret = secret
-	c.bindings[id] = binding
 	binding.Secret = ""
 	return binding, nil
 }
 
-func (c *ChannelCoordinator) DeleteBinding(tenantID, id string) error {
+func (c *ChannelCoordinator) DeleteBinding(ctx context.Context, tenantID, id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	binding, ok := c.bindings[id]
-	if !ok || binding.TenantID != tenantID {
-		return ErrNotFound
+	return c.mutateLocked(ctx, func(bindings map[string]ChannelBinding) error {
+		binding, ok := bindings[id]
+		if !ok || binding.TenantID != tenantID {
+			return ErrNotFound
+		}
+		delete(bindings, id)
+		return nil
+	})
+}
+
+func (c *ChannelCoordinator) Binding(ctx context.Context, tenantID, id string) (ChannelBinding, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.refreshLocked(ctx); err != nil {
+		return ChannelBinding{}, false, err
 	}
-	delete(c.bindings, id)
-	return nil
-}
-
-func (c *ChannelCoordinator) Binding(tenantID, id string) (ChannelBinding, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	binding, ok := c.bindings[id]
-	return binding, ok && binding.TenantID == tenantID
+	return binding, ok && binding.TenantID == tenantID, nil
 }
 
-func (c *ChannelCoordinator) BindingForSession(tenantID, sessionID string) (ChannelBinding, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func (c *ChannelCoordinator) BindingForSession(ctx context.Context, tenantID, sessionID string) (ChannelBinding, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.refreshLocked(ctx); err != nil {
+		return ChannelBinding{}, false, err
+	}
 	for _, binding := range c.bindings {
 		if binding.TenantID == tenantID && binding.SessionID == sessionID {
-			return binding, true
+			return binding, true, nil
 		}
 	}
-	return ChannelBinding{}, false
+	return ChannelBinding{}, false, nil
 }
 
-func (c *ChannelCoordinator) ListBindings(tenantID string) []ChannelBinding {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func (c *ChannelCoordinator) ListBindings(ctx context.Context, tenantID string) ([]ChannelBinding, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.refreshLocked(ctx); err != nil {
+		return nil, err
+	}
 	items := []ChannelBinding{}
 	for _, binding := range c.bindings {
 		if binding.TenantID == tenantID {
@@ -241,11 +304,14 @@ func (c *ChannelCoordinator) ListBindings(tenantID string) []ChannelBinding {
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	return items
+	return items, nil
 }
 
 func (c *ChannelCoordinator) Receive(ctx context.Context, tenantID string, callback ChannelCallback) (ChannelBinding, ChannelMessage, error) {
-	binding, ok := c.Binding(tenantID, callback.BindingID)
+	binding, ok, err := c.Binding(ctx, tenantID, callback.BindingID)
+	if err != nil {
+		return ChannelBinding{}, ChannelMessage{}, err
+	}
 	if !ok {
 		return ChannelBinding{}, ChannelMessage{}, ErrNotFound
 	}
@@ -256,9 +322,13 @@ func (c *ChannelCoordinator) Receive(ctx context.Context, tenantID string, callb
 }
 
 func (c *ChannelCoordinator) ReceiveExternal(ctx context.Context, callback ChannelCallback) (ChannelBinding, ChannelMessage, error) {
-	c.mu.RLock()
+	c.mu.Lock()
+	if err := c.refreshLocked(ctx); err != nil {
+		c.mu.Unlock()
+		return ChannelBinding{}, ChannelMessage{}, err
+	}
 	binding, ok := c.bindings[callback.BindingID]
-	c.mu.RUnlock()
+	c.mu.Unlock()
 	if !ok {
 		return ChannelBinding{}, ChannelMessage{}, ErrNotFound
 	}
@@ -314,7 +384,9 @@ func (c *ChannelCoordinator) Send(ctx context.Context, binding ChannelBinding, r
 		return ChannelDelivery{}, errors.New("platform: channel adapter unavailable")
 	}
 	if !binding.PlatformOwned {
-		if _, ok := c.Binding(binding.TenantID, binding.ID); !ok {
+		if _, ok, err := c.Binding(ctx, binding.TenantID, binding.ID); err != nil {
+			return ChannelDelivery{}, err
+		} else if !ok {
 			return ChannelDelivery{}, ErrNotFound
 		}
 	}

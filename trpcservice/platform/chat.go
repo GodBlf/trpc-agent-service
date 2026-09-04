@@ -134,7 +134,11 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		h.providers.recordRejected(provider, subject, requestID, rejectionCode, route)
 		return ErrProviderMessageIgnored
 	}
-	if _, ok := h.platform.app(route.TenantID, route.AppID); !ok {
+	if _, ok, err := h.platform.app(ctx, route.TenantID, route.AppID); err != nil || !ok {
+		if err != nil {
+			h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", route)
+			return errors.New("control_plane_unavailable")
+		}
 		h.providers.recordRejected(provider, subject, requestID, "route_unavailable", route)
 		return errors.New("provider route unavailable")
 	}
@@ -187,7 +191,7 @@ func (h *AdminHandler) redeliverProviderReply(binding ChannelBinding, requestID 
 	h.chatWG.Add(1)
 	go func() {
 		defer h.chatWG.Done()
-		store, release, err := h.acquireStore(binding.TenantID)
+		store, release, err := h.acquireStore(h.chatCtx, binding.TenantID)
 		if err != nil {
 			return
 		}
@@ -301,7 +305,12 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.channels.ListBindings(tenant.TenantID)})
+		items, err := h.channels.ListBindings(r.Context(), tenant.TenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
 		if !canOperate(tenant.Role) {
 			writeError(w, http.StatusForbidden, "forbidden", "operator role is required")
@@ -312,22 +321,29 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel, app, conversation, and user identifiers are required")
 			return
 		}
-		if _, exists := h.platform.app(tenant.TenantID, request.AppID); !exists {
+		if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AppID); err != nil || !exists {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
-		binding, err := h.channels.CreateBinding(tenant, request)
+		binding, err := h.channels.CreateBinding(r.Context(), tenant, request)
 		if errors.Is(err, ErrDuplicateEvent) {
 			writeError(w, http.StatusConflict, "channel_binding_exists", "channel binding already exists")
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel binding is invalid")
+			if errors.Is(err, errControlPlaneUnavailable) {
+				writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			} else {
+				writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel binding is invalid")
+			}
 			return
 		}
-		store, release, err := h.acquireStore(tenant.TenantID)
+		store, release, err := h.acquireStore(r.Context(), tenant.TenantID)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "storage_error", "storage unavailable")
+			writeStorageError(w, err)
 			return
 		}
 		defer release()
@@ -369,18 +385,25 @@ func (h *AdminHandler) handleChannelBindingResource(w http.ResponseWriter, r *ht
 		var binding ChannelBinding
 		var err error
 		if request.Enabled != nil {
-			binding, err = h.channels.UpdateBinding(tenant.TenantID, id, *request.Enabled)
+			binding, err = h.channels.UpdateBinding(r.Context(), tenant.TenantID, id, *request.Enabled)
 		} else {
-			binding, err = h.channels.ReplaceSecret(tenant.TenantID, id, request.Secret)
+			binding, err = h.channels.ReplaceSecret(r.Context(), tenant.TenantID, id, request.Secret)
 		}
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
 			return
 		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+			return
+		}
 		writeJSON(w, http.StatusOK, binding)
 	case http.MethodDelete:
-		if err := h.channels.DeleteBinding(tenant.TenantID, id); errors.Is(err, ErrNotFound) {
+		if err := h.channels.DeleteBinding(r.Context(), tenant.TenantID, id); errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "channel_binding_not_found", "channel binding was not found")
+			return
+		} else if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -596,7 +619,10 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
-		if _, ok := h.platform.app(route.TenantID, route.AppID); !ok {
+		if _, ok, err := h.platform.app(r.Context(), route.TenantID, route.AppID); err != nil || !ok {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -626,7 +652,10 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		if request.ProviderAccount == "" {
 			request.ProviderAccount = existing.ProviderAccount
 		}
-		if _, ok := h.platform.app(request.TenantID, request.AppID); !ok {
+		if _, ok, err := h.platform.app(r.Context(), request.TenantID, request.AppID); err != nil || !ok {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -707,7 +736,10 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_chat_session", "app id is required")
 		return
 	}
-	if _, exists := h.platform.app(tenant.TenantID, request.AppID); !exists {
+	if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AppID); err != nil || !exists {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 		return
 	}
@@ -724,7 +756,7 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_chat_session", "session id is invalid")
 		return
 	}
-	store, release, err := h.acquireStore(tenant.TenantID)
+	store, release, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -749,7 +781,7 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 		writeStorageError(w, createErr)
 		return
 	}
-	if _, err := h.channels.CreateBinding(tenant, createChannelBindingRequest{
+	if _, err := h.channels.CreateBinding(r.Context(), tenant, createChannelBindingRequest{
 		Channel: ChannelMock, AppID: request.AppID, ConversationType: ConversationSingle,
 		ConversationID: "chat:" + sessionID, UserID: tenant.UserID, SessionID: sessionID,
 	}); err != nil {
@@ -781,6 +813,11 @@ func (h *AdminHandler) handleSendChatMessage(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid_request_id", "request id must be 1 to 128 printable ASCII characters")
 		return
 	}
+	traceParent := strings.ToLower(strings.TrimSpace(r.Header.Get("traceparent")))
+	if traceParent != "" && !validTraceParent(traceParent) {
+		writeError(w, http.StatusBadRequest, "invalid_traceparent", "traceparent is invalid")
+		return
+	}
 	events, err := h.chatEvents(r.Context(), tenant.TenantID, sessionID)
 	if err != nil {
 		writeStorageError(w, err)
@@ -797,7 +834,7 @@ func (h *AdminHandler) handleSendChatMessage(w http.ResponseWriter, r *http.Requ
 	}
 	result, err := h.startChatRun(chatRunOptions{
 		tenant: tenant, appID: appID, sessionID: sessionID, input: request.Input,
-		requestID: requestID, userID: tenant.UserID,
+		requestID: requestID, userID: tenant.UserID, traceParent: traceParent,
 	})
 	if err != nil {
 		writeChatStartError(w, err)
@@ -887,7 +924,7 @@ func (h *AdminHandler) handleChatStream(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
 		return
 	}
-	store, release, err := h.acquireStore(tenant.TenantID)
+	store, release, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1032,12 +1069,15 @@ type chatRunOptions struct {
 	userID         string
 	binding        *ChannelBinding
 	traceID        string
+	traceParent    string
 	policyRevision uint64
+	fencingToken   uint64
 }
 
 type activeChatRun struct {
 	cancel context.CancelFunc
 	input  string
+	done   <-chan struct{}
 }
 
 func (o chatRunOptions) provider() string {
@@ -1055,7 +1095,11 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		return chatRunResponse{}, errors.New("forbidden")
 	}
 	if options.binding == nil {
-		if binding, ok := h.channels.BindingForSession(options.tenant.TenantID, options.sessionID); ok {
+		binding, ok, err := h.channels.BindingForSession(h.chatCtx, options.tenant.TenantID, options.sessionID)
+		if err != nil {
+			return chatRunResponse{}, err
+		}
+		if ok {
 			options.binding = &binding
 		}
 	}
@@ -1065,6 +1109,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	}
 	options.input = governanceResult.Input
 	options.traceID = governanceResult.TraceID
+	if options.traceParent == "" {
+		options.traceParent = newTraceParent(options.traceID)
+	}
 	options.policyRevision = governanceResult.PolicyRevision
 	started := false
 	defer func() {
@@ -1078,9 +1125,12 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 	}
 	storageStarted := time.Now()
-	store, release, err := h.acquireStore(options.tenant.TenantID)
+	store, release, err := h.acquireStore(h.chatCtx, options.tenant.TenantID)
 	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	if err != nil {
+		if errors.Is(err, errControlPlaneUnavailable) {
+			return chatRunResponse{}, errControlPlaneUnavailable
+		}
 		return chatRunResponse{}, storageFailureError(err)
 	}
 	defer func() {
@@ -1111,7 +1161,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	}
 	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	inputPayload, _ := json.Marshal(map[string]string{
-		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID, "trace_id": options.traceID,
+		"app_id": options.appID, "input": options.input, "request_id": options.requestID, "user_id": options.userID, "trace_id": options.traceID, "traceparent": options.traceParent,
 	})
 	recoveryOptions := options
 	existingInput := false
@@ -1121,11 +1171,12 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			continue
 		}
 		var persistedInput struct {
-			AppID     string `json:"app_id"`
-			Input     string `json:"input"`
-			UserID    string `json:"user_id"`
-			RequestID string `json:"request_id"`
-			TraceID   string `json:"trace_id"`
+			AppID       string `json:"app_id"`
+			Input       string `json:"input"`
+			UserID      string `json:"user_id"`
+			RequestID   string `json:"request_id"`
+			TraceID     string `json:"trace_id"`
+			TraceParent string `json:"traceparent"`
 		}
 		if event.Type != "message.input" || json.Unmarshal(event.Payload, &persistedInput) != nil ||
 			persistedInput.Input != options.input || (persistedInput.AppID != "" && persistedInput.AppID != options.appID) ||
@@ -1149,6 +1200,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 		if persistedInput.TraceID != "" {
 			recoveryOptions.traceID = persistedInput.TraceID
+		}
+		if persistedInput.TraceParent != "" {
+			recoveryOptions.traceParent = persistedInput.TraceParent
 		}
 		recoveryOptions.input = persistedInput.Input
 		options = recoveryOptions
@@ -1191,13 +1245,18 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		h.chatMu.Unlock()
 		return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
 	}
-	policy, policyFound := h.governance.Policy(options.tenant.TenantID, options.appID)
+	policy, policyFound, err := h.governance.Policy(h.chatCtx, options.tenant.TenantID, options.appID)
+	if err != nil {
+		h.chatMu.Unlock()
+		return chatRunResponse{}, &GovernanceError{Code: "control_plane_unavailable"}
+	}
 	if !policyFound {
 		h.chatMu.Unlock()
 		return chatRunResponse{}, &GovernanceError{Code: "policy_unavailable"}
 	}
 	runCtx, cancel := runtimeTimeoutContext(h.chatCtx, policy.runtimeTimeout())
-	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input}
+	done := make(chan struct{})
+	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input, done: done}
 	h.chatWG.Add(1)
 	started = true
 	h.chatMu.Unlock()
@@ -1208,6 +1267,7 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			h.chatMu.Lock()
 			delete(h.activeRuns, key)
 			h.chatMu.Unlock()
+			close(done)
 			cancel()
 			release()
 		}()
@@ -1227,8 +1287,13 @@ func runtimeTimeoutContext(parent context.Context, timeout time.Duration) (conte
 
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
 	governanceRequest := h.governanceRequest(options)
+	agentInput, err := contextualAgentInput(ctx, store, options)
+	if err != nil {
+		h.finishChatStorageFailure(store, options, governanceRequest, err)
+		return
+	}
 	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
-		AppID: options.appID, SessionID: options.sessionID, Input: options.input, RequestID: options.requestID, TraceID: options.traceID, PolicyRevision: options.policyRevision,
+		AppID: options.appID, SessionID: options.sessionID, Input: agentInput, RequestID: options.requestID, TraceID: options.traceID, TraceParent: options.traceParent, PolicyRevision: options.policyRevision,
 		Channel: options.provider(), ExternalSubject: optionsExternalSubject(options),
 	})
 	if err != nil {
@@ -1237,6 +1302,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 		if spanErr := h.governance.RecordSpan(governanceRequest, options.traceID, "worker.execute", "error"); spanErr != nil {
+			return
+		}
+		if markErr := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); markErr != nil {
 			return
 		}
 		cancelled := err.Error() == "request_cancelled" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -1258,7 +1326,7 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			h.providers.recordTerminalIfPending(providerDeliveryBinding(*options.binding), ChannelReply{MessageID: options.requestID}, code)
 		}
 		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
-		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", eventType, h.chatIdentityPayload(options, map[string]string{"error": "run failed"}))
+		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", eventType, h.chatIdentityPayload(options, map[string]string{"error": err.Error()}))
 		cancel()
 		return
 	}
@@ -1275,6 +1343,20 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	var usageKnown bool
 	deltaNumber := 0
 	for runtimeEvent := range events {
+		if token, parseErr := strconv.ParseUint(runtimeEvent.Data["fencing_token"], 10, 64); parseErr == nil && token > 0 {
+			options.fencingToken = token
+		}
+		if runtimeEvent.Type == "session.lease.acquired" {
+			payload := h.chatIdentityPayload(options, runtimeEvent.Data)
+			leaseKey := options.requestID + ":lease-" + strconv.FormatUint(options.fencingToken, 10)
+			if err := h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, leaseKey, runtimeEvent.Type, payload); err != nil {
+				return
+			}
+			if err := h.cancelSupersededChatRuns(ctx, store, options); err != nil {
+				return
+			}
+			continue
+		}
 		if tokens, known := runtimeUsage(runtimeEvent.Data); known {
 			usageTokens, usageKnown = tokens, true
 		}
@@ -1305,10 +1387,16 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		if runtimeEvent.Type == "run.failed" {
 			if strings.Contains(runtimeEvent.Data["error"], "confirmation_required") {
 				_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
+				if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+					return
+				}
 				h.appendPendingConfirmationEvent(store, options)
 				return
 			}
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "error")
+			if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+				return
+			}
 			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "runner_failed", false)); err != nil {
 				return
 			}
@@ -1325,6 +1413,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		if runtimeEvent.Type == "run.cancelled" {
 			_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
+			if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+				return
+			}
 			if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
 				return
 			}
@@ -1342,6 +1433,9 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	}
 	if ctx.Err() != nil {
 		_ = h.governance.RecordSpan(governanceRequest, options.traceID, "runner.run", "cancelled")
+		if err := h.governance.MarkExecutingToolsOutcomeUnknown(h.chatCtx, governanceRequest, options.traceID); err != nil {
+			return
+		}
 		if _, err := completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "cancelled", true)); err != nil {
 			return
 		}
@@ -1358,13 +1452,6 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	if outputBlocked {
 		errorType = "output_guardrail"
 	}
-	output, err = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, output, usageTokens, usageKnown, errorType, false))
-	if err != nil {
-		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
-		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "audit unavailable"}))
-		cancel()
-		return
-	}
 	if sawCompleted {
 		if bufferOutput {
 			payload := h.chatIdentityPayload(options, map[string]string{"delta": output})
@@ -1372,6 +1459,45 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		payload := h.chatIdentityPayload(options, map[string]string{"output": output})
 		_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", "message.completed", payload)
+		if err := store.PutMemory(ctx, MemoryRecord{
+			TenantID: options.tenant.TenantID, SessionID: options.sessionID,
+			Key: "latest_agent_reply", Value: output, FencingToken: options.fencingToken,
+		}); err != nil {
+			_, _ = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", usageTokens, usageKnown, "storage_error", false))
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":memory-failed", "memory.write.failed", h.chatIdentityPayload(options, map[string]string{"error": "memory write failed"}))
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "memory write failed"}))
+			cancel()
+			return
+		}
+		if err := h.governance.RecordSpan(governanceRequest, options.traceID, "storage.memory.write", "ok"); err != nil {
+			return
+		}
+	}
+	output, err = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, output, usageTokens, usageKnown, errorType, false))
+	if err != nil {
+		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "audit unavailable"}))
+		cancel()
+		return
+	}
+	if artifacts, ok := store.(ArtifactStore); ok && sawCompleted {
+		_, artifactErr := artifacts.PutArtifact(ctx, Artifact{
+			TenantID: options.tenant.TenantID, SessionID: options.sessionID,
+			Name:       "response-" + options.requestID + ".txt",
+			ContentRef: "session-event://" + options.tenant.TenantID + "/" + options.sessionID + "/" + options.requestID + ":completed",
+			RequestID:  options.requestID, TraceID: options.traceID, Status: "published",
+			FencingToken: options.fencingToken,
+		})
+		if artifactErr != nil {
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":artifact-failed", "artifact.publication.failed", h.chatIdentityPayload(options, map[string]string{"error": "artifact publication failed"}))
+			cancel()
+			return
+		}
+		if err := h.governance.RecordSpan(governanceRequest, options.traceID, "storage.artifact.publish", "ok"); err != nil {
+			return
+		}
 	}
 	if options.binding != nil {
 		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: output})
@@ -1411,6 +1537,105 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
 	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
 	cancelTerminal()
+}
+
+func (h *AdminHandler) cancelSupersededChatRuns(ctx context.Context, store DataStore, options chatRunOptions) error {
+	events, err := store.ListSessionEvents(ctx, options.tenant.TenantID, options.sessionID, 0)
+	if err != nil {
+		return err
+	}
+	started := make(map[string]struct{})
+	terminal := make(map[string]struct{})
+	identities := make(map[string]map[string]string)
+	for _, event := range events {
+		switch {
+		case event.Type == "message.input" && strings.HasSuffix(event.IdempotencyKey, ":input"):
+			requestID := strings.TrimSuffix(event.IdempotencyKey, ":input")
+			var identity map[string]string
+			if json.Unmarshal(event.Payload, &identity) == nil {
+				identities[requestID] = identity
+			}
+		case event.Type == "run.started" && strings.HasSuffix(event.IdempotencyKey, ":started"):
+			started[strings.TrimSuffix(event.IdempotencyKey, ":started")] = struct{}{}
+		case (event.Type == "run.completed" || event.Type == "run.failed" || event.Type == "run.cancelled") && strings.HasSuffix(event.IdempotencyKey, ":terminal"):
+			terminal[strings.TrimSuffix(event.IdempotencyKey, ":terminal")] = struct{}{}
+		case event.Type == "run.completed" && strings.HasSuffix(event.IdempotencyKey, ":run-completed"):
+			terminal[strings.TrimSuffix(event.IdempotencyKey, ":run-completed")] = struct{}{}
+		}
+	}
+	for requestID := range started {
+		if requestID == options.requestID {
+			continue
+		}
+		if _, complete := terminal[requestID]; complete {
+			continue
+		}
+		payload := make(map[string]string, len(identities[requestID])+4)
+		for key, value := range identities[requestID] {
+			payload[key] = value
+		}
+		payload["tenant_id"] = options.tenant.TenantID
+		payload["session_id"] = options.sessionID
+		payload["request_id"] = requestID
+		payload["error"] = "lease_superseded"
+		payload["fencing_token"] = strconv.FormatUint(options.fencingToken, 10)
+		if err := h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, requestID+":terminal", "run.cancelled", payload); err != nil && !errors.Is(err, ErrDuplicateEvent) {
+			return err
+		}
+	}
+	return nil
+}
+
+func contextualAgentInput(ctx context.Context, store DataStore, options chatRunOptions) (string, error) {
+	sections := make([]string, 0, 2)
+	memory, err := store.ListMemory(ctx, options.tenant.TenantID, options.sessionID)
+	if err != nil {
+		return "", err
+	}
+	if len(memory) > 0 {
+		var values []string
+		for _, item := range memory {
+			values = append(values, item.Key+"="+item.Value)
+		}
+		sections = append(sections, "Memory:\n"+strings.Join(values, "\n"))
+	}
+	if knowledge, ok := store.(KnowledgeStore); ok {
+		records, err := knowledge.ListKnowledge(ctx, options.tenant.TenantID, options.appID)
+		if err != nil {
+			return "", err
+		}
+		if len(records) > 0 {
+			var values []string
+			for _, item := range records {
+				values = append(values, item.Content)
+			}
+			sections = append(sections, "Knowledge:\n"+strings.Join(values, "\n"))
+		}
+	}
+	if len(sections) == 0 {
+		return options.input, nil
+	}
+	return strings.Join(sections, "\n\n") + "\n\nUser:\n" + options.input, nil
+}
+
+func (h *AdminHandler) finishChatStorageFailure(store DataStore, options chatRunOptions, request GovernanceRequest, cause error) {
+	_ = h.governance.RecordSpan(request, options.traceID, "storage.context.read", "error")
+	_, _ = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, "storage_error", false))
+	terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+	defer cancel()
+	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": storageFailureError(cause).Error()}))
+}
+
+func newTraceParent(traceID string) string {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if len(traceID) != 32 {
+		buf := make([]byte, 16)
+		_, _ = rand.Read(buf)
+		traceID = hex.EncodeToString(buf)
+	}
+	span := make([]byte, 8)
+	_, _ = rand.Read(span)
+	return "00-" + traceID + "-" + hex.EncodeToString(span) + "-01"
 }
 
 func (h *AdminHandler) appendPendingConfirmationEvent(store DataStore, options chatRunOptions) {
@@ -1454,7 +1679,10 @@ func (h *AdminHandler) chatIdentityPayload(options chatRunOptions, values map[st
 		"user_id": options.userID, "request_id": options.requestID, "trace_id": options.traceID,
 		"policy_revision": strconv.FormatUint(options.policyRevision, 10),
 	}
-	if deployment, ok := h.platform.activeDeployment(options.tenant.TenantID, options.appID); ok {
+	if options.fencingToken > 0 {
+		payload["fencing_token"] = strconv.FormatUint(options.fencingToken, 10)
+	}
+	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
 		payload["deployment_id"] = deployment.ID
 		payload["version_id"] = deployment.VersionID
 	}
@@ -1478,8 +1706,8 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		request.ConversationType = options.binding.ConversationType
 		request.ExternalSubject = options.binding.ConversationID
 	}
-	if deployment, ok := h.platform.activeDeployment(options.tenant.TenantID, options.appID); ok {
-		if version, found := h.platform.DeploymentVersion(deployment.VersionID); found {
+	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
+		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, deployment.VersionID); found {
 			request.RequiredTools = configStrings(version.Config, "tools")
 			request.RequiredMCP = configStrings(version.Config, "mcp")
 		}
@@ -1540,8 +1768,13 @@ func (h *AdminHandler) appendChatEvent(ctx context.Context, store DataStore, ten
 	if err != nil {
 		return err
 	}
+	var fencingToken uint64
+	if fields, ok := payload.(map[string]string); ok {
+		fencingToken, _ = strconv.ParseUint(fields["fencing_token"], 10, 64)
+	}
 	return store.AppendSessionEvent(ctx, SessionEvent{
 		TenantID: tenantID, SessionID: sessionID, IdempotencyKey: idempotencyKey, Type: eventType, Payload: encoded,
+		FencingToken: fencingToken,
 	})
 }
 
@@ -1563,7 +1796,7 @@ func (h *AdminHandler) appendCriticalChatEvent(ctx context.Context, store DataSt
 }
 
 func (h *AdminHandler) chatEvents(ctx context.Context, tenantID, sessionID string) ([]SessionEvent, error) {
-	store, release, err := h.acquireStore(tenantID)
+	store, release, err := h.acquireStore(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -1578,6 +1811,10 @@ func boundedStorageContext(parent context.Context) (context.Context, context.Can
 }
 
 func writeStorageError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errControlPlaneUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+		return
+	}
 	code := storageFailureError(err).Error()
 	switch code {
 	case "storage_timeout":
@@ -1688,6 +1925,8 @@ func writeChatStartError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
 	case "storage_unavailable":
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "storage is unavailable")
+	case "control_plane_unavailable":
+		writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
 	default:
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
 	}

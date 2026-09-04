@@ -15,7 +15,7 @@ import (
 )
 
 func TestMemoryPostReturnsPersistedRecord(t *testing.T) {
-	handler := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
+	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 	response, err := server.Client().Post(server.URL+"/api/v1/admin/memory/session-one", "application/json", bytes.NewBufferString(`{"key":"name","value":"Ada"}`))
@@ -128,7 +128,7 @@ func TestMigrationIsRejectedAfterHandlerClose(t *testing.T) {
 
 func TestDataManagementAPIUsesTrustedTenantAndBackendSelection(t *testing.T) {
 	redisServer := miniredis.RunT(t)
-	h := NewAdminHandler(NewMemoryPlatform(), DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RolePlatformAdmin}, {TenantID: "tenant-b", TenantName: "B", Role: RoleViewer}}})
+	h := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-a", TenantName: "A", Role: RolePlatformAdmin}, {TenantID: "tenant-b", TenantName: "B", Role: RoleViewer}}})
 	h.ConfigureBackendCatalog(redisServer.Addr(), "")
 	ts := httptest.NewServer(h)
 	defer ts.Close()
@@ -150,7 +150,7 @@ func TestDataManagementAPIUsesTrustedTenantAndBackendSelection(t *testing.T) {
 		t.Fatalf("select=%d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	store, releaseStore, err := h.acquireStore("tenant-a")
+	store, releaseStore, err := h.acquireStore(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}

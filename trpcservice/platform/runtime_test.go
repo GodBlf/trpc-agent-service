@@ -10,23 +10,28 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
 )
 
-func activeTestPlatform(t *testing.T) *MemoryPlatform {
+func activeTestPlatform(t *testing.T) *SnapshotControlPlane {
 	t.Helper()
-	store := NewMemoryPlatform()
-	store.seedTenant(TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator})
-	if !store.createApp(AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}) {
+	store := NewInMemoryControlPlane()
+	if err := store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator}); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}); err != nil || !created {
 		t.Fatal("create app")
 	}
 	deployment := Deployment{ID: "deploy-one", TenantID: "tenant-one", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(deployment) {
+	if created, err := store.createDeployment(context.Background(), deployment); err != nil || !created {
 		t.Fatal("create deployment")
 	}
-	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
-	if !ok {
+	version, _, _, err := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _, ok, err := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
+	if err != nil || !ok {
 		t.Fatal("publish")
 	}
-	if _, _, ok := store.transition(published, DeploymentActive, ""); !ok {
+	if _, _, ok, err := store.transition(context.Background(), published, DeploymentActive, ""); err != nil || !ok {
 		t.Fatal("activate")
 	}
 	return store
@@ -44,6 +49,36 @@ type capturingRunner struct {
 	request chan RunnerRequest
 	err     error
 }
+
+type losingLeaseManager struct {
+	lost chan struct{}
+}
+
+func (m *losingLeaseManager) Acquire(context.Context, string, string) (SessionExecutionLease, error) {
+	return SessionExecutionLease{FencingToken: 42, Lost: m.lost}, nil
+}
+
+func (*losingLeaseManager) Close() error { return nil }
+
+type quietStreamingRunner struct {
+	started chan struct{}
+}
+
+func (r quietStreamingRunner) Run(context.Context, RunnerRequest) (RunnerResponse, error) {
+	return RunnerResponse{}, nil
+}
+
+func (r quietStreamingRunner) RunEvents(ctx context.Context, _ RunnerRequest) (<-chan RuntimeEvent, error) {
+	events := make(chan RuntimeEvent)
+	close(r.started)
+	go func() {
+		defer close(events)
+		<-ctx.Done()
+	}()
+	return events, nil
+}
+
+func (quietStreamingRunner) Close() error { return nil }
 
 type notifyingLifecycle struct {
 	*lifecycle.Service
@@ -144,22 +179,58 @@ func TestRuntimeSerializesSameSessionAndRunsDifferentSessionsConcurrently(t *tes
 	}
 }
 
+func TestRuntimeStreamEmitsCancelledWhenLeaseIsLostWithoutWorkerEvent(t *testing.T) {
+	started := make(chan struct{})
+	lost := make(chan struct{})
+	runtime := NewRuntime(activeTestPlatform(t), quietStreamingRunner{started: started}, nil)
+	runtime.SetSessionLeaseManager(&losingLeaseManager{lost: lost})
+
+	events, err := runtime.Stream(context.Background(), TenantContext{TenantID: "tenant-one", Role: RoleOperator}, GatewayRequest{
+		AppID: "app-one", SessionID: "session", Input: "hello", RequestID: "request-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	leaseEvent := <-events
+	if leaseEvent.Type != "session.lease.acquired" || leaseEvent.Data["fencing_token"] != "42" {
+		t.Fatalf("lease event = %#v", leaseEvent)
+	}
+	close(lost)
+	select {
+	case event, ok := <-events:
+		if !ok || event.Type != "run.cancelled" || event.Data["fencing_token"] != "42" {
+			t.Fatalf("lease-loss event = %#v, open = %v", event, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease loss did not emit a terminal event")
+	}
+	if _, ok := <-events; ok {
+		t.Fatal("stream emitted more than one terminal event")
+	}
+}
+
 func TestRuntimeDoesNotShareSessionGateAcrossTenants(t *testing.T) {
 	store := activeTestPlatform(t)
-	store.seedTenant(TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator})
-	if !store.createApp(AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}) {
+	if err := store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator}); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}); err != nil || !created {
 		t.Fatal("create second app")
 	}
 	deployment := Deployment{ID: "deploy-two", TenantID: "tenant-two", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(deployment) {
+	if created, err := store.createDeployment(context.Background(), deployment); err != nil || !created {
 		t.Fatal("create second deployment")
 	}
-	version, _, _ := store.createVersion(deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(deployment, DeploymentPublished, version.ID)
-	if !ok {
+	version, _, _, err := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _, ok, err := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
+	if err != nil || !ok {
 		t.Fatal("publish second")
 	}
-	if _, _, ok := store.transition(published, DeploymentActive, ""); !ok {
+	if _, _, ok, err := store.transition(context.Background(), published, DeploymentActive, ""); err != nil || !ok {
 		t.Fatal("activate second")
 	}
 
@@ -307,5 +378,18 @@ func TestUnavailableWorkerReturnsStableError(t *testing.T) {
 	}
 	if got := runtime.Status()[1].Lifecycle; got != "unavailable" {
 		t.Fatalf("worker status = %q", got)
+	}
+}
+
+func TestTimedOutWorkerIsRetired(t *testing.T) {
+	runtime := NewRuntime(activeTestPlatform(t), capturingRunner{err: context.DeadlineExceeded}, nil)
+	tenant := TenantContext{TenantID: "tenant-one", Role: RoleOperator}
+	_, _ = runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "session", Input: "x"})
+	if got := runtime.Status()[1].Lifecycle; got != LifecycleUnavailable {
+		t.Fatalf("worker lifecycle = %q", got)
+	}
+	_, err := runtime.Handle(context.Background(), tenant, GatewayRequest{AppID: "app-one", SessionID: "next", Input: "x"})
+	if err == nil || err.Error() != "worker_unavailable" {
+		t.Fatalf("retired worker accepted work: %v", err)
 	}
 }

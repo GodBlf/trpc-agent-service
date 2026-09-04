@@ -4,24 +4,35 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type RemoteRunnerAdapter struct {
 	endpoint string
 	token    string
 	client   *http.Client
+	keyID    string
+	secret   []byte
 }
 
 func NewRemoteRunnerAdapter(endpoint, token string) *RemoteRunnerAdapter {
-	return &RemoteRunnerAdapter{endpoint: strings.TrimRight(endpoint, "/"), token: token, client: &http.Client{}}
+	return NewSignedRemoteRunnerAdapter(endpoint, token, "development", []byte(token))
+}
+
+func NewSignedRemoteRunnerAdapter(endpoint, token, keyID string, secret []byte) *RemoteRunnerAdapter {
+	return &RemoteRunnerAdapter{endpoint: strings.TrimRight(endpoint, "/"), token: token, client: &http.Client{}, keyID: keyID, secret: append([]byte(nil), secret...)}
 }
 
 func (a *RemoteRunnerAdapter) Run(ctx context.Context, request RunnerRequest) (RunnerResponse, error) {
@@ -48,7 +59,14 @@ func (a *RemoteRunnerAdapter) Run(ctx context.Context, request RunnerRequest) (R
 }
 
 func (a *RemoteRunnerAdapter) RunEvents(ctx context.Context, request RunnerRequest) (<-chan RuntimeEvent, error) {
-	payload, err := json.Marshal(request)
+	if request.TraceParent == "" {
+		request.TraceParent = newTraceParent(request.TraceID)
+	}
+	manifest, err := signExecutionManifest(request, a.keyID, a.secret, time.Now().UTC())
+	if err != nil {
+		return nil, &runtimeError{code: "worker_unavailable", err: err}
+	}
+	payload, err := json.Marshal(map[string]string{"manifest": manifest})
 	if err != nil {
 		return nil, &runtimeError{code: "worker_unavailable", err: err}
 	}
@@ -58,6 +76,7 @@ func (a *RemoteRunnerAdapter) RunEvents(ctx context.Context, request RunnerReque
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+a.token)
+	httpRequest.Header.Set("traceparent", request.TraceParent)
 	response, err := a.client.Do(httpRequest)
 	if err != nil {
 		return nil, &runtimeError{code: "worker_unavailable", err: err}
@@ -82,6 +101,7 @@ func (a *RemoteRunnerAdapter) RunEvents(ctx context.Context, request RunnerReque
 		defer response.Body.Close()
 		scanner := bufio.NewScanner(response.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		sawTerminal := false
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -91,11 +111,17 @@ func (a *RemoteRunnerAdapter) RunEvents(ctx context.Context, request RunnerReque
 			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) != nil {
 				continue
 			}
+			if event.Type == "run.completed" || event.Type == "run.failed" || event.Type == "run.cancelled" {
+				sawTerminal = true
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case events <- event:
 			}
+		}
+		if !sawTerminal && ctx.Err() == nil {
+			events <- RuntimeEvent{Type: "run.failed", Data: map[string]string{"error": "worker_unavailable"}}
 		}
 	}()
 	return events, nil
@@ -104,9 +130,12 @@ func (a *RemoteRunnerAdapter) RunEvents(ctx context.Context, request RunnerReque
 func (a *RemoteRunnerAdapter) Close() error { return nil }
 
 type WorkerServerConfig struct {
-	Token     string
-	Factory   AgentFactory
-	BeforeRun func(RunnerRequest, DeploymentVersion)
+	Token          string
+	Factory        AgentFactory
+	BeforeRun      func(RunnerRequest, DeploymentVersion)
+	ManifestKeys   map[string][]byte
+	Now            func() time.Time
+	ToolGovernance ToolGovernance
 }
 
 type WorkerServer struct {
@@ -119,8 +148,15 @@ func NewWorkerServer(config WorkerServerConfig) *WorkerServer {
 	if config.Token == "" {
 		config.Token = "development-worker"
 	}
+	if len(config.ManifestKeys) == 0 {
+		config.ManifestKeys = map[string][]byte{"development": []byte(config.Token)}
+	}
+	if config.Now == nil {
+		config.Now = time.Now
+	}
 	store := newWorkerVersionStore()
 	runner := NewFrameworkRunnerAdapter(store.Resolve, config.Factory)
+	runner.SetToolGovernance(config.ToolGovernance)
 	return &WorkerServer{config: config, versions: store, runner: runner}
 }
 
@@ -139,8 +175,23 @@ func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "worker_unauthorized", "worker authorization failed")
 		return
 	}
-	var request RunnerRequest
-	if err := decodeStrict(r, &request); err != nil || request.TenantID == "" || request.AppID == "" ||
+	var envelope struct {
+		Manifest string `json:"manifest"`
+	}
+	if err := decodeStrict(r, &envelope); err != nil || envelope.Manifest == "" {
+		writeError(w, http.StatusBadRequest, "invalid_execution_manifest", "Execution Manifest is invalid")
+		return
+	}
+	request, err := verifyExecutionManifest(envelope.Manifest, s.config.ManifestKeys, s.config.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid_execution_manifest", "Execution Manifest verification failed")
+		return
+	}
+	if !validTraceParent(request.TraceParent) || r.Header.Get("traceparent") != request.TraceParent {
+		writeError(w, http.StatusUnauthorized, "invalid_execution_manifest", "Execution Manifest trace context is invalid")
+		return
+	}
+	if request.TenantID == "" || request.AppID == "" ||
 		request.SessionID == "" || request.RequestID == "" || request.DeploymentID == "" || request.VersionID == "" ||
 		request.Input == "" || request.Version == nil {
 		writeError(w, http.StatusBadRequest, "invalid_worker_request", "resolved worker request is invalid")
@@ -169,6 +220,9 @@ func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
 	for event := range events {
 		data, err := json.Marshal(event)
 		if err != nil {
@@ -179,6 +233,65 @@ func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+var traceParentPattern = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-(?:0[1-9a-f]|[1-9a-f][0-9a-f])$`)
+
+func validTraceParent(value string) bool { return traceParentPattern.MatchString(value) }
+
+type executionManifestClaims struct {
+	Request   RunnerRequest `json:"request"`
+	IssuedAt  int64         `json:"iat"`
+	ExpiresAt int64         `json:"exp"`
+}
+
+func signExecutionManifest(request RunnerRequest, keyID string, secret []byte, now time.Time) (string, error) {
+	if keyID == "" || len(secret) < 8 {
+		return "", errors.New("execution manifest signing key is invalid")
+	}
+	header, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT", "kid": keyID})
+	claims, err := json.Marshal(executionManifestClaims{Request: request, IssuedAt: now.Unix(), ExpiresAt: now.Add(30 * time.Second).Unix()})
+	if err != nil {
+		return "", err
+	}
+	unsigned := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(unsigned))
+	return unsigned + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func verifyExecutionManifest(compact string, keys map[string][]byte, now time.Time) (RunnerRequest, error) {
+	parts := strings.Split(compact, ".")
+	if len(parts) != 3 {
+		return RunnerRequest{}, errors.New("invalid execution manifest")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return RunnerRequest{}, err
+	}
+	var header map[string]string
+	if json.Unmarshal(headerBytes, &header) != nil || header["alg"] != "HS256" || header["typ"] != "JWT" {
+		return RunnerRequest{}, errors.New("invalid execution manifest header")
+	}
+	secret := keys[header["kid"]]
+	if len(secret) < 8 {
+		return RunnerRequest{}, errors.New("unknown execution manifest key")
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(parts[0] + "." + parts[1]))
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(signature, mac.Sum(nil)) {
+		return RunnerRequest{}, errors.New("invalid execution manifest signature")
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return RunnerRequest{}, err
+	}
+	var claims executionManifestClaims
+	if json.Unmarshal(claimsBytes, &claims) != nil || claims.IssuedAt > now.Add(5*time.Second).Unix() || claims.ExpiresAt < now.Unix() {
+		return RunnerRequest{}, errors.New("expired execution manifest")
+	}
+	return claims.Request, nil
 }
 
 type workerVersionStore struct {
@@ -209,12 +322,12 @@ func (s *workerVersionStore) Put(version DeploymentVersion) error {
 	return nil
 }
 
-func (s *workerVersionStore) Resolve(versionID string) (DeploymentVersion, bool) {
+func (s *workerVersionStore) Resolve(_ context.Context, versionID string) (DeploymentVersion, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	version, exists := s.versions[versionID]
 	if exists {
 		version.Config = cloneConfig(version.Config)
 	}
-	return version, exists
+	return version, exists, nil
 }
