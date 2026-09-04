@@ -31,8 +31,15 @@ func (h *AdminHandler) handleDataResource(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
+	if h.isClosing() {
+		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+		return
+	}
 	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
 		return
 	}
@@ -119,7 +126,10 @@ func (h *AdminHandler) handleKnowledgeData(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, "invalid_knowledge", "Knowledge record is invalid")
 			return
 		}
-		if _, found := h.platform.app(r.Context(), tenant.TenantID, item.AgentAppID); !found {
+		if _, found, err := h.platform.app(r.Context(), tenant.TenantID, item.AgentAppID); err != nil || !found {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -184,6 +194,9 @@ func (h *AdminHandler) handleStorage(w http.ResponseWriter, r *http.Request, ten
 	if err := h.selectBackend(r.Context(), tenant.TenantID, selection, store); err != nil {
 		if closer, ok := store.(interface{ Close() error }); ok {
 			_ = closer.Close()
+		}
+		if writeControlPlaneError(w, err) {
+			return
 		}
 		writeError(w, http.StatusInternalServerError, "backend_selection_not_persisted", "backend selection could not be persisted")
 		return

@@ -86,7 +86,10 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 	switch r.Method {
 	case http.MethodGet:
 		appID := strings.TrimSpace(r.URL.Query().Get("app_id"))
-		policy, found := h.governance.Policy(r.Context(), tenant.TenantID, appID)
+		policy, found, err := h.governance.Policy(r.Context(), tenant.TenantID, appID)
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		if !found {
 			writeError(w, http.StatusNotFound, "policy_not_found", "governance policy was not found")
 			return
@@ -102,12 +105,18 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
 			return
 		}
-		if _, found := h.platform.app(r.Context(), tenant.TenantID, policy.AgentAppID); !found {
+		if _, found, err := h.platform.app(r.Context(), tenant.TenantID, policy.AgentAppID); err != nil || !found {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
 		policy.TenantID = tenant.TenantID
-		if existing, found := h.governance.Policy(r.Context(), tenant.TenantID, policy.AgentAppID); found {
+		if existing, found, err := h.governance.Policy(r.Context(), tenant.TenantID, policy.AgentAppID); err != nil {
+			writeControlPlaneError(w, err)
+			return
+		} else if found {
 			replacements := []string{}
 			for _, value := range policy.RedactedPatterns {
 				if value != "[REDACTED]" {
@@ -122,6 +131,9 @@ func (h *AdminHandler) handleGovernancePolicy(w http.ResponseWriter, r *http.Req
 		}
 		updated, err := h.governance.PutPolicy(r.Context(), policy)
 		if err != nil {
+			if writeControlPlaneError(w, h.platform.controlPlaneError()) {
+				return
+			}
 			if err.Error() == "invalid_policy" {
 				writeError(w, http.StatusBadRequest, "invalid_policy", "governance policy is invalid")
 			} else {

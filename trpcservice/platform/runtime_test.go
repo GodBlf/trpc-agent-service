@@ -13,20 +13,25 @@ import (
 func activeTestPlatform(t *testing.T) *SnapshotControlPlane {
 	t.Helper()
 	store := NewInMemoryControlPlane()
-	store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator})
-	if !store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}) {
+	if err := store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-one", TenantName: "One", Role: RoleOperator}); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-one", Name: "App One"}); err != nil || !created {
 		t.Fatal("create app")
 	}
 	deployment := Deployment{ID: "deploy-one", TenantID: "tenant-one", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(context.Background(), deployment) {
+	if created, err := store.createDeployment(context.Background(), deployment); err != nil || !created {
 		t.Fatal("create deployment")
 	}
-	version, _, _ := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
-	if !ok {
+	version, _, _, err := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _, ok, err := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
+	if err != nil || !ok {
 		t.Fatal("publish")
 	}
-	if _, _, ok := store.transition(context.Background(), published, DeploymentActive, ""); !ok {
+	if _, _, ok, err := store.transition(context.Background(), published, DeploymentActive, ""); err != nil || !ok {
 		t.Fatal("activate")
 	}
 	return store
@@ -207,20 +212,25 @@ func TestRuntimeStreamEmitsCancelledWhenLeaseIsLostWithoutWorkerEvent(t *testing
 
 func TestRuntimeDoesNotShareSessionGateAcrossTenants(t *testing.T) {
 	store := activeTestPlatform(t)
-	store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator})
-	if !store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}) {
+	if err := store.seedTenant(context.Background(), TenantAssignment{TenantID: "tenant-two", TenantName: "Two", Role: RoleOperator}); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := store.createApp(context.Background(), AgentApp{ID: "app-one", TenantID: "tenant-two", Name: "App One"}); err != nil || !created {
 		t.Fatal("create second app")
 	}
 	deployment := Deployment{ID: "deploy-two", TenantID: "tenant-two", AgentAppID: "app-one", Status: DeploymentDraft}
-	if !store.createDeployment(context.Background(), deployment) {
+	if created, err := store.createDeployment(context.Background(), deployment); err != nil || !created {
 		t.Fatal("create second deployment")
 	}
-	version, _, _ := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
-	published, _, ok := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
-	if !ok {
+	version, _, _, err := store.createVersion(context.Background(), deployment, "runtime-version", map[string]any{"model": "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, _, ok, err := store.transition(context.Background(), deployment, DeploymentPublished, version.ID)
+	if err != nil || !ok {
 		t.Fatal("publish second")
 	}
-	if _, _, ok := store.transition(context.Background(), published, DeploymentActive, ""); !ok {
+	if _, _, ok, err := store.transition(context.Background(), published, DeploymentActive, ""); err != nil || !ok {
 		t.Fatal("activate second")
 	}
 

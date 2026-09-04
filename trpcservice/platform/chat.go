@@ -134,7 +134,11 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		h.providers.recordRejected(provider, subject, requestID, rejectionCode, route)
 		return ErrProviderMessageIgnored
 	}
-	if _, ok := h.platform.app(ctx, route.TenantID, route.AppID); !ok {
+	if _, ok, err := h.platform.app(ctx, route.TenantID, route.AppID); err != nil || !ok {
+		if err != nil {
+			h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", route)
+			return errors.New("control_plane_unavailable")
+		}
 		h.providers.recordRejected(provider, subject, requestID, "route_unavailable", route)
 		return errors.New("provider route unavailable")
 	}
@@ -317,7 +321,10 @@ func (h *AdminHandler) handleChannelBindings(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid_channel_binding", "channel, app, conversation, and user identifiers are required")
 			return
 		}
-		if _, exists := h.platform.app(r.Context(), tenant.TenantID, request.AppID); !exists {
+		if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AppID); err != nil || !exists {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -612,7 +619,10 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
-		if _, ok := h.platform.app(r.Context(), route.TenantID, route.AppID); !ok {
+		if _, ok, err := h.platform.app(r.Context(), route.TenantID, route.AppID); err != nil || !ok {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -642,7 +652,10 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		if request.ProviderAccount == "" {
 			request.ProviderAccount = existing.ProviderAccount
 		}
-		if _, ok := h.platform.app(r.Context(), request.TenantID, request.AppID); !ok {
+		if _, ok, err := h.platform.app(r.Context(), request.TenantID, request.AppID); err != nil || !ok {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
@@ -723,7 +736,10 @@ func (h *AdminHandler) handleChatSessions(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_chat_session", "app id is required")
 		return
 	}
-	if _, exists := h.platform.app(r.Context(), tenant.TenantID, request.AppID); !exists {
+	if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AppID); err != nil || !exists {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 		return
 	}
@@ -1112,6 +1128,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	store, release, err := h.acquireStore(h.chatCtx, options.tenant.TenantID)
 	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(storageStarted))
 	if err != nil {
+		if errors.Is(err, errControlPlaneUnavailable) {
+			return chatRunResponse{}, errControlPlaneUnavailable
+		}
 		return chatRunResponse{}, storageFailureError(err)
 	}
 	defer func() {
@@ -1226,7 +1245,11 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		h.chatMu.Unlock()
 		return chatRunResponse{}, &GovernanceError{Code: "audit_unavailable", TraceID: options.traceID}
 	}
-	policy, policyFound := h.governance.Policy(h.chatCtx, options.tenant.TenantID, options.appID)
+	policy, policyFound, err := h.governance.Policy(h.chatCtx, options.tenant.TenantID, options.appID)
+	if err != nil {
+		h.chatMu.Unlock()
+		return chatRunResponse{}, &GovernanceError{Code: "control_plane_unavailable"}
+	}
 	if !policyFound {
 		h.chatMu.Unlock()
 		return chatRunResponse{}, &GovernanceError{Code: "policy_unavailable"}
@@ -1659,7 +1682,7 @@ func (h *AdminHandler) chatIdentityPayload(options chatRunOptions, values map[st
 	if options.fencingToken > 0 {
 		payload["fencing_token"] = strconv.FormatUint(options.fencingToken, 10)
 	}
-	if deployment, ok := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
+	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
 		payload["deployment_id"] = deployment.ID
 		payload["version_id"] = deployment.VersionID
 	}
@@ -1683,8 +1706,8 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		request.ConversationType = options.binding.ConversationType
 		request.ExternalSubject = options.binding.ConversationID
 	}
-	if deployment, ok := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
-		if version, found := h.platform.DeploymentVersion(h.chatCtx, deployment.VersionID); found {
+	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
+		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, deployment.VersionID); found {
 			request.RequiredTools = configStrings(version.Config, "tools")
 			request.RequiredMCP = configStrings(version.Config, "mcp")
 		}
@@ -1788,6 +1811,10 @@ func boundedStorageContext(parent context.Context) (context.Context, context.Can
 }
 
 func writeStorageError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errControlPlaneUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+		return
+	}
 	code := storageFailureError(err).Error()
 	switch code {
 	case "storage_timeout":
@@ -1898,6 +1925,8 @@ func writeChatStartError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
 	case "storage_unavailable":
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "storage is unavailable")
+	case "control_plane_unavailable":
+		writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
 	default:
 		writeError(w, http.StatusServiceUnavailable, "storage_error", "session event could not be persisted")
 	}

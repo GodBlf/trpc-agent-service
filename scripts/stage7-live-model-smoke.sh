@@ -62,7 +62,7 @@ post() {
   curl "${args[@]}" -d "$body" "$BASE_URL$path" >"$RESPONSE_FILE"
 }
 post /api/v1/admin/agent-apps '{"id":"app-live","name":"Live Model Smoke"}'
-post /api/v1/admin/governance/policy '{"agent_app_id":"app-live","token_budget":100000,"estimated_tokens_per_run":1000,"rate_limit":10,"rate_window_seconds":60}'
+post /api/v1/admin/governance/policy '{"agent_app_id":"app-live","token_budget":100000,"estimated_tokens_per_run":1000,"rate_limit":10,"rate_window_seconds":60,"runtime_timeout_ms":120000}'
 post /api/v1/admin/deployments '{"id":"deploy-live","agent_app_id":"app-live"}'
 post /api/v1/admin/deployments/deploy-live/versions '{"config":{"provider_profile":"default-openai","model":"gpt-5.6-luna","prompt":"请只回复：live-smoke-ok"}}' live-model-version
 VERSION_ID="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$RESPONSE_FILE")"
@@ -70,7 +70,7 @@ post /api/v1/admin/deployments/deploy-live/transition '{"status":"published","ve
 post /api/v1/admin/deployments/deploy-live/transition '{"status":"active"}'
 post /api/v1/chat/sessions '{"app_id":"app-live","session_id":"session-live"}'
 post /api/v1/chat/sessions/session-live/messages '{"input":"执行在线模型验收"}'
-for _ in $(seq 1 90); do
+for _ in $(seq 1 150); do
   if curl --silent --fail -b "$COOKIE_FILE" "$BASE_URL/api/v1/admin/sessions/session-live/events" >"$RESPONSE_FILE" && grep -q 'run.completed' "$RESPONSE_FILE"; then
     echo "Stage 7 live model smoke passed"
     exit 0

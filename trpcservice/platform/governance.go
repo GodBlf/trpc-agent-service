@@ -513,14 +513,14 @@ func (p TenantPolicy) runtimeTimeout() time.Duration {
 	return time.Duration(p.RuntimeTimeoutMS) * time.Millisecond
 }
 
-func (g *GovernanceCenter) Policy(ctx context.Context, tenantID, appID string) (TenantPolicy, bool) {
+func (g *GovernanceCenter) Policy(ctx context.Context, tenantID, appID string) (TenantPolicy, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.refreshPoliciesLocked(ctx) != nil {
-		return TenantPolicy{}, false
+	if err := g.refreshPoliciesLocked(ctx); err != nil {
+		return TenantPolicy{}, false, err
 	}
 	policy, ok := g.policies[governanceKey(tenantID, appID)]
-	return clonePolicy(policy), ok
+	return clonePolicy(policy), ok, nil
 }
 
 func (g *GovernanceCenter) Evaluate(ctx context.Context, request GovernanceRequest) (GovernanceResult, error) {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
@@ -66,26 +67,26 @@ type SnapshotControlPlane struct {
 // ControlPlaneStore is the authoritative Gateway resource boundary. The
 // operations stay package-private so persistence cannot bypass domain rules.
 type ControlPlaneStore interface {
-	seedTenant(context.Context, TenantAssignment)
-	createTenant(context.Context, Tenant) bool
-	tenant(context.Context, string) (Tenant, bool)
-	DeploymentVersion(context.Context, string) (DeploymentVersion, bool)
-	listTenants(context.Context) []Tenant
-	listTenantsFor(context.Context, TenantContext) []Tenant
-	createApp(context.Context, AgentApp) bool
-	app(context.Context, string, string) (AgentApp, bool)
-	listApps(context.Context, string) []AgentApp
-	createDeployment(context.Context, Deployment) bool
-	deployment(context.Context, string, string) (Deployment, bool)
-	listDeployments(context.Context, string) []Deployment
-	createVersion(context.Context, Deployment, string, map[string]any) (DeploymentVersion, string, bool)
-	listVersions(context.Context, string, string) []DeploymentVersion
-	transition(context.Context, Deployment, DeploymentStatus, string) (Deployment, string, bool)
-	startRollout(context.Context, Deployment, string, int) (Deployment, string, bool)
-	rollbackPreview(context.Context, Deployment) (DeploymentRollbackPreview, string, bool)
-	rollback(context.Context, Deployment) (Deployment, string, bool)
-	activeDeployment(context.Context, string, string) (Deployment, bool)
-	routeDeployment(context.Context, string, string, string) (Deployment, bool)
+	seedTenant(context.Context, TenantAssignment) error
+	createTenant(context.Context, Tenant) (bool, error)
+	tenant(context.Context, string) (Tenant, bool, error)
+	DeploymentVersion(context.Context, string) (DeploymentVersion, bool, error)
+	listTenants(context.Context) ([]Tenant, error)
+	listTenantsFor(context.Context, TenantContext) ([]Tenant, error)
+	createApp(context.Context, AgentApp) (bool, error)
+	app(context.Context, string, string) (AgentApp, bool, error)
+	listApps(context.Context, string) ([]AgentApp, error)
+	createDeployment(context.Context, Deployment) (bool, error)
+	deployment(context.Context, string, string) (Deployment, bool, error)
+	listDeployments(context.Context, string) ([]Deployment, error)
+	createVersion(context.Context, Deployment, string, map[string]any) (DeploymentVersion, string, bool, error)
+	listVersions(context.Context, string, string) ([]DeploymentVersion, error)
+	transition(context.Context, Deployment, DeploymentStatus, string) (Deployment, string, bool, error)
+	startRollout(context.Context, Deployment, string, int) (Deployment, string, bool, error)
+	rollbackPreview(context.Context, Deployment) (DeploymentRollbackPreview, string, bool, error)
+	rollback(context.Context, Deployment) (Deployment, string, bool, error)
+	activeDeployment(context.Context, string, string) (Deployment, bool, error)
+	routeDeployment(context.Context, string, string, string) (Deployment, bool, error)
 	controlPlaneError() error
 	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
 	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
@@ -95,6 +96,8 @@ type ControlPlaneStore interface {
 	saveGovernancePolicy(context.Context, TenantPolicy) (TenantPolicy, error)
 	Close() error
 }
+
+var errControlPlaneUnavailable = errors.New("control_plane_unavailable")
 
 func (p *SnapshotControlPlane) controlPlaneError() error {
 	p.mu.RLock()
@@ -263,44 +266,50 @@ func (p *SnapshotControlPlane) Close() error {
 	return err
 }
 
-func (p *SnapshotControlPlane) seedTenant(ctx context.Context, assignment TenantAssignment) {
+func (p *SnapshotControlPlane) seedTenant(ctx context.Context, assignment TenantAssignment) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLockedContext(ctx)
+	if !p.refreshLockedContext(ctx) {
+		return p.persistenceErr
+	}
 	if _, exists := p.tenants[assignment.TenantID]; !exists {
 		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
-		p.persistLockedContext(ctx)
+		if !p.persistLockedContext(ctx) {
+			return p.persistenceErr
+		}
 	}
+	return nil
 }
 
-func (p *SnapshotControlPlane) createTenant(ctx context.Context, tenant Tenant) bool {
+func (p *SnapshotControlPlane) createTenant(ctx context.Context, tenant Tenant) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
-		return false
+		return false, p.persistenceErr
 	}
 	if _, exists := p.tenants[tenant.ID]; exists {
-		return false
+		return false, nil
 	}
 	p.tenants[tenant.ID] = tenant
-	return p.persistLockedContext(ctx)
+	ok := p.persistLockedContext(ctx)
+	return ok, p.persistenceErr
 }
 
-func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, bool) {
+func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
-		return Tenant{}, false
+		return Tenant{}, false, p.persistenceErr
 	}
 	tenant, ok := p.tenants[id]
-	return tenant, ok
+	return tenant, ok, nil
 }
 
-func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string) (DeploymentVersion, bool) {
+func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string) (DeploymentVersion, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
-		return DeploymentVersion{}, false
+		return DeploymentVersion{}, false, p.persistenceErr
 	}
 	for _, versions := range p.versions {
 		for _, version := range versions {
@@ -309,29 +318,33 @@ func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string)
 					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
 						deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
 				}
-				return version, true
+				return version, true, nil
 			}
 		}
 	}
-	return DeploymentVersion{}, false
+	return DeploymentVersion{}, false, nil
 }
 
-func (p *SnapshotControlPlane) listTenants(ctx context.Context) []Tenant {
+func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLockedContext(ctx)
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
 	items := make([]Tenant, 0, len(p.tenants))
 	for _, tenant := range p.tenants {
 		items = append(items, tenant)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	return items
+	return items, nil
 }
 
-func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant TenantContext) []Tenant {
+func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant TenantContext) ([]Tenant, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refreshLockedContext(ctx)
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
 	items := make([]Tenant, 0, len(tenant.Assignments))
 	for _, candidate := range p.tenants {
 		if tenantCanSee(tenant, candidate.ID) {
@@ -339,7 +352,7 @@ func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant Tenant
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	return items
+	return items, nil
 }
 
 type developmentSession struct {
@@ -409,7 +422,7 @@ func (h *AdminHandler) ConfigureIdentityProvider(provider IdentityProvider) {
 	h.productionSessions = make(map[string]*productionSession)
 	if source, ok := provider.(interface{ Assignments() []TenantAssignment }); ok {
 		for _, assignment := range source.Assignments() {
-			h.platform.seedTenant(context.Background(), assignment)
+			_ = h.platform.seedTenant(context.Background(), assignment)
 		}
 	}
 }
@@ -430,7 +443,7 @@ func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *
 		platform = NewInMemoryControlPlane()
 	}
 	for _, assignment := range identity.Assignments {
-		platform.seedTenant(context.Background(), assignment)
+		_ = platform.seedTenant(context.Background(), assignment)
 	}
 	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	failureCtx, failureCancel := context.WithCancel(context.Background())
@@ -579,6 +592,12 @@ func (h *AdminHandler) Close() error {
 	return h.platform.Close()
 }
 
+func (h *AdminHandler) isClosing() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closing
+}
+
 func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -592,7 +611,7 @@ func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
 func (h *AdminHandler) acquireStore(ctx context.Context, tenantID string) (DataStore, func(), error) {
 	selections, err := h.platform.loadBackendSelections(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %v", errControlPlaneUnavailable, err)
 	}
 	h.backends.syncSelections(selections)
 	return h.backends.acquire(tenantID)
@@ -784,7 +803,11 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"items": h.platform.listTenantsFor(r.Context(), trusted)})
+		items, err := h.platform.listTenantsFor(r.Context(), trusted)
+		if writeControlPlaneError(w, err) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case http.MethodPost:
 		if trusted.Role != RolePlatformAdmin {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
@@ -801,7 +824,11 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
-		if !h.platform.createTenant(r.Context(), tenant) {
+		created, err := h.platform.createTenant(r.Context(), tenant)
+		if writeControlPlaneError(w, err) {
+			return
+		}
+		if !created {
 			writeError(w, http.StatusConflict, "tenant_exists", "tenant identifier already exists")
 			return
 		}
@@ -828,12 +855,23 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
-	tenant, exists := h.platform.tenant(r.Context(), id)
+	tenant, exists, err := h.platform.tenant(r.Context(), id)
+	if writeControlPlaneError(w, err) {
+		return
+	}
 	if !exists {
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, tenant)
+}
+
+func writeControlPlaneError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "control_plane_unavailable", "Control Plane Store is unavailable")
+	return true
 }
 
 var resourceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{2,62}$`)

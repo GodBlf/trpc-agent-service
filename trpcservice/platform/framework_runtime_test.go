@@ -292,7 +292,10 @@ func TestGovernancePluginConsumesDangerousConfirmationAndRecordsToolCompletion(t
 
 func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(t *testing.T) {
 	platform := activeTestPlatform(t)
-	version, ok := platform.DeploymentVersion(context.Background(), "deploy-one-v1")
+	version, ok, err := platform.DeploymentVersion(context.Background(), "deploy-one-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("active deployment version not found")
 	}
@@ -302,11 +305,11 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 		TenantID: "tenant-one", AgentAppID: "app-one",
 		AllowedTools: []string{"deploy"}, DangerousTools: []string{"deploy"},
 	})
-	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool, error) {
 		if id != version.ID {
-			return DeploymentVersion{}, false
+			return DeploymentVersion{}, false, nil
 		}
-		return version, true
+		return version, true, nil
 	}, nil)
 	adapter.SetGovernance(center)
 	request := RunnerRequest{
@@ -341,7 +344,7 @@ func TestDefaultAgentFactoryInvokesConfiguredDeterministicToolAfterConfirmation(
 }
 
 func TestFrameworkRunnerAdapterRejectsUnknownVersionAndClose(t *testing.T) {
-	adapter := NewFrameworkRunnerAdapter(func(context.Context, string) (DeploymentVersion, bool) { return DeploymentVersion{}, false }, nil)
+	adapter := NewFrameworkRunnerAdapter(func(context.Context, string) (DeploymentVersion, bool, error) { return DeploymentVersion{}, false, nil }, nil)
 	if _, err := adapter.RunEvents(context.Background(), RunnerRequest{VersionID: "missing"}); err == nil || err.Error() != "deployment_version_scope_mismatch" {
 		t.Fatalf("unknown version error = %v", err)
 	}
@@ -364,9 +367,9 @@ func TestFrameworkRunnerAdapterAppliesToolGovernanceAfterRunningPlainVersion(t *
 			Config: map[string]any{"runner": "tool", "tools": []any{"deploy"}, "deterministic_tool_call": "deploy"},
 		},
 	}
-	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool, error) {
 		version, ok := versions[id]
-		return version, ok
+		return version, ok, nil
 	}, nil)
 	defer adapter.Close()
 	center := NewGovernanceCenter()
@@ -442,9 +445,9 @@ func TestFrameworkRunnerAdapterIsolatesTenantVersions(t *testing.T) {
 		"tenant-two-v1": {ID: "tenant-two-v1", TenantID: "tenant-two", AgentAppID: "app-two", DeploymentID: "deploy-two", Active: true},
 	}
 	var factoryCalls atomic.Int64
-	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool) {
+	adapter := NewFrameworkRunnerAdapter(func(_ context.Context, id string) (DeploymentVersion, bool, error) {
 		version, ok := versions[id]
-		return version, ok
+		return version, ok, nil
 	}, func(_ context.Context, version DeploymentVersion) (frameworkagent.Agent, error) {
 		factoryCalls.Add(1)
 		return serviceagent.NewDeterministicAgent(version.AgentAppID), nil
@@ -531,11 +534,14 @@ func TestFrameworkRunnerAdapterRetiresInactiveVersion(t *testing.T) {
 	adapter := NewFrameworkRunnerAdapter(platform.DeploymentVersion, nil)
 	request := RunnerRequest{TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", SessionID: "session-one", UserID: "user-one", Input: "hello", RequestID: "request-one", VersionID: "deploy-one-v1"}
 	_ = collectRuntimeEvents(t, adapter, request)
-	deployment, ok := platform.deployment(context.Background(), "tenant-one", "deploy-one")
+	deployment, ok, err := platform.deployment(context.Background(), "tenant-one", "deploy-one")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("deployment not found")
 	}
-	if _, _, ok := platform.transition(context.Background(), deployment, DeploymentPaused, ""); !ok {
+	if _, _, ok, err := platform.transition(context.Background(), deployment, DeploymentPaused, ""); err != nil || !ok {
 		t.Fatal("pause deployment")
 	}
 	if _, err := adapter.RunEvents(context.Background(), request); err == nil || err.Error() != "deployment_version_inactive" {

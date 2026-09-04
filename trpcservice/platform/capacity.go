@@ -111,11 +111,17 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "invalid_capacity_request", "capacity test inputs are invalid")
 		return
 	}
-	if _, exists := h.platform.app(r.Context(), tenant.TenantID, request.AgentAppID); !exists {
+	if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AgentAppID); err != nil || !exists {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 		return
 	}
-	if _, exists := h.platform.activeDeployment(r.Context(), tenant.TenantID, request.AgentAppID); !exists {
+	if _, exists, err := h.platform.activeDeployment(r.Context(), tenant.TenantID, request.AgentAppID); err != nil || !exists {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		writeError(w, http.StatusConflict, "active_deployment_not_found", "active Deployment is required")
 		return
 	}
@@ -143,7 +149,10 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
 		return
 	}
-	policy, _ := h.governance.Policy(r.Context(), tenant.TenantID, request.AgentAppID)
+	policy, _, err := h.governance.Policy(r.Context(), tenant.TenantID, request.AgentAppID)
+	if writeControlPlaneError(w, err) {
+		return
+	}
 	timeout := time.Duration(request.TimeoutMS) * time.Millisecond
 	if policy.RuntimeTimeoutMS > 0 && policy.runtimeTimeout() < timeout {
 		timeout = policy.runtimeTimeout()

@@ -56,8 +56,8 @@ func TestGovernancePolicyStoreImportsLegacyLocalPolicies(t *testing.T) {
 	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
 		t.Fatalf("imported policy = %#v, found = %v", policy, found)
 	}
-	if active, found := center.Policy(context.Background(), "tenant-a", "app-a"); !found || active.Revision != 1 {
-		t.Fatalf("active policy = %#v, found = %v", active, found)
+	if active, found, err := center.Policy(context.Background(), "tenant-a", "app-a"); err != nil || !found || active.Revision != 1 {
+		t.Fatalf("active policy = %#v, found = %v, error = %v", active, found, err)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestGovernancePersistenceFailureRollsBackPolicyAndExecution(t *testing.T) {
 	if _, err := center.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a"}); err == nil {
 		t.Fatal("policy update succeeded without durable audit")
 	}
-	if _, found := center.Policy(context.Background(), "tenant-a", "app-a"); found {
-		t.Fatal("failed policy update remained active in memory")
+	if _, found, err := center.Policy(context.Background(), "tenant-a", "app-a"); err != nil || found {
+		t.Fatalf("failed policy update remained active in memory: found = %v, error = %v", found, err)
 	}
 	center.policies[governanceKey("tenant-a", "app-a")] = TenantPolicy{TenantID: "tenant-a", AgentAppID: "app-a", Revision: 1}
 	_, err := center.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-a", AgentAppID: "app-a", RequestID: "request-a", Input: "hello"})
@@ -139,9 +139,9 @@ func TestGovernanceCenterPersistsPoliciesAndAuditEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, found := reloaded.Policy(context.Background(), "tenant-a", "app-a")
-	if !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
-		t.Fatalf("policy = %#v, found = %v", policy, found)
+	policy, found, err := reloaded.Policy(context.Background(), "tenant-a", "app-a")
+	if err != nil || !found || policy.Revision != 1 || len(policy.AllowedTools) != 1 {
+		t.Fatalf("policy = %#v, found = %v, error = %v", policy, found, err)
 	}
 	audits := reloaded.AuditEvents(AuditQuery{TenantID: "tenant-a", Limit: 10})
 	if len(audits) != 2 || audits[0].Decision != "authorization.denied" {

@@ -322,12 +322,12 @@ func (s *workerVersionStore) Put(version DeploymentVersion) error {
 	return nil
 }
 
-func (s *workerVersionStore) Resolve(_ context.Context, versionID string) (DeploymentVersion, bool) {
+func (s *workerVersionStore) Resolve(_ context.Context, versionID string) (DeploymentVersion, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	version, exists := s.versions[versionID]
 	if exists {
 		version.Config = cloneConfig(version.Config)
 	}
-	return version, exists
+	return version, exists, nil
 }

@@ -152,7 +152,7 @@ func deterministicFixtureDelay(value any, kind string) (time.Duration, error) {
 }
 
 type FrameworkRunnerAdapter struct {
-	resolve        func(context.Context, string) (DeploymentVersion, bool)
+	resolve        func(context.Context, string) (DeploymentVersion, bool, error)
 	factory        AgentFactory
 	mu             sync.Mutex
 	runners        map[string]frameworkrunner.Runner
@@ -164,7 +164,7 @@ type FrameworkRunnerAdapter struct {
 	runWG          sync.WaitGroup
 }
 
-func NewFrameworkRunnerAdapter(resolve func(context.Context, string) (DeploymentVersion, bool), factory AgentFactory) *FrameworkRunnerAdapter {
+func NewFrameworkRunnerAdapter(resolve func(context.Context, string) (DeploymentVersion, bool, error), factory AgentFactory) *FrameworkRunnerAdapter {
 	if factory == nil {
 		factory = DefaultAgentFactory()
 	}
@@ -177,7 +177,10 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 	if a.closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok := a.resolve(ctx, versionID)
+	version, ok, err := a.resolve(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok || version.ID != versionID {
 		return nil, errors.New("deployment_version_not_found")
 	}
@@ -348,7 +351,10 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	if closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok := a.resolve(ctx, request.VersionID)
+	version, ok, err := a.resolve(ctx, request.VersionID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok || version.TenantID != request.TenantID || version.AgentAppID != request.AppID || version.DeploymentID != request.DeploymentID {
 		return nil, errors.New("deployment_version_scope_mismatch")
 	}

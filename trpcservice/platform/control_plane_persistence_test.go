@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,9 @@ func TestControlPlaneLoadStopsWhenHTTPRequestIsCanceled(t *testing.T) {
 	platform := NewInMemoryControlPlane()
 	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
 	defer handler.Close()
+	if created, err := platform.createApp(context.Background(), AgentApp{ID: "stale-app", TenantID: "tenant-one", Name: "Stale App"}); err != nil || !created {
+		t.Fatal("seed stale App")
+	}
 	persistence := &cancellationObservingControlPlanePersistence{entered: make(chan struct{}), canceled: make(chan struct{})}
 	platform.persistence = persistence
 
@@ -66,6 +70,39 @@ func TestControlPlaneLoadStopsWhenHTTPRequestIsCanceled(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("HTTP request did not return after cancellation")
+	}
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	var apiError errorResponse
+	if err := json.NewDecoder(response.Body).Decode(&apiError); err != nil {
+		t.Fatal(err)
+	}
+	if apiError.Error.Code != "control_plane_unavailable" {
+		t.Fatalf("error code = %q", apiError.Error.Code)
+	}
+}
+
+func TestControlPlaneFailureDoesNotBecomeResourceConflict(t *testing.T) {
+	platform := NewInMemoryControlPlane()
+	handler := NewAdminHandler(platform, DevelopmentIdentity{ID: "admin", Name: "Admin", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}})
+	defer handler.Close()
+	platform.persistence = unavailableControlPlanePersistence{}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/agent-apps", strings.NewReader(`{"id":"new-app","name":"New App"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	var apiError errorResponse
+	if err := json.NewDecoder(response.Body).Decode(&apiError); err != nil {
+		t.Fatal(err)
+	}
+	if apiError.Error.Code != "control_plane_unavailable" {
+		t.Fatalf("error code = %q", apiError.Error.Code)
 	}
 }
 

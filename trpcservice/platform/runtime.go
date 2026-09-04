@@ -240,17 +240,17 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return nil, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found, err := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	if err != nil {
+		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
+	}
 	if !found {
-		if err := rt.platform.controlPlaneError(); err != nil {
-			return nil, &runtimeError{code: "control_plane_unavailable", err: err}
-		}
 		return nil, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(ctx, deployment.VersionID); found {
-		request.Version = &version
-	} else if err := rt.platform.controlPlaneError(); err != nil {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
 		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
+	} else if found {
+		request.Version = &version
 	}
 	request.TenantID, request.DeploymentID, request.VersionID, request.UserID = tenant.TenantID, deployment.ID, deployment.VersionID, tenant.UserID
 	streamCtx, cancel := context.WithCancel(ctx)
@@ -379,17 +379,17 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if request.AppID == "" || request.SessionID == "" || request.Input == "" {
 		return GatewayResponse{}, &runtimeError{code: "invalid_request"}
 	}
-	deployment, found := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	deployment, found, err := rt.platform.routeDeployment(ctx, tenant.TenantID, request.AppID, request.RequestID)
+	if err != nil {
+		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
+	}
 	if !found {
-		if err := rt.platform.controlPlaneError(); err != nil {
-			return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
-		}
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found := rt.platform.DeploymentVersion(ctx, deployment.VersionID); found {
-		request.Version = &version
-	} else if err := rt.platform.controlPlaneError(); err != nil {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
 		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
+	} else if found {
+		request.Version = &version
 	}
 	request.DeploymentID, request.VersionID = deployment.ID, deployment.VersionID
 	runCtx, cancel := context.WithCancel(ctx)
@@ -493,32 +493,32 @@ func (rt *Runtime) countersFor(tenantID string) *runtimeCounters {
 	return counters
 }
 
-func (p *SnapshotControlPlane) activeDeployment(ctx context.Context, tenantID, appID string) (Deployment, bool) {
+func (p *SnapshotControlPlane) activeDeployment(ctx context.Context, tenantID, appID string) (Deployment, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
-		return Deployment{}, false
+		return Deployment{}, false, p.persistenceErr
 	}
 	for _, deployment := range p.deployments {
 		if deployment.TenantID == tenantID && deployment.AgentAppID == appID && deployment.Status == DeploymentActive && deployment.VersionID != "" {
-			return deployment, true
+			return deployment, true, nil
 		}
 	}
-	return Deployment{}, false
+	return Deployment{}, false, nil
 }
 
-func (p *SnapshotControlPlane) routeDeployment(ctx context.Context, tenantID, appID, requestID string) (Deployment, bool) {
-	deployment, found := p.activeDeployment(ctx, tenantID, appID)
-	if !found {
-		return deployment, false
+func (p *SnapshotControlPlane) routeDeployment(ctx context.Context, tenantID, appID, requestID string) (Deployment, bool, error) {
+	deployment, found, err := p.activeDeployment(ctx, tenantID, appID)
+	if err != nil || !found {
+		return deployment, false, err
 	}
 	if deployment.TargetVersionID == "" || deployment.CurrentVersionID == "" || deployment.GrayPercentage <= 0 || deployment.GrayPercentage >= 100 || requestID == "" {
-		return deployment, true
+		return deployment, true, nil
 	}
 	if uint64(grayBucket(requestID)) < uint64(deployment.GrayPercentage) {
 		deployment.VersionID = deployment.TargetVersionID
 	}
-	return deployment, true
+	return deployment, true, nil
 }
 
 func grayBucket(requestID string) int {
@@ -649,6 +649,9 @@ func (h *AdminHandler) handleRuntimeStatus(w http.ResponseWriter, r *http.Reques
 	items := h.runtime.StatusFor(tenant)
 	store, releaseStore, err := h.acquireStore(r.Context(), tenant.TenantID)
 	if err != nil {
+		if writeControlPlaneError(w, err) {
+			return
+		}
 		items = appendDependencyStatus(items, "dependency-storage", LifecycleUnavailable)
 	} else {
 		defer releaseStore()
