@@ -71,6 +71,7 @@ type ControlPlaneStore interface {
 	seedTenant(context.Context, TenantAssignment) error
 	createTenant(context.Context, Tenant) (bool, error)
 	tenant(context.Context, string) (Tenant, bool, error)
+	updateTenantAuditPolicy(context.Context, string, AuditPolicy) (Tenant, error)
 	DeploymentVersion(context.Context, DeploymentVersionRef) (DeploymentVersion, bool, error)
 	listTenants(context.Context) ([]Tenant, error)
 	listTenantsFor(context.Context, TenantContext) ([]Tenant, error)
@@ -308,7 +309,7 @@ func (p *SnapshotControlPlane) seedTenant(ctx context.Context, assignment Tenant
 		return p.persistenceErr
 	}
 	if _, exists := p.tenants[assignment.TenantID]; !exists {
-		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC(), AuditPolicy: DefaultAuditPolicy()}
 		if !p.persistLockedContext(ctx) {
 			return p.persistenceErr
 		}
@@ -325,6 +326,7 @@ func (p *SnapshotControlPlane) createTenant(ctx context.Context, tenant Tenant) 
 	if _, exists := p.tenants[tenant.ID]; exists {
 		return false, nil
 	}
+	tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
 	p.tenants[tenant.ID] = tenant
 	ok := p.persistLockedContext(ctx)
 	return ok, p.persistenceErr
@@ -337,7 +339,35 @@ func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, b
 		return Tenant{}, false, p.persistenceErr
 	}
 	tenant, ok := p.tenants[id]
+	if ok {
+		tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
+		p.tenants[id] = tenant
+	}
 	return tenant, ok, nil
+}
+
+func (p *SnapshotControlPlane) updateTenantAuditPolicy(ctx context.Context, id string, policy AuditPolicy) (Tenant, error) {
+	normalized, err := policy.Normalize()
+	if err != nil {
+		return Tenant{}, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return Tenant{}, p.persistenceErr
+	}
+	tenant, ok := p.tenants[id]
+	if !ok {
+		return Tenant{}, ErrNotFound
+	}
+	previous := tenant
+	tenant.AuditPolicy = normalized
+	p.tenants[id] = tenant
+	if !p.persistLockedContext(ctx) {
+		p.tenants[id] = previous
+		return Tenant{}, p.persistenceErr
+	}
+	return tenant, nil
 }
 
 func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, ref DeploymentVersionRef) (DeploymentVersion, bool, error) {
@@ -380,6 +410,7 @@ func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error
 	}
 	items := make([]Tenant, 0, len(p.tenants))
 	for _, tenant := range p.tenants {
+		tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
 		items = append(items, tenant)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
@@ -394,6 +425,7 @@ func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant Tenant
 	}
 	items := make([]Tenant, 0, len(tenant.Assignments))
 	for _, candidate := range p.tenants {
+		candidate.AuditPolicy = normalizedAuditPolicy(candidate.AuditPolicy)
 		if tenantCanSee(tenant, candidate.ID) {
 			items = append(items, candidate)
 		}
@@ -439,6 +471,7 @@ type AdminHandler struct {
 	failureCancel            context.CancelFunc
 	channels                 *ChannelCoordinator
 	providers                *ProviderRuntime
+	runCoordinator           RunCoordinator
 	chatMu                   sync.Mutex
 	activeRuns               map[string]activeChatRun
 	chatCtx                  context.Context
@@ -480,6 +513,11 @@ func (h *AdminHandler) ConfigureGovernance(center *GovernanceCenter) {
 	}
 	h.governance = center
 	center.configurePolicyStore(h.platform)
+	if tenants, err := h.platform.listTenants(context.Background()); err == nil {
+		for _, tenant := range tenants {
+			_ = center.SetAuditPolicy(tenant.ID, tenant.AuditPolicy)
+		}
+	}
 	if governed, ok := h.runtime.worker.runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
 		governed.SetGovernance(center)
 	}
@@ -498,16 +536,22 @@ func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *
 	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
 	channels.configurePersistence(platform.loadChannelBindings, platform.mutateChannelBindings)
-	return &AdminHandler{
+	h := &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
-		channels: channels, activeRuns: make(map[string]activeChatRun),
+		channels: channels, activeRuns: make(map[string]activeChatRun), runCoordinator: NewInMemoryRunCoordinator(),
 		chatCtx: chatCtx, chatCancel: chatCancel, capacityCtx: capacityCtx, capacityCancel: capacityCancel,
 		capacityRuns: make(map[string]*capacityRun), drainState: DrainIdle, faultInjectionEnabled: true,
 	}
+	for _, assignment := range identity.Assignments {
+		if tenant, ok, err := platform.tenant(context.Background(), assignment.TenantID); err == nil && ok {
+			_ = h.governance.SetAuditPolicy(tenant.ID, tenant.AuditPolicy)
+		}
+	}
+	return h
 }
 
 func (h *AdminHandler) ConfigureFaultInjection(enabled bool) {
@@ -628,6 +672,9 @@ func (h *AdminHandler) Close() error {
 	h.chatWG.Wait()
 	h.capacityWG.Wait()
 	h.failureCancel()
+	if h.runCoordinator != nil {
+		_ = h.runCoordinator.Close()
+	}
 	runtimeErr := h.runtime.Close()
 	storeErr := h.backends.close()
 	if runtimeErr != nil {
@@ -682,6 +729,22 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 
 func (h *AdminHandler) ConfigureSessionLeases(manager SessionLeaseManager) {
 	h.runtime.SetSessionLeaseManager(manager)
+}
+
+// ConfigureRunCoordinator installs the shared execution coordinator used by
+// chat submission and cancellation. A nil value restores the single-process
+// in-memory adapter.
+func (h *AdminHandler) ConfigureRunCoordinator(coordinator RunCoordinator) {
+	h.mu.Lock()
+	previous := h.runCoordinator
+	if coordinator == nil {
+		coordinator = NewInMemoryRunCoordinator()
+	}
+	h.runCoordinator = coordinator
+	h.mu.Unlock()
+	if previous != nil && previous != coordinator {
+		_ = previous.Close()
+	}
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -873,7 +936,7 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_tenant", "id and name must be valid")
 			return
 		}
-		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
+		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC(), AuditPolicy: DefaultAuditPolicy()}
 		created, err := h.platform.createTenant(r.Context(), tenant)
 		if writeControlPlaneError(w, err) {
 			return
@@ -897,10 +960,6 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
-		return
-	}
 	if !tenantCanSee(trusted, id) {
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
@@ -913,7 +972,43 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, tenant)
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, tenant)
+		return
+	}
+	if r.Method != http.MethodPatch && r.Method != http.MethodPut {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET, PATCH, or PUT")
+		return
+	}
+	assignment, _ := trusted.AssignmentFor(id)
+	if trusted.Role != RolePlatformAdmin && assignment.Role != RolePlatformAdmin && (trusted.Role != RoleTenantAdmin || trusted.TenantID != id) {
+		writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
+		return
+	}
+	var request struct {
+		AuditPolicy AuditPolicy `json:"audit_policy"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_audit_policy", "audit_policy is required")
+		return
+	}
+	updated, err := h.platform.updateTenantAuditPolicy(r.Context(), id, request.AuditPolicy)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
+			return
+		}
+		if errors.Is(err, errControlPlaneUnavailable) {
+			writeControlPlaneError(w, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_audit_policy", err.Error())
+		return
+	}
+	h.governance.SetAuditPolicy(id, updated.AuditPolicy)
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func writeControlPlaneError(w http.ResponseWriter, err error) bool {

@@ -173,6 +173,11 @@ func main() {
 			log.Fatalf("Session Execution Lease store: %v", err)
 		}
 		admin.ConfigureSessionLeases(leases)
+		runCoordinator, err := platform.NewPostgresRunCoordinator(controlPlaneDSN, gatewayID, leaseTTL, leaseRenewInterval)
+		if err != nil {
+			log.Fatalf("Run Coordinator store: %v", err)
+		}
+		admin.ConfigureRunCoordinator(runCoordinator)
 	}
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
 	admin.ConfigurePostgresBackend(os.Getenv("TRPC_POSTGRES_DSN"))

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -263,6 +264,7 @@ type GovernanceCenter struct {
 	usedTokens    map[string]int64
 	toolStarts    map[string]time.Time
 	metricSamples []MetricSample
+	auditPolicies map[string]AuditPolicy
 	now           func() time.Time
 	path          string
 	policyStore   interface {
@@ -282,6 +284,7 @@ type governanceSnapshot struct {
 	UsedTokens                map[string]int64                        `json:"used_tokens"`
 	Traces                    map[string]PlatformTrace                `json:"traces"`
 	MetricSamples             []MetricSample                          `json:"metric_samples,omitempty"`
+	AuditPolicies             map[string]AuditPolicy                  `json:"audit_policies,omitempty"`
 }
 
 type governanceState struct {
@@ -295,12 +298,13 @@ type governanceState struct {
 	usedTokens    map[string]int64
 	toolStarts    map[string]time.Time
 	metricSamples []MetricSample
+	auditPolicies map[string]AuditPolicy
 }
 
 func NewGovernanceCenter() *GovernanceCenter {
 	return &GovernanceCenter{
 		policies: map[string]TenantPolicy{}, confirmations: map[string]ToolConfirmation{}, executions: map[string]governanceExecution{},
-		metrics: map[string]TenantMetrics{}, rateWindows: map[string]rateWindow{}, traces: map[string]PlatformTrace{}, usedTokens: map[string]int64{}, toolStarts: map[string]time.Time{}, now: time.Now,
+		metrics: map[string]TenantMetrics{}, rateWindows: map[string]rateWindow{}, traces: map[string]PlatformTrace{}, usedTokens: map[string]int64{}, toolStarts: map[string]time.Time{}, auditPolicies: map[string]AuditPolicy{}, now: time.Now,
 	}
 }
 
@@ -419,7 +423,48 @@ func NewPersistentGovernanceCenter(path string) (*GovernanceCenter, error) {
 	if snapshot.MetricSamples != nil {
 		center.metricSamples = snapshot.MetricSamples
 	}
+	if snapshot.AuditPolicies != nil {
+		center.auditPolicies = make(map[string]AuditPolicy, len(snapshot.AuditPolicies))
+		for tenantID, policy := range snapshot.AuditPolicies {
+			center.auditPolicies[tenantID] = normalizedAuditPolicy(policy)
+		}
+	}
 	return center, nil
+}
+
+// SetAuditPolicy updates the non-secret policy used by audit retention and
+// content shaping. Validation keeps high-risk operations fail-closed.
+func (g *GovernanceCenter) SetAuditPolicy(tenantID string, policy AuditPolicy) error {
+	if strings.TrimSpace(tenantID) == "" {
+		return errors.New("invalid_tenant_id")
+	}
+	normalized, err := policy.Normalize()
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.auditPolicies == nil {
+		g.auditPolicies = make(map[string]AuditPolicy)
+	}
+	previous, existed := g.auditPolicies[tenantID]
+	g.auditPolicies[tenantID] = normalized
+	if err := g.persistLocked(); err != nil {
+		if existed {
+			g.auditPolicies[tenantID] = previous
+		} else {
+			delete(g.auditPolicies, tenantID)
+		}
+		return err
+	}
+	return nil
+}
+
+func (g *GovernanceCenter) auditPolicyLocked(tenantID string) AuditPolicy {
+	if policy, ok := g.auditPolicies[tenantID]; ok {
+		return normalizedAuditPolicy(policy)
+	}
+	return DefaultAuditPolicy()
 }
 
 func governanceKey(tenantID, appID string) string    { return tenantID + "\x00" + appID }
@@ -1177,8 +1222,13 @@ func (g *GovernanceCenter) AuditEvents(query AuditQuery) []AuditEvent {
 		limit = 100
 	}
 	result := []AuditEvent{}
+	now := g.now().UTC()
 	for index := len(g.audits) - 1; index >= 0 && len(result) < limit; index-- {
 		event := g.audits[index]
+		policy := g.auditPolicyLocked(event.TenantID)
+		if event.OccurredAt.Before(now.Add(-time.Duration(policy.RetentionDays) * 24 * time.Hour)) {
+			continue
+		}
 		if query.TenantID != "" && event.TenantID != query.TenantID || query.Channel != "" && event.Channel != query.Channel || query.AgentName != "" && event.AgentName != query.AgentName || query.Decision != "" && event.Decision != query.Decision || query.ErrorType != "" && event.ErrorType != query.ErrorType || query.UserID != "" && event.UserID != query.UserID || query.SessionID != "" && event.SessionID != query.SessionID || query.RequestID != "" && event.RequestID != query.RequestID || query.TraceID != "" && event.TraceID != query.TraceID || !query.From.IsZero() && event.OccurredAt.Before(query.From) || !query.To.IsZero() && event.OccurredAt.After(query.To) {
 			continue
 		}
@@ -1368,13 +1418,28 @@ func (g *GovernanceCenter) RecordDeliveryFor(tenantID, appID, provider string, d
 }
 
 func (g *GovernanceCenter) appendAuditLocked(event AuditEvent) {
+	policy := g.auditPolicyLocked(event.TenantID)
 	if event.ID == "" {
 		event.ID = "audit-" + stableID(event.TenantID+event.TraceID+event.Decision+event.OccurredAt.String())
 	}
 	if event.OccurredAt.IsZero() {
 		event.OccurredAt = g.now().UTC()
 	}
+	if policy.ContentMode == AuditMetadataOnly {
+		event.Content = ""
+	} else {
+		event.Content = redactAuditContent(event.Content)
+	}
 	g.audits = append(g.audits, event)
+	kept := g.audits[:0]
+	now := g.now().UTC()
+	for _, candidate := range g.audits {
+		candidatePolicy := g.auditPolicyLocked(candidate.TenantID)
+		if !candidate.OccurredAt.Before(now.Add(-time.Duration(candidatePolicy.RetentionDays) * 24 * time.Hour)) {
+			kept = append(kept, candidate)
+		}
+	}
+	g.audits = kept
 	if len(g.audits) > 10000 {
 		g.audits = append([]AuditEvent(nil), g.audits[len(g.audits)-10000:]...)
 	}
@@ -1431,7 +1496,11 @@ func (g *GovernanceCenter) persistLocked() error {
 			Started: execution.started, Active: execution.active, Expired: execution.expired,
 		}
 	}
-	snapshot := governanceSnapshot{Policies: persistedPolicies, EncryptedRedactedPatterns: encryptedPatterns, Audits: g.audits, Confirmations: g.confirmations, Executions: persistedExecutions, ToolStarts: g.toolStarts, Metrics: g.metrics, UsedTokens: g.usedTokens, Traces: g.traces, MetricSamples: g.metricSamples}
+	auditPolicies := make(map[string]AuditPolicy, len(g.auditPolicies))
+	for tenantID, policy := range g.auditPolicies {
+		auditPolicies[tenantID] = normalizedAuditPolicy(policy)
+	}
+	snapshot := governanceSnapshot{Policies: persistedPolicies, EncryptedRedactedPatterns: encryptedPatterns, Audits: g.audits, Confirmations: g.confirmations, Executions: persistedExecutions, ToolStarts: g.toolStarts, Metrics: g.metrics, UsedTokens: g.usedTokens, Traces: g.traces, MetricSamples: g.metricSamples, AuditPolicies: auditPolicies}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -1535,7 +1604,10 @@ func (g *GovernanceCenter) snapshotLocked() governanceState {
 		confirmations: make(map[string]ToolConfirmation, len(g.confirmations)), executions: make(map[string]governanceExecution, len(g.executions)),
 		metrics: make(map[string]TenantMetrics, len(g.metrics)), rateWindows: make(map[string]rateWindow, len(g.rateWindows)),
 		traces: make(map[string]PlatformTrace, len(g.traces)), usedTokens: make(map[string]int64, len(g.usedTokens)), toolStarts: make(map[string]time.Time, len(g.toolStarts)),
-		metricSamples: append([]MetricSample(nil), g.metricSamples...),
+		metricSamples: append([]MetricSample(nil), g.metricSamples...), auditPolicies: make(map[string]AuditPolicy, len(g.auditPolicies)),
+	}
+	for tenantID, policy := range g.auditPolicies {
+		state.auditPolicies[tenantID] = normalizedAuditPolicy(policy)
 	}
 	for key, value := range g.policies {
 		state.policies[key] = clonePolicy(value)
@@ -1570,6 +1642,7 @@ func (g *GovernanceCenter) restoreLocked(state governanceState) {
 	g.metrics, g.rateWindows, g.traces, g.usedTokens = state.metrics, state.rateWindows, state.traces, state.usedTokens
 	g.toolStarts = state.toolStarts
 	g.metricSamples = state.metricSamples
+	g.auditPolicies = state.auditPolicies
 }
 
 func (g *GovernanceCenter) recordTraceLocked(request GovernanceRequest, traceID, name, status string, now time.Time) {
@@ -1620,6 +1693,15 @@ func redact(value string, patterns []string) string {
 		value = strings.ReplaceAll(value, pattern, "[REDACTED]")
 	}
 	return value
+}
+
+var auditCredentialPattern = regexp.MustCompile(`(?i)(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^,\s]+`)
+
+func redactAuditContent(value string) string {
+	if value == "" {
+		return ""
+	}
+	return auditCredentialPattern.ReplaceAllString(value, "$1=[REDACTED]")
 }
 func contains(values []string, value string) bool {
 	for _, candidate := range values {

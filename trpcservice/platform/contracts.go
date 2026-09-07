@@ -71,9 +71,58 @@ func TenantContextFromContext(ctx context.Context) (TenantContext, bool) {
 }
 
 type Tenant struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	CreatedAt   time.Time   `json:"created_at"`
+	AuditPolicy AuditPolicy `json:"audit_policy"`
+}
+
+type AuditContentMode string
+
+const (
+	AuditMetadataOnly    AuditContentMode = "metadata_only"
+	AuditRedactedSummary AuditContentMode = "redacted_summary"
+)
+
+type AuditPolicy struct {
+	RetentionDays       int              `json:"retention_days"`
+	ContentMode         AuditContentMode `json:"content_mode"`
+	HighRiskFailureMode string           `json:"high_risk_failure_mode"`
+}
+
+func DefaultAuditPolicy() AuditPolicy {
+	return AuditPolicy{RetentionDays: 90, ContentMode: AuditMetadataOnly, HighRiskFailureMode: "fail_closed"}
+}
+
+func (p AuditPolicy) Normalize() (AuditPolicy, error) {
+	defaults := DefaultAuditPolicy()
+	if p.RetentionDays == 0 {
+		p.RetentionDays = defaults.RetentionDays
+	}
+	if p.ContentMode == "" {
+		p.ContentMode = defaults.ContentMode
+	}
+	if p.HighRiskFailureMode == "" {
+		p.HighRiskFailureMode = defaults.HighRiskFailureMode
+	}
+	if p.RetentionDays < 1 || p.RetentionDays > 3650 {
+		return AuditPolicy{}, errors.New("invalid_audit_retention_days")
+	}
+	if p.ContentMode != AuditMetadataOnly && p.ContentMode != AuditRedactedSummary {
+		return AuditPolicy{}, errors.New("invalid_audit_content_mode")
+	}
+	if p.HighRiskFailureMode != "fail_closed" {
+		return AuditPolicy{}, errors.New("invalid_high_risk_failure_mode")
+	}
+	return p, nil
+}
+
+func normalizedAuditPolicy(policy AuditPolicy) AuditPolicy {
+	normalized, err := policy.Normalize()
+	if err != nil {
+		return DefaultAuditPolicy()
+	}
+	return normalized
 }
 
 type AgentApp struct {
@@ -313,6 +362,7 @@ type AuditEvent struct {
 	Checkpoint     string        `json:"checkpoint,omitempty"`
 	Rule           string        `json:"rule,omitempty"`
 	Reason         string        `json:"reason,omitempty"`
+	Content        string        `json:"content,omitempty"`
 }
 
 type AuditSink interface {
