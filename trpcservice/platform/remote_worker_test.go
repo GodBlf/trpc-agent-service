@@ -14,6 +14,16 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/lifecycle"
 )
 
+func TestWorkerServerCloseIsIdempotent(t *testing.T) {
+	server := NewWorkerServer(WorkerServerConfig{})
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRemoteWorkerPreservesResolvedIdentityTraceAndVersion(t *testing.T) {
 	requests := make(chan RunnerRequest, 1)
 	versions := make(chan DeploymentVersion, 1)

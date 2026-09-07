@@ -139,9 +139,11 @@ type WorkerServerConfig struct {
 }
 
 type WorkerServer struct {
-	config   WorkerServerConfig
-	versions *workerVersionStore
-	runner   *FrameworkRunnerAdapter
+	config    WorkerServerConfig
+	versions  *workerVersionStore
+	runner    *FrameworkRunnerAdapter
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewWorkerServer(config WorkerServerConfig) *WorkerServer {
@@ -158,6 +160,17 @@ func NewWorkerServer(config WorkerServerConfig) *WorkerServer {
 	runner := NewFrameworkRunnerAdapter(store.Resolve, config.Factory)
 	runner.SetToolGovernance(config.ToolGovernance)
 	return &WorkerServer{config: config, versions: store, runner: runner}
+}
+
+// Close cancels and drains active executions and closes cached framework
+// Runners. It is safe to call more than once during shutdown.
+func (s *WorkerServer) Close() error {
+	s.closeOnce.Do(func() {
+		if s.runner != nil {
+			s.closeErr = s.runner.Close()
+		}
+	})
+	return s.closeErr
 }
 
 func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

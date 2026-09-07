@@ -77,6 +77,9 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("worker HTTP shutdown: %v", err)
 		}
+		if err := worker.Close(); err != nil {
+			log.Printf("worker runtime shutdown: %v", err)
+		}
 		return
 	}
 	if role != "" && role != "gateway" {
