@@ -31,6 +31,7 @@ type controlPlaneSnapshot struct {
 	Versions           map[string][]DeploymentVersion `json:"deployment_versions"`
 	VersionCreations   []persistedVersionCreation     `json:"version_creations"`
 	ChannelBindings    map[string]ChannelBinding      `json:"channel_bindings"`
+	ProviderRoutes     map[string]BotRoute            `json:"provider_routes,omitempty"`
 	BackendSelections  map[string]backendSelection    `json:"backend_selections,omitempty"`
 	GovernancePolicies map[string]TenantPolicy        `json:"governance_policies,omitempty"`
 }
@@ -253,6 +254,7 @@ func controlPlaneSnapshotFrom(platform *SnapshotControlPlane) controlPlaneSnapsh
 		Tenants: platform.tenants, Apps: platform.apps, Deployments: platform.deployments,
 		Versions:           platform.versions,
 		ChannelBindings:    platform.channelBindings,
+		ProviderRoutes:     platform.providerRoutes,
 		BackendSelections:  platform.backendSelections,
 		GovernancePolicies: platform.governancePolicies,
 		VersionCreations:   make([]persistedVersionCreation, 0, len(platform.versionCreations)),
@@ -281,6 +283,9 @@ func applyControlPlaneSnapshot(platform *SnapshotControlPlane, snapshot controlP
 	}
 	if snapshot.ChannelBindings != nil {
 		platform.channelBindings = snapshot.ChannelBindings
+	}
+	if snapshot.ProviderRoutes != nil {
+		platform.providerRoutes = snapshot.ProviderRoutes
 	}
 	if snapshot.BackendSelections != nil {
 		platform.backendSelections = snapshot.BackendSelections

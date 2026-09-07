@@ -57,7 +57,6 @@ services:
       TRPC_SESSION_LEASE_RENEW_INTERVAL: 1s
       TRPC_FAULT_INJECTION: "1"
       TRPC_GOVERNANCE_PATH: /data/governance-a.json
-      TRPC_BOT_ROUTES_PATH: /data/bot-routes-a.json
     volumes:
       - stage7-data:/data
     depends_on:
@@ -80,7 +79,6 @@ services:
       <<: *gateway-environment
       TRPC_GATEWAY_ID: gateway-b
       TRPC_GOVERNANCE_PATH: /data/governance-b.json
-      TRPC_BOT_ROUTES_PATH: /data/bot-routes-b.json
   gateway:
     image: nginx:1.27-alpine
     ports:

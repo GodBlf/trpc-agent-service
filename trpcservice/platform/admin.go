@@ -57,6 +57,7 @@ type SnapshotControlPlane struct {
 	versions            map[string][]DeploymentVersion
 	versionCreations    map[versionCreationKey]versionCreation
 	channelBindings     map[string]ChannelBinding
+	providerRoutes      map[string]BotRoute
 	backendSelections   map[string]backendSelection
 	governancePolicies  map[string]TenantPolicy
 	persistence         controlPlanePersistence
@@ -89,6 +90,8 @@ type ControlPlaneStore interface {
 	routeDeployment(context.Context, string, string, string) (Deployment, bool, error)
 	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
 	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
+	loadProviderRoutes(context.Context) (map[string]BotRoute, error)
+	mutateProviderRoutes(context.Context, func(map[string]BotRoute) error) (map[string]BotRoute, error)
 	loadBackendSelections(context.Context) (map[string]backendSelection, error)
 	saveBackendSelection(context.Context, string, backendSelection) error
 	loadGovernancePolicies(context.Context) (map[string]TenantPolicy, error)
@@ -120,7 +123,7 @@ func NewInMemoryControlPlane() *SnapshotControlPlane {
 	return &SnapshotControlPlane{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
-		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding),
+		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding), providerRoutes: make(map[string]BotRoute),
 		backendSelections: make(map[string]backendSelection), governancePolicies: make(map[string]TenantPolicy),
 	}
 }
@@ -225,6 +228,34 @@ func (p *SnapshotControlPlane) mutateChannelBindings(ctx context.Context, mutate
 		result[key] = binding
 	}
 	return result, nil
+}
+
+func (p *SnapshotControlPlane) loadProviderRoutes(ctx context.Context) (map[string]BotRoute, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	return copyBotRoutes(p.providerRoutes), nil
+}
+
+func (p *SnapshotControlPlane) mutateProviderRoutes(ctx context.Context, mutate func(map[string]BotRoute) error) (map[string]BotRoute, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	previous := p.providerRoutes
+	routes := copyBotRoutes(previous)
+	if err := mutate(routes); err != nil {
+		return nil, err
+	}
+	p.providerRoutes = routes
+	if !p.persistLockedContext(ctx) {
+		p.providerRoutes = previous
+		return nil, p.persistenceErr
+	}
+	return copyBotRoutes(routes), nil
 }
 
 func (p *SnapshotControlPlane) persistLockedContext(ctx context.Context) bool {
@@ -615,6 +646,9 @@ func (h *AdminHandler) isClosing() bool {
 }
 
 func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
+	if providers != nil {
+		_ = providers.routes.configurePersistence(h.platform.loadProviderRoutes, h.platform.mutateProviderRoutes)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.providers = providers

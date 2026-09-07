@@ -174,13 +174,18 @@ func main() {
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
 	admin.ConfigurePostgresBackend(os.Getenv("TRPC_POSTGRES_DSN"))
 	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
-	routePath := os.Getenv("TRPC_BOT_ROUTES_PATH")
-	if routePath == "" {
-		routePath = "data/bot-routes.json"
-	}
-	routes, err := platform.NewPersistentBotTenantAllowlist(routePath)
-	if err != nil {
-		log.Fatalf("bot tenant allowlist: %v", err)
+	var routes *platform.BotTenantAllowlist
+	if controlPlaneDSN != "" {
+		routes = platform.NewBotTenantAllowlist()
+	} else {
+		routePath := os.Getenv("TRPC_BOT_ROUTES_PATH")
+		if routePath == "" {
+			routePath = "data/bot-routes.json"
+		}
+		routes, err = platform.NewPersistentBotTenantAllowlist(routePath)
+		if err != nil {
+			log.Fatalf("bot tenant allowlist: %v", err)
+		}
 	}
 	providers := platform.NewProviderRuntime(platform.LoadBotConfig(nil), routes, admin.ProcessProviderMessage)
 	admin.ConfigureProviderRuntime(providers)

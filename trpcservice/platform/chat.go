@@ -112,12 +112,20 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 	default:
 		return errors.New("unsupported provider")
 	}
-	route, exists := h.providers.Routes().Lookup(provider, subject)
+	requestID := "channel-" + messageID
+	route, exists, routeErr := h.providers.Routes().ResolveContext(ctx, provider, subject)
+	if routeErr != nil {
+		h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
+		return errors.New("control_plane_unavailable")
+	}
 	if !exists && fallbackSubject != "" && fallbackSubject != subject {
 		subject = fallbackSubject
-		route, exists = h.providers.Routes().Lookup(provider, subject)
+		route, exists, routeErr = h.providers.Routes().ResolveContext(ctx, provider, subject)
+		if routeErr != nil {
+			h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
+			return errors.New("control_plane_unavailable")
+		}
 	}
-	requestID := "channel-" + messageID
 	if !exists {
 		h.providers.recordRejected(provider, subject, requestID, "unmapped", BotRoute{})
 		return ErrProviderMessageIgnored
@@ -600,7 +608,14 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 	}
 	switch r.Method {
 	case http.MethodGet:
-		items := h.providers.Routes().List()
+		items, err := h.providers.Routes().ListContext(r.Context())
+		if err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		filtered := items[:0]
 		for _, item := range items {
 			if tenantCanSee(tenant, item.TenantID) {
@@ -627,13 +642,23 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if err := h.providers.Routes().Upsert(route); err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusConflict, "provider_route_conflict", "provider route conflicts with an existing mapping")
 			return
 		}
 		route.Enabled = true
 		writeJSON(w, http.StatusCreated, route)
 	case http.MethodPatch:
-		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if lookupErr != nil {
+			if writeControlPlaneError(w, lookupErr) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
@@ -668,12 +693,22 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusConflict, "provider_route_conflict", "provider route could not be updated")
 			return
 		}
 		writeJSON(w, http.StatusOK, route)
 	case http.MethodDelete:
-		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if lookupErr != nil {
+			if writeControlPlaneError(w, lookupErr) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
