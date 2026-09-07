@@ -184,7 +184,18 @@ npm run dev
 
 企微不使用自建应用，不接受 CorpID、AgentID、应用 Secret、Access Token、EncodingAESKey 或传统 HTTP 回调配置。真实凭据仅从被忽略的 `.env.local` 读取；自动化验收使用本地协议 fixture，不消费真实消息。
 
-最终中文交付物见 [`docs/architecture.md`](docs/architecture.md)、[`docs/data-model.md`](docs/data-model.md)、[`docs/storage-strategy.md`](docs/storage-strategy.md) 与 [`docs/acceptance.md`](docs/acceptance.md)。早期阶段记录保留用于追溯，不作为最终验收结论。
+最终中文交付物已按验收项拆分，统一入口见 [`docs/README.md`](docs/README.md)：
+
+1. [架构设计文档](docs/architecture.md)
+2. [系统架构图](docs/system-architecture-diagram.md)
+3. [企业微信核心时序图](docs/core-sequence-diagram.md)
+4. [数据模型设计](docs/data-model.md)
+5. [数据同步与幂等策略](docs/data-sync-idempotency.md)
+6. [多后端适配方案](docs/backend-adapters.md)
+7. [生产风险清单](docs/production-risks.md)
+8. [GitHub 实现代码详解](docs/implementation-details.md)
+
+阶段记录、验收材料和调研资料已归入 `docs/` 子目录，仅用于追溯，不作为最终交付物的替代。
 
 最终验收命令：
 
