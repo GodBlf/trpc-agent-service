@@ -1707,7 +1707,7 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		request.ExternalSubject = options.binding.ConversationID
 	}
 	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
-		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, deployment.VersionID); found {
+		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, DeploymentVersionRef{TenantID: options.tenant.TenantID, VersionID: deployment.VersionID}); found {
 			request.RequiredTools = configStrings(version.Config, "tools")
 			request.RequiredMCP = configStrings(version.Config, "mcp")
 		}

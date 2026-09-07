@@ -9,7 +9,7 @@
 | Tenant | `tenant_id` | name, audit_policy | 隔离根 |
 | Agent App | `(tenant_id, app_id)` | name | Tenant 1:N App |
 | Deployment | `(tenant_id, deployment_id)` | app_id, status, current/target/previous_version_id, gray_percentage | 同一 App 只有一个 Active Deployment |
-| Deployment Version | `(tenant_id, deployment_id, number)`，全局 version_id | provider_profile, model, prompt, generation_config | 发布后不可变，不含凭据 |
+| Deployment Version | `(tenant_id, deployment_id, number)`，租户内唯一 `version_id` | provider_profile, model, prompt, generation_config | 发布后不可变，不含凭据；运行时必须使用 `(tenant_id, version_id)` |
 | Backend Selection | `(tenant_id, data_kind)` | adapter_id, server_owned_config_ref | 客户端只能选择服务端目录中的 adapter |
 | Channel Binding | `(tenant_id, binding_id)` | app_id, provider, account, external_subject, session_id, enabled | 外部主体映射到 Tenant/App |
 | Session | `(tenant_id, session_id)` | app_id, user_id | 由事件流物化 |

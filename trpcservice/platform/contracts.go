@@ -125,6 +125,17 @@ type DeploymentVersion struct {
 	Active       bool           `json:"-"`
 }
 
+// DeploymentVersionRef is the authoritative identity used by runtime code.
+// Version IDs are only unique inside a tenant's deployment namespace.
+type DeploymentVersionRef struct {
+	TenantID  string
+	VersionID string
+}
+
+func versionRefKey(ref DeploymentVersionRef) string {
+	return ref.TenantID + "\x00" + ref.VersionID
+}
+
 type DeploymentRollbackPreview struct {
 	TenantID          string `json:"tenant_id"`
 	AgentAppID        string `json:"agent_app_id"`

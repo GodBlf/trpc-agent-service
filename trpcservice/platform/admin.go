@@ -70,7 +70,7 @@ type ControlPlaneStore interface {
 	seedTenant(context.Context, TenantAssignment) error
 	createTenant(context.Context, Tenant) (bool, error)
 	tenant(context.Context, string) (Tenant, bool, error)
-	DeploymentVersion(context.Context, string) (DeploymentVersion, bool, error)
+	DeploymentVersion(context.Context, DeploymentVersionRef) (DeploymentVersion, bool, error)
 	listTenants(context.Context) ([]Tenant, error)
 	listTenantsFor(context.Context, TenantContext) ([]Tenant, error)
 	createApp(context.Context, AgentApp) (bool, error)
@@ -309,24 +309,36 @@ func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, b
 	return tenant, ok, nil
 }
 
-func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string) (DeploymentVersion, bool, error) {
+func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, ref DeploymentVersionRef) (DeploymentVersion, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
 		return DeploymentVersion{}, false, p.persistenceErr
 	}
-	for _, versions := range p.versions {
-		for _, version := range versions {
-			if version.ID == id {
-				if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
-					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
-						deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
-				}
-				return version, true, nil
-			}
+	if ref.TenantID == "" || ref.VersionID == "" {
+		return DeploymentVersion{}, false, nil
+	}
+	for _, version := range p.versionsByTenant(ref.TenantID) {
+		if version.ID != ref.VersionID {
+			continue
 		}
+		if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
+			version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
+				deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
+		}
+		return version, true, nil
 	}
 	return DeploymentVersion{}, false, nil
+}
+
+func (p *SnapshotControlPlane) versionsByTenant(tenantID string) []DeploymentVersion {
+	var versions []DeploymentVersion
+	for key, items := range p.versions {
+		if strings.HasPrefix(key, tenantID+"\x00") {
+			versions = append(versions, items...)
+		}
+	}
+	return versions
 }
 
 func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error) {

@@ -657,3 +657,45 @@ func TestTwoTenantRoutesResolveScopedDeploymentVersions(t *testing.T) {
 	default:
 	}
 }
+
+func TestSameDeploymentAndVersionIDsRemainTenantScoped(t *testing.T) {
+	store := NewInMemoryControlPlane()
+	runs := make(chan capturedRun, 2)
+	handler := NewAdminHandler(store, DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{
+		{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin},
+		{TenantID: "tenant-two", TenantName: "Two", Role: RolePlatformAdmin},
+	}})
+	handler.ConfigureRuntime(tenantCapturingRunner{runs: runs}, nil)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Jar: jar}
+	post := func(path, body, key string, wantStatus int, target any) {
+		t.Helper()
+		requireJSONResponse(t, client, server.URL+path, body, key, wantStatus, target)
+	}
+	activate := func(marker string) {
+		t.Helper()
+		post("/api/v1/admin/agent-apps", `{"id":"same-app","name":"Scoped App"}`, "", http.StatusCreated, nil)
+		post("/api/v1/admin/deployments", `{"id":"same-deploy","agent_app_id":"same-app"}`, "", http.StatusCreated, nil)
+		post("/api/v1/admin/deployments/same-deploy/versions", `{"config":{"tenant_marker":"`+marker+`"}}`, marker, http.StatusCreated, nil)
+		post("/api/v1/admin/deployments/same-deploy/transition", `{"status":"published","version_id":"same-deploy-v1"}`, "", http.StatusOK, nil)
+		post("/api/v1/admin/deployments/same-deploy/transition", `{"status":"active"}`, "", http.StatusOK, nil)
+	}
+	activate("one")
+	post("/api/v1/admin/run", `{"app_id":"same-app","session_id":"session-one","input":"one"}`, "", http.StatusOK, nil)
+	first := <-runs
+	if first.request.Version == nil || first.request.Version.Config["tenant_marker"] != "one" {
+		t.Fatalf("tenant one version = %#v", first.request.Version)
+	}
+	post("/api/v1/auth/switch-tenant", `{"tenant_id":"tenant-two"}`, "", http.StatusOK, nil)
+	activate("two")
+	post("/api/v1/admin/run", `{"app_id":"same-app","session_id":"session-two","input":"two"}`, "", http.StatusOK, nil)
+	second := <-runs
+	if second.request.Version == nil || second.request.Version.Config["tenant_marker"] != "two" {
+		t.Fatalf("tenant two version = %#v", second.request.Version)
+	}
+}
