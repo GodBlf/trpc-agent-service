@@ -7,10 +7,15 @@ for file in docs/architecture.md docs/data-model.md docs/storage-strategy.md doc
 done
 test "$(grep -c '^```mermaid$' "$ROOT/docs/architecture.md")" -ge 2
 grep -q '企业微信' "$ROOT/docs/architecture.md"
+grep -q 'ADMIN\[Admin API\]' "$ROOT/docs/architecture.md"
+grep -q 'GUARD\[Plugin / Guardrail\]' "$ROOT/docs/architecture.md"
+grep -q 'OTEL\[OpenTelemetry Collector\]' "$ROOT/docs/architecture.md"
 grep -q '风险清单' "$ROOT/docs/architecture.md"
 test "$(grep -c '^| .* | .* | .* |$' "$ROOT/docs/architecture.md")" -ge 8
 grep -q 'Projection Checkpoint' "$ROOT/docs/data-model.md"
 grep -q 'Qdrant/Milvus' "$ROOT/docs/storage-strategy.md"
+grep -q '^### 本地向量库到远端向量库$' "$ROOT/docs/storage-strategy.md"
+grep -q 'active index generation' "$ROOT/docs/storage-strategy.md"
 grep -q 'Stage 7 是本项目最后一个交付阶段' "$ROOT/docs/acceptance.md"
 if grep -R -q 'Stage 8\|阶段 8' "$ROOT/docs"; then
   echo "error: final documentation must not defer work to Stage 8" >&2

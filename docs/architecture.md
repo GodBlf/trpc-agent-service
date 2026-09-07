@@ -13,13 +13,17 @@ flowchart LR
   U[管理者 / Chat Workspace] --> E[Nginx 可路由入口]
   WU[企业微信用户] --> WC[WeCom WebSocket Channel Adapter]
   TU[Telegram 用户] --> TG[Telegram Long Polling Channel Adapter]
+  E --> ADMIN[Admin API]
+  E --> CHAT[Chat / SSE API]
+  ADMIN --> GA[Gateway A]
+  ADMIN --> GB[Gateway B]
+  CHAT --> GA
+  CHAT --> GB
   WC --> GA[Gateway A]
   TG --> GA
-  E --> GA
-  E --> GB[Gateway B]
   GA --> CP[(PostgreSQL Control Plane<br/>配置 / Policy / Backend Selection)]
   GB --> CP
-  GA --> DS[租户 Storage Router]
+  GA --> DS[租户 Storage Router / Adapter]
   GB --> DS
   DS --> PG[(PostgreSQL / SQL)]
   DS --> RD[(Redis)]
@@ -31,13 +35,24 @@ flowchart LR
   WK --> AF[AgentFactory]
   AF --> RA[trpc-agent-go Runner]
   RA --> MODEL[OpenAI-compatible Model]
-  RA --> TOOL[Tool / MCP]
-  TOOL -->|内部 API：执行前授权与执行后落账| GOV
-  GA --> OT[Audit / Metrics / Platform Trace]
-  GB --> OT
+  RA -->|运行时 callbacks| GUARD[Plugin / Guardrail]
+  GUARD --> TOOL[Tool / MCP]
+  GUARD -->|内部 API：执行前授权与执行后落账| GOV
+  GA --> AUDIT[(Audit Store)]
+  GB --> AUDIT
+  WC -. traces / metrics .-> OTEL[OpenTelemetry Collector]
+  TG -. traces / metrics .-> OTEL
+  GA -. traces / metrics .-> OTEL
+  GB -. traces / metrics .-> OTEL
+  WK -. traces / metrics .-> OTEL
+  DS -. storage spans .-> OTEL
+  GUARD -. governance spans .-> OTEL
+  OTEL --> OBS[(Metrics / Trace Backend)]
   DS -.设计适配边界.-> V[(Qdrant / Milvus)]
   DS -.设计适配边界.-> S3[(S3 Object Storage)]
 ```
+
+Admin API 与 Chat/SSE API 是由入口转发给任一 Gateway 的两个逻辑接口面；前者管理 Tenant、Agent App、Deployment、Channel Binding、Backend Selection 和 Governance Policy，后者承载运行请求与事件流。Runner 的 Plugin/Guardrail callbacks 在实际 Tool 调用点连接 Governance 运行态，先完成授权与预算检查再执行 Tool/MCP。Channel Adapter、Gateway、Worker、Storage Adapter 和治理回调把 spans/metrics 发送给 OpenTelemetry Collector，再由 Collector 输出到 Metrics/Trace Backend；不可替代的 Audit Event 则由 Gateway 单独写入 Audit Store。
 
 入口的 `X-Gateway: a|b` 只用于验收确定性选路，生产环境应由 Service 或负载均衡器分配。请求不依赖 sticky session：Gateway 在 PostgreSQL 中按 `(tenant_id, session_id)` 获取可续租的 Session Execution Lease，租约默认 30 秒、每 10 秒续租，每次重新授予产生单调递增 fencing token。Worker 不保存 Tenant、Deployment 或 Session 权威状态，因此实例重启不会改变请求应执行的版本。
 
