@@ -59,7 +59,8 @@ grep -q 'PostgreSQL' "$ROOT/docs/backend-adapters.md"
 grep -q 'Redis' "$ROOT/docs/backend-adapters.md"
 grep -q 'Qdrant/Milvus' "$ROOT/docs/backend-adapters.md"
 grep -q 'S3 兼容对象存储' "$ROOT/docs/backend-adapters.md"
-grep -q '仅设计适配边界' "$ROOT/docs/backend-adapters.md"
+grep -q 'Qdrant 已接入' "$ROOT/docs/backend-adapters.md"
+grep -q 'Artifact 内容已接入' "$ROOT/docs/backend-adapters.md"
 
 test "$(grep -c '^| [0-9][0-9]* |' "$ROOT/docs/production-risks.md")" -ge 8
 grep -q '残余风险' "$ROOT/docs/production-risks.md"
@@ -67,8 +68,8 @@ grep -q '残余风险' "$ROOT/docs/production-risks.md"
 grep -q 'https://github.com/GodBlf/trpc-agent-service' "$ROOT/docs/implementation-details.md"
 grep -q '架构组件到代码的映射' "$ROOT/docs/implementation-details.md"
 grep -q '能力完成度' "$ROOT/docs/implementation-details.md"
-grep -q 'Qdrant/Milvus.*仅设计' "$ROOT/docs/implementation-details.md"
-grep -q 'S3 对象内容.*仅设计' "$ROOT/docs/implementation-details.md"
+grep -q 'Qdrant/Milvus.*Qdrant 已接入' "$ROOT/docs/implementation-details.md"
+grep -q 'S3 对象内容.*已接入' "$ROOT/docs/implementation-details.md"
 
 grep -q 'Stage 7 是本项目最后一个交付阶段' "$ROOT/docs/acceptance/acceptance.md"
 if grep -R -q 'Stage 8\|阶段 8' "$ROOT/docs"; then

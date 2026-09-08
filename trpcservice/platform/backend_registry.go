@@ -189,7 +189,7 @@ func closeDataStoreWithError(store DataStore) error {
 	return nil
 }
 
-func newBackendStore(selection backendSelection) (DataStore, error) {
+func newBasicBackendStore(selection BackendEndpoint) (DataStore, error) {
 	switch selection.Backend {
 	case "inmemory":
 		return NewInMemoryStore(), nil

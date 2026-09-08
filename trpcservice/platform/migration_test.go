@@ -59,7 +59,7 @@ func TestRedisToSQLMigrationDryRunAndRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	dry, err := MigrateRedisToSQL(ctx, source, destination, MigrationOptions{TenantID: "tenant-a", DryRun: true})
-	if err != nil || dry.SourceCount != 3 || dry.DestinationCount != 3 {
+	if err != nil || dry.SourceCount != 3 || dry.DestinationCount != 0 || dry.Matched {
 		t.Fatalf("dry=%#v err=%v", dry, err)
 	}
 	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
@@ -150,4 +150,16 @@ func TestMigrationDetectsEventIdentityMismatch(t *testing.T) {
 	if err == nil || report.Status != "failed" {
 		t.Fatalf("report=%#v err=%v", report, err)
 	}
+}
+
+func (s *flakyDestination) ListSessionIDs(ctx context.Context, tenant string) ([]string, error) {
+	return s.DataStore.(sessionLister).ListSessionIDs(ctx, tenant)
+}
+
+func (s *corruptingDestination) ListSessionIDs(ctx context.Context, tenant string) ([]string, error) {
+	return s.DataStore.(sessionLister).ListSessionIDs(ctx, tenant)
+}
+
+func (s *identityCorruptingDestination) ListSessionIDs(ctx context.Context, tenant string) ([]string, error) {
+	return s.DataStore.(sessionLister).ListSessionIDs(ctx, tenant)
 }

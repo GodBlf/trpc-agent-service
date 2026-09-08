@@ -9,13 +9,17 @@ test("shows backend health and starts a migration dry-run", async () => {
     if (path.includes("/sessions/") && path.endsWith("/events")) return new Response(JSON.stringify({ items: [] }), { status: 200 });
     if (path.includes("/sessions/")) return new Response(JSON.stringify({ error: { code: "session_not_found", message: "missing" } }), { status: 404 });
     if (path.includes("/memory/")) return new Response(JSON.stringify({ items: [] }), { status: 200 });
-    if (path.endsWith("/migrations") && init?.method === "POST") return new Response(JSON.stringify({ id: "migration-1", status: "completed", dry_run: true, sessions: 0, processed_sessions: 0, source_count: 0, destination_count: 0 }), { status: 202 });
+    if (path.endsWith("/migrations") && init?.method === "POST") {
+      expect(JSON.parse(String(init.body))).toEqual({ dry_run: true, batch_size: 100, cutover: false });
+      return new Response(JSON.stringify({ id: "migration-1", status: "completed", dry_run: true, sessions: 0, processed_sessions: 0, source_count: 0, destination_count: 0, matched: true }), { status: 202 });
+    }
     throw new Error(`unexpected request ${path}`);
   });
   render(<DataPage identity={{ id: "admin", name: "Admin", active_tenant_id: "tenant-a", active_role: "platform_admin", assignments: [] }} />);
   expect(await screen.findByText("healthy")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: /启动迁移/ }));
   await waitFor(() => expect(screen.getByText(/迁移 completed/)).toBeInTheDocument());
+  expect(screen.getByText(/校验一致/)).toBeInTheDocument();
   fetchMock.mockRestore();
 });
 

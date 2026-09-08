@@ -33,10 +33,10 @@ export interface RuntimeFaultConfiguration { scenario: RuntimeFaultScenario; del
 export interface RuntimeStatus { id: string; role: "gateway" | "worker" | "dependency"; available: boolean; lifecycle: "healthy" | "degraded" | "unavailable" | "closing" | "error"; active_executions: number; completed_executions: number; failed_executions: number }
 export interface DrainStatus { state: "idle" | "draining" | "closed" | "failed"; started_at?: string; completed_at?: string; error?: string; active_executions: number }
 export interface BackendHealth { backend: string; status: string; message?: string; checked_at: string }
-export interface SessionState { id: string; tenant_id: string; sequence: number; summary: string; event_count: number; updated_at: string }
+export interface SessionState { id: string; tenant_id: string; sequence: number; summary: string; summary_source_sequence?: number; event_count: number; updated_at: string }
 export interface SessionEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
 export interface MemoryRecord { id: string; tenant_id: string; session_id: string; key: string; value: string; updated_at: string }
-export interface MigrationResult { id: string; status: string; dry_run: boolean; sessions: number; processed_sessions: number; source_count: number; destination_count: number; checksum?: string; message?: string }
+export interface MigrationResult { id: string; status: string; dry_run: boolean; sessions: number; processed_sessions: number; source_count: number; destination_count: number; checksum?: string; matched?: boolean; message?: string }
 export interface ChatSession { id: string; tenant_id: string; app_id: string; user_id?: string; sequence?: number }
 export interface ChatEvent { id: string; tenant_id: string; session_id: string; sequence: number; idempotency_key: string; type: string; payload: string; occurred_at: string }
 export interface ChatRunResponse { session_id: string; request_id: string; status: "running" | "pending" | "completed" | "failed" | "cancelled" }
@@ -178,7 +178,7 @@ export const api = {
   session: (id: string) => request<SessionState>(`/api/v1/admin/sessions/${encodeURIComponent(id)}`),
   sessionEvents: (id: string) => request<ListResponse<SessionEvent>>(`/api/v1/admin/sessions/${encodeURIComponent(id)}/events`),
   memory: (id: string) => request<ListResponse<MemoryRecord>>(`/api/v1/admin/memory/${encodeURIComponent(id)}`),
-  migrate: (input: { dry_run: boolean; batch_size: number }) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify(input) }),
+  migrate: (input: { dry_run: boolean; batch_size: number; cutover: boolean }) => request<MigrationResult>("/api/v1/admin/migrations", { method: "POST", body: JSON.stringify(input) }),
   migration: (id: string) => request<MigrationResult>(`/api/v1/admin/migrations/${encodeURIComponent(id)}`),
   createChatSession: (app_id: string, session_id: string) =>
     request<ChatSession>("/api/v1/chat/sessions", { method: "POST", body: JSON.stringify({ app_id, session_id }) }),

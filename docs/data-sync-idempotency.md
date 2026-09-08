@@ -15,8 +15,8 @@ Session Event 是运行数据事实源，Session State、Summary 和向量索引
 3. 按 `(tenant_id, session_id)` 获取 Session Execution Lease，获得单调递增的 fencing token。
 4. 写入 token 唯一的 `session.lease.acquired` 和 `<request_id>:started`。
 5. Worker 执行 Runner；Gateway 按事件序号追加 delta、completed 或失败事件。
-6. 发布 Artifact 元数据，写入 `latest_agent_reply` Memory，并连续推进 Session State/Summary Projection Checkpoint。
-7. 写入唯一运行终态 `run.completed`、`run.failed` 或 `run.cancelled`，随后发送 IM 回复并释放 Lease。
+6. 写入 `latest_agent_reply` Memory；发布 Artifact 内容并校验 checksum 后写入元数据；最后追加带 `source_sequence` 的 Summary Projection Checkpoint。
+7. 写入唯一运行终态 `run.completed`、`run.failed` 或 `run.cancelled`；成功终态提交后发送 IM 回复并记录投递结果，随后释放 Lease。
 
 每个步骤都使用由 `request_id` 和阶段名确定性派生的幂等键。成功回复要求 Artifact、Memory 和投影已经提交；任何关键写失败都不能写成功终态。调用方取消和存储超时使用稳定错误分类，不能被误报为业务成功。
 
@@ -40,31 +40,33 @@ PostgreSQL 以数据库时间判断 Lease 的 `expires_at`。Gateway 定期续�
 
 Memory 的权威值先提交到选定的 SQL/Redis 后端，再发布索引任务。Agent 读取上下文时先读权威 Memory，向量召回只扩展候选。Knowledge 同样先保存来源、内容或内容引用，再异步分块、生成 embedding、upsert 向量并推进 index checkpoint。索引故障把状态置为 `retry_pending`，使用指数退避和有界并发重试，不删除权威记录。
 
-Artifact 采用两阶段发布设计：先把内容写到含 `request_id` 的临时对象 key，校验 checksum，再在 SQL 事务中发布 metadata，最后把对象标为可读。对象成功而 SQL 失败会留下可扫描的临时对象；SQL 成功但对象不可读时转为 `recovery_required`，API 不返回虚假成功。当前参考实现使用已持久化 `message.completed` 的 `session-event://` 引用，其 metadata 可由事件事实源校验。
+Artifact metadata 只引用已持久化的 `message.completed` 事件。配置 S3 时，适配器把事件内容写入确定性名称的版本对象，回读校验 checksum 后再发布 metadata；对象成功而 metadata 失败会留下不可达版本，交给生命周期或后续扫描清理。未配置对象存储时保留可由事件事实源校验的 `session-event://` 引用。metadata 已发布但对象不可读或 checksum 不符时，API 返回恢复错误而不返回虚假内容。
 
 ## 6. Redis/SQLite 到 SQL 迁移
 
-迁移采用 forward-only Migration Job：
+迁移采用 forward-only Migration Job。正式 Redis 迁移先在共享 Control Plane 设置 Tenant Migration Lock，使新请求返回 `tenant_storage_migrating`，再用 Redis 持久锁阻止已经持有旧 adapter 的节点写入：
 
 1. 锁定目标 Tenant 的 Backend Selection，阻止迁移期间切换配置。
 2. 按 Session 列表和 sequence 分批复制 Session Event，再复制 Memory。
 3. 每批保存 source cursor、最后 sequence、记录数和 checksum 的 Migration Checkpoint。
 4. dry-run 比较源/目标数量、事件身份和摘要，不切换在线流量。
 5. 正式迁移完成后执行双读校验，确认无缺失、无多余、checksum 一致。
-6. 在 Control Plane 中原子更新 Backend Selection，源后端进入只读观察窗口。
+6. 在 Control Plane 中原子更新 Backend Selection，源 Redis 保留持久只读锁进入观察窗口；明确回滚时才用 `storage-migrate -resume-source-writes` 解锁。
 7. 观察期通过后再按运维流程回收源数据；失败任务从最后完整 checkpoint 恢复。
 
 目标端仍使用原有幂等键，重复批次不会产生第二份事件。迁移工具不得跨 Tenant 接受源或目标范围。Control Plane schema 迁移由 `control-migrate` 执行 expand-contract：先添加兼容结构，升级全部 Gateway，最后在后续维护窗口删除旧结构；Gateway 只验证版本，不在启动时改表。
 
+进程崩溃会保留 Control Plane Migration ID 和 Redis 只读锁。重启后 `GET /api/v1/admin/migrations/{migration_id}` 返回 `recovery_required`；管理员核对路由、checkpoint 和目标数据后，可调用 `DELETE` 同一路径解除对应 ID 的两层锁。独立迁移工具也提供 `-resume-source-writes`，用于已确认 Control Plane 状态的离线回滚。
+
 ## 7. 本地向量库到远端向量库
 
-向量是 Knowledge/Memory 权威内容的可重建派生物。Migration Job 按 Tenant、Agent App、索引类型和 index generation 隔离，启动时固定 embedding model、向量维度、切片版本和源 watermark，在远端创建未发布的新 generation。
+向量是 Knowledge/Memory 权威内容的可重建派生物。`storage-migrate -profiles <file> -reindex-profile <id> -tenant <tenant>` 按 Tenant 和 index generation 重建 Qdrant collection；profile 固定 embedding model、向量维度和 generation，确定性向量 ID 使重试不会产生重复记录。
 
 向量 ID 使用 `(tenant_id, app_id, source_type, source_id, chunk_id, embedding_version)` 确定性生成，批量 upsert 可安全重试。checkpoint 记录源 cursor、watermark、成功/失败数与批次 checksum。Tenant ID 同时进入 collection/partition 路由和 metadata filter。只有模型、维度与切片版本完全相同时才允许复制已有向量，否则从权威内容重新切片和 embedding。
 
 watermark 之后的新增、更新和删除进入 SQL outbox；回填期间继续写源索引，并异步同步目标 generation，删除使用 tombstone。回填结束后先追平 outbox，再核对有效 ID、缺失/多余项、metadata checksum、维度和 embedding 版本，并对固定查询集执行 shadow read。只有 Top-K 覆盖率、过滤条件和延迟达到阈值时，才原子切换 active index generation。
 
-回滚只需恢复 generation 指针并继续回放 outbox。失败任务保留 checkpoint、新 generation 和错误摘要，不影响当前在线索引；未发布 generation 可在审计后清理。
+切换通过选择指向新 generation 的 Backend Profile 完成，回滚时恢复旧 profile。当前实现会在查询时补齐遗漏的权威 Knowledge，并在向量服务不可用时回退到权威记录；持续 outbox、删除 tombstone、shadow-read 阈值和未发布 generation 自动清理仍是生产扩展项。
 
 ## 8. 故障恢复与检测
 

@@ -50,7 +50,7 @@ func (s *InMemoryStore) PutArtifact(ctx context.Context, item Artifact) (Artifac
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	stream := storageSessionKey(item.TenantID, item.SessionID)
-	if item.FencingToken > 0 && item.FencingToken < s.fences[stream] {
+	if item.FencingToken > 0 && item.FencingToken < s.fences[stream] && !importingMigration(ctx) {
 		return Artifact{}, ErrStaleFencingToken
 	}
 	if item.FencingToken > s.fences[stream] {

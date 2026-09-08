@@ -170,7 +170,12 @@ func (h *AdminHandler) handleGovernanceAudit(w http.ResponseWriter, r *http.Requ
 		SessionID: r.URL.Query().Get("session_id"), RequestID: r.URL.Query().Get("request_id"), TraceID: r.URL.Query().Get("trace_id"),
 		From: from, To: to, Offset: offset, Limit: limit,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.governance.AuditEvents(query)})
+	items, err := h.governance.QueryAuditEvents(r.Context(), query)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable", "audit service is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (h *AdminHandler) handleConfirmationDecision(w http.ResponseWriter, r *http.Request, tenant TenantContext, id string) {

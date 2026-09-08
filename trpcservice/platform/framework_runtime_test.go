@@ -68,6 +68,18 @@ func TestOpenAICompatibleAgentFactoryUsesServerOwnedProfile(t *testing.T) {
 	if strings.Contains(string(encoded), "fixture-secret") {
 		t.Fatal("provider credential leaked into request body")
 	}
+	_, err = adapter.Run(context.Background(), RunnerRequest{
+		TenantID: "tenant-one", AppID: "app-one", DeploymentID: "deploy-one", VersionID: "deploy-one-v1",
+		SessionID: "session-one", UserID: "user-one", RequestID: "request-openai-two", Input: "second request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := <-requests
+	secondPayload, _ := json.Marshal(secondRequest["messages"])
+	if strings.Contains(string(secondPayload), "hello") || !strings.Contains(string(secondPayload), "second request") {
+		t.Fatalf("upstream runner retained node-local history: %s", secondPayload)
+	}
 }
 
 func TestOpenAICompatibleModelStreamsThroughPublicChatSSE(t *testing.T) {

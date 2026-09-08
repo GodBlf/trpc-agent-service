@@ -592,6 +592,8 @@ func (h *AdminHandler) handleRoutedRun(w http.ResponseWriter, r *http.Request) {
 		code, message := "storage_unavailable", "tenant storage is unavailable"
 		if errors.Is(err, errControlPlaneUnavailable) {
 			code, message = "control_plane_unavailable", "control plane is unavailable"
+		} else if errors.Is(err, ErrTenantMigrating) {
+			code, message = "tenant_storage_migrating", "tenant storage is temporarily read-only during migration"
 		} else if h.life != nil && h.life.IsClosing() {
 			code, message = "service_closing", "service is closing"
 		}

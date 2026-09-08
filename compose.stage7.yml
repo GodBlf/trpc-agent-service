@@ -53,6 +53,7 @@ services:
       TRPC_REDIS_ADDR: redis:6379
       TRPC_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
       TRPC_CONTROL_PLANE_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
+      TRPC_AUDIT_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
       TRPC_SESSION_LEASE_TTL: 3s
       TRPC_SESSION_LEASE_RENEW_INTERVAL: 1s
       TRPC_FAULT_INJECTION: "1"

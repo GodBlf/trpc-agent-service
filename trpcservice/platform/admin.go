@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"trpc.group/trpc-go/trpc-agent-go/session/summary"
 )
 
 type Role string
@@ -145,6 +146,9 @@ func (p *SnapshotControlPlane) saveBackendSelection(ctx context.Context, tenantI
 		return p.persistenceErr
 	}
 	previous, existed := p.backendSelections[tenantID]
+	if previous.MigrationID != "" {
+		return ErrTenantMigrating
+	}
 	p.backendSelections[tenantID] = selection
 	if p.persistLockedContext(ctx) {
 		return nil
@@ -447,6 +451,7 @@ type productionSession struct {
 const maxDevelopmentSessions = 256
 
 type AdminHandler struct {
+	summarizer               summary.SessionSummarizer
 	platform                 ControlPlaneStore
 	identity                 DevelopmentIdentity
 	identityProvider         IdentityProvider
@@ -570,8 +575,16 @@ func (h *AdminHandler) ConfigureDataStore(store DataStore) {
 }
 
 type backendSelection struct {
-	Backend string `json:"backend"`
-	Address string `json:"address"`
+	ProfileID      string               `json:"profile_id,omitempty"`
+	MigrationID    string               `json:"migration_id,omitempty"`
+	ExternalMemory ExternalMemoryConfig `json:"external_memory,omitempty"`
+	Backend        string               `json:"backend"`
+	Address        string               `json:"address"`
+	Memory         BackendEndpoint      `json:"memory,omitempty"`
+	Artifact       BackendEndpoint      `json:"artifact,omitempty"`
+	Knowledge      BackendEndpoint      `json:"knowledge,omitempty"`
+	Object         ObjectBackendConfig  `json:"object,omitempty"`
+	Vector         VectorBackendConfig  `json:"vector,omitempty"`
 }
 
 func (h *AdminHandler) ConfigureBackendSelections(path string) error {
@@ -709,6 +722,9 @@ func (h *AdminHandler) acquireStore(ctx context.Context, tenantID string) (DataS
 	selections, err := h.platform.loadBackendSelections(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", errControlPlaneUnavailable, err)
+	}
+	if selections[tenantID].MigrationID != "" {
+		return nil, nil, ErrTenantMigrating
 	}
 	h.backends.syncSelections(selections)
 	return h.backends.acquire(tenantID)

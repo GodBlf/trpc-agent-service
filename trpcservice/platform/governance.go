@@ -253,6 +253,7 @@ type rateWindow struct {
 // boundary. It is deterministic and process-local by default so adapters can
 // replace its persistence without changing HTTP or runtime contracts.
 type GovernanceCenter struct {
+	auditStore    AuditStore
 	mu            sync.Mutex
 	policies      map[string]TenantPolicy
 	audits        []AuditEvent
@@ -1461,6 +1462,14 @@ func (g *GovernanceCenter) Record(ctx context.Context, event AuditEvent) error {
 }
 
 func (g *GovernanceCenter) persistLocked() error {
+	if g.auditStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := g.auditStore.AppendAuditEvents(ctx, g.audits)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
 	if g.path == "" {
 		return nil
 	}
