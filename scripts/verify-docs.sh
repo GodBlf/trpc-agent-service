@@ -6,6 +6,7 @@ DELIVERABLES=(
   docs/architecture.md
   docs/system-architecture-diagram.md
   docs/core-sequence-diagram.md
+  docs/im-channel-adapter.md
   docs/data-model.md
   docs/data-sync-idempotency.md
   docs/backend-adapters.md
@@ -19,7 +20,7 @@ done
 
 test -s "$ROOT/docs/README.md"
 test -s "$ROOT/docs/acceptance/acceptance.md"
-test "$(find "$ROOT/docs" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')" -eq 9
+test "$(find "$ROOT/docs" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')" -eq 10
 
 architecture_han_count="$(perl -CSD -Mutf8 -ne '$n += () = /\p{Han}/g; END { print $n }' "$ROOT/docs/architecture.md")"
 test "$architecture_han_count" -ge 2000
@@ -44,6 +45,11 @@ grep -q 'latest_agent_reply Memory' "$ROOT/docs/core-sequence-diagram.md"
 grep -q '`request_id`' "$ROOT/docs/core-sequence-diagram.md"
 grep -q '`trace_id`' "$ROOT/docs/core-sequence-diagram.md"
 grep -q '`traceparent`' "$ROOT/docs/core-sequence-diagram.md"
+
+grep -q 'model.NewUserMessage' "$ROOT/docs/im-channel-adapter.md"
+grep -q '(provider, provider_account, external_subject)' "$ROOT/docs/im-channel-adapter.md"
+grep -q 'Session ID 与隔离规则' "$ROOT/docs/im-channel-adapter.md"
+grep -q '平台限制与降级矩阵' "$ROOT/docs/im-channel-adapter.md"
 
 grep -q 'Projection Checkpoint' "$ROOT/docs/data-model.md"
 grep -q '核心事件 JSON Schema' "$ROOT/docs/data-model.md"

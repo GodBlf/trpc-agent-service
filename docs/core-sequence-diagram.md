@@ -37,9 +37,8 @@ sequenceDiagram
 
   alt 需要人工确认
     Gov-->>Gateway: pending_confirmation(request_id)
-    Gateway-->>Channel: 暂停执行并返回确认状态
-    Channel-->>WeCom: 状态消息
-    WeCom-->>User: 展示待确认状态
+    Gateway->>Store: 持久化确认状态并暂停执行
+    Note over Gateway,WeCom: 当前不占用一次性回复引用发送中间状态；操作员在 Management Console 处理确认
   else 已授权执行
     Gov-->>Runner: approved -> executing
     Runner->>Tool: 执行 Tool / MCP
@@ -76,3 +75,5 @@ sequenceDiagram
 只有 Session Event、Artifact、`latest_agent_reply` Memory 和连续投影全部成功后，Gateway 才写唯一 `run.completed` 并调用 Channel Adapter 回复。Storage 写入失败、Lease 丢失或治理拒绝都不能发送成功回复。重复的企业微信消息复用同一 `request_id`：若事实源已有相同 input 或终态，则返回已有结果；相同 ID 但内容不同返回幂等冲突。
 
 危险 Tool 在产生副作用前必须从 approved 原子进入 executing。若 Worker 在 executing 后失联，平台记录 `outcome_unknown`，不会自动重放。Gateway 失去 Lease 时取消 Runner；即使旧 goroutine 未及时退出，存储层也通过更高 fencing token 拒绝其后续事件和 Memory 写入。
+
+真实 IM 当前只发送最终成功回复，不转发 `message.delta`，也不发送确认、失败或取消状态；完整 Provider 认证、Session 规则和限制矩阵见 [IM Channel Adapter 设计](im-channel-adapter.md)。
