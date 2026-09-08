@@ -91,6 +91,15 @@ jq -e '.backend == "postgres"' "$RESPONSE" >/dev/null
 expect 200 "$(request b "$COOKIE_B" GET /api/v1/admin/agent-apps)" read-app-b
 jq -e '.items[] | select(.id == "app-stage7")' "$RESPONSE" >/dev/null
 
+# Provider Route registry is shared by both Gateways. The route is created via
+# B, observed via A, then disabled via B and observed from A again.
+expect 201 "$(request b "$COOKIE_B" POST /api/v1/admin/providers/routes '{"provider":"telegram","external_subject":"stage7-shared","tenant_id":"tenant-dev","app_id":"app-stage7","conversation_type":"single"}')" create-provider-route-b
+expect 200 "$(request a "$COOKIE_A" GET /api/v1/admin/providers/routes)" read-provider-route-a
+jq -e '.items[] | select(.provider == "telegram" and .external_subject == "stage7-shared" and .enabled == true)' "$RESPONSE" >/dev/null
+expect 200 "$(request b "$COOKIE_B" PATCH '/api/v1/admin/providers/routes?provider=telegram&external_subject=stage7-shared' '{"tenant_id":"tenant-dev","app_id":"app-stage7","conversation_type":"single","enabled":false}')" disable-provider-route-b
+expect 200 "$(request a "$COOKIE_A" GET /api/v1/admin/providers/routes)" read-disabled-provider-route-a
+jq -e '.items[] | select(.provider == "telegram" and .external_subject == "stage7-shared" and .enabled == false)' "$RESPONSE" >/dev/null
+
 # Channel Binding is immediately shared and each Gateway mutates the latest
 # authoritative snapshot instead of replacing it with a stale local copy.
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/bindings '{"channel":"mock","app_id":"app-stage7","conversation_type":"single","external_conversation_id":"shared-a","external_user_id":"shared-a","session_id":"session-binding-a"}')" create-binding-a
@@ -106,6 +115,12 @@ expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions '{"app_id":"app-s
 expect 202 "$(request b "$COOKIE_B" POST /api/v1/chat/sessions/session-stage7/messages '{"input":"run through gateway b"}' request-b)" run-b
 wait_request_terminal b "$COOKIE_B" session-stage7 request-b run.completed
 
+# A retry arriving at the other Gateway after completion must return the
+# persisted terminal and must not append another input event.
+expect 200 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions/session-stage7/messages '{"input":"run through gateway b"}' request-b)" retry-request-on-a
+request a "$COOKIE_A" GET /api/v1/admin/sessions/session-stage7/events >/dev/null
+jq -e '[.items[] | select(.idempotency_key == "request-b:input")] | length == 1' "$RESPONSE" >/dev/null
+
 # Pause Gateway A until its live lease expires. After it resumes and records an
 # exact cancellation, Gateway B must commit with a higher observable token.
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/admin/agent-apps '{"id":"app-fence","name":"Fencing"}')" create-fence-app
@@ -117,6 +132,16 @@ expect 200 "$(request a "$COOKIE_A" POST /api/v1/admin/governance/policy '{"agen
 expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions '{"app_id":"app-fence","session_id":"session-fence"}')" create-fence-session
 expect 202 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions/session-fence/messages '{"input":"first owner"}' fence-a)" fence-a-admitted
 wait_request_event a "$COOKIE_A" session-fence fence-a session.lease.acquired
+
+# Cancellation is intentionally sent through the other Gateway while A owns
+# the execution. The shared coordinator wakes A within the lease renewal bound.
+expect 201 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions '{"app_id":"app-fence","session_id":"session-fence-cancel"}')" create-fence-cancel-session
+expect 202 "$(request a "$COOKIE_A" POST /api/v1/chat/sessions/session-fence-cancel/messages '{"input":"cancel me"}' fence-cancel-a)" fence-cancel-admitted
+sleep 1
+expect 200 "$(request b "$COOKIE_B" POST /api/v1/chat/sessions/session-fence-cancel/cancel '{"request_id":"fence-cancel-a"}')" remote-cancel
+jq -e '.status == "cancellation_requested" or .status == "running"' "$RESPONSE" >/dev/null
+wait_request_terminal b "$COOKIE_B" session-fence-cancel fence-cancel-a run.cancelled
+
 docker compose -f "$COMPOSE_FILE" pause gateway-a >/dev/null
 sleep 4
 expect 202 "$(request b "$COOKIE_B" POST /api/v1/chat/sessions/session-fence/messages '{"input":"current owner"}' fence-b)" fence-b-admitted

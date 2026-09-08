@@ -139,9 +139,11 @@ type WorkerServerConfig struct {
 }
 
 type WorkerServer struct {
-	config   WorkerServerConfig
-	versions *workerVersionStore
-	runner   *FrameworkRunnerAdapter
+	config    WorkerServerConfig
+	versions  *workerVersionStore
+	runner    *FrameworkRunnerAdapter
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewWorkerServer(config WorkerServerConfig) *WorkerServer {
@@ -158,6 +160,17 @@ func NewWorkerServer(config WorkerServerConfig) *WorkerServer {
 	runner := NewFrameworkRunnerAdapter(store.Resolve, config.Factory)
 	runner.SetToolGovernance(config.ToolGovernance)
 	return &WorkerServer{config: config, versions: store, runner: runner}
+}
+
+// Close cancels and drains active executions and closes cached framework
+// Runners. It is safe to call more than once during shutdown.
+func (s *WorkerServer) Close() error {
+	s.closeOnce.Do(func() {
+		if s.runner != nil {
+			s.closeErr = s.runner.Close()
+		}
+	})
+	return s.closeErr
 }
 
 func (s *WorkerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -309,7 +322,8 @@ func (s *workerVersionStore) Put(version DeploymentVersion) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, exists := s.versions[version.ID]; exists {
+	key := versionRefKey(DeploymentVersionRef{TenantID: version.TenantID, VersionID: version.ID})
+	if existing, exists := s.versions[key]; exists {
 		existing.Config = cloneConfig(existing.Config)
 		version.Config = cloneConfig(version.Config)
 		if fmt.Sprintf("%v", existing.Config) != fmt.Sprintf("%v", version.Config) {
@@ -318,14 +332,14 @@ func (s *workerVersionStore) Put(version DeploymentVersion) error {
 		return nil
 	}
 	version.Config = cloneConfig(version.Config)
-	s.versions[version.ID] = version
+	s.versions[key] = version
 	return nil
 }
 
-func (s *workerVersionStore) Resolve(_ context.Context, versionID string) (DeploymentVersion, bool, error) {
+func (s *workerVersionStore) Resolve(_ context.Context, ref DeploymentVersionRef) (DeploymentVersion, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	version, exists := s.versions[versionID]
+	version, exists := s.versions[versionRefKey(ref)]
 	if exists {
 		version.Config = cloneConfig(version.Config)
 	}

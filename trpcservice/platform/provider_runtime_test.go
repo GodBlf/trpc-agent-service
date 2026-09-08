@@ -526,6 +526,34 @@ func TestBotTenantAllowlistPersistsDisableUpdateAndDelete(t *testing.T) {
 	}
 }
 
+func TestProviderRoutesShareControlPlaneAcrossHandlers(t *testing.T) {
+	store := NewInMemoryControlPlane()
+	identity := DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-one", TenantName: "One", Role: RolePlatformAdmin}}}
+	handlerA := NewAdminHandler(store, identity)
+	handlerB := NewAdminHandler(store, identity)
+	runtimeA := NewProviderRuntime(BotConfig{}, NewBotTenantAllowlist(), nil)
+	runtimeB := NewProviderRuntime(BotConfig{}, NewBotTenantAllowlist(), nil)
+	handlerA.ConfigureProviderRuntime(runtimeA)
+	handlerB.ConfigureProviderRuntime(runtimeB)
+	route := BotRoute{Provider: ChannelTelegram, ExternalSubject: "shared-chat", TenantID: "tenant-one", AppID: "app-one", ConversationType: ConversationSingle}
+	if err := runtimeB.Routes().Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := runtimeA.Routes().ResolveContext(context.Background(), route.Provider, route.ExternalSubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.TenantID != route.TenantID || got.AppID != route.AppID {
+		t.Fatalf("shared route = %#v/%v", got, ok)
+	}
+	if _, err := runtimeB.Routes().Update(route.Provider, route.ExternalSubject, BotRoute{TenantID: route.TenantID, AppID: route.AppID, ConversationType: route.ConversationType, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := runtimeA.Routes().ResolveContext(context.Background(), route.Provider, route.ExternalSubject); err != nil || !ok || got.Enabled {
+		t.Fatalf("shared disabled route = %#v/%v, err=%v", got, ok, err)
+	}
+}
+
 func TestProviderRuntimeMissingCredentialsStaysAvailable(t *testing.T) {
 	runtime := NewProviderRuntime(BotConfig{}, nil, nil)
 	runtime.Start(context.Background())

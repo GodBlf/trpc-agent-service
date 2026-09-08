@@ -77,6 +77,9 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("worker HTTP shutdown: %v", err)
 		}
+		if err := worker.Close(); err != nil {
+			log.Printf("worker runtime shutdown: %v", err)
+		}
 		return
 	}
 	if role != "" && role != "gateway" {
@@ -170,17 +173,27 @@ func main() {
 			log.Fatalf("Session Execution Lease store: %v", err)
 		}
 		admin.ConfigureSessionLeases(leases)
+		runCoordinator, err := platform.NewPostgresRunCoordinator(controlPlaneDSN, gatewayID, leaseTTL, leaseRenewInterval)
+		if err != nil {
+			log.Fatalf("Run Coordinator store: %v", err)
+		}
+		admin.ConfigureRunCoordinator(runCoordinator)
 	}
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
 	admin.ConfigurePostgresBackend(os.Getenv("TRPC_POSTGRES_DSN"))
 	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
-	routePath := os.Getenv("TRPC_BOT_ROUTES_PATH")
-	if routePath == "" {
-		routePath = "data/bot-routes.json"
-	}
-	routes, err := platform.NewPersistentBotTenantAllowlist(routePath)
-	if err != nil {
-		log.Fatalf("bot tenant allowlist: %v", err)
+	var routes *platform.BotTenantAllowlist
+	if controlPlaneDSN != "" {
+		routes = platform.NewBotTenantAllowlist()
+	} else {
+		routePath := os.Getenv("TRPC_BOT_ROUTES_PATH")
+		if routePath == "" {
+			routePath = "data/bot-routes.json"
+		}
+		routes, err = platform.NewPersistentBotTenantAllowlist(routePath)
+		if err != nil {
+			log.Fatalf("bot tenant allowlist: %v", err)
+		}
 	}
 	providers := platform.NewProviderRuntime(platform.LoadBotConfig(nil), routes, admin.ProcessProviderMessage)
 	admin.ConfigureProviderRuntime(providers)

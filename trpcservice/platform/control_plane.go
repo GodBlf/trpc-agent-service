@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const ControlPlaneSchemaVersion = 1
+const ControlPlaneSchemaVersion = 2
 const controlPlaneOperationTimeout = 5 * time.Second
 
 type persistedVersionCreation struct {
@@ -31,6 +31,7 @@ type controlPlaneSnapshot struct {
 	Versions           map[string][]DeploymentVersion `json:"deployment_versions"`
 	VersionCreations   []persistedVersionCreation     `json:"version_creations"`
 	ChannelBindings    map[string]ChannelBinding      `json:"channel_bindings"`
+	ProviderRoutes     map[string]BotRoute            `json:"provider_routes,omitempty"`
 	BackendSelections  map[string]backendSelection    `json:"backend_selections,omitempty"`
 	GovernancePolicies map[string]TenantPolicy        `json:"governance_policies,omitempty"`
 }
@@ -67,8 +68,11 @@ func MigrateSQLiteControlPlane(path string) error {
 	defer cancel()
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING`,
+		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 2) ON CONFLICT(singleton) DO NOTHING`,
+		`UPDATE control_plane_schema SET version = 2 WHERE singleton = 1 AND version < 2`,
 		`CREATE TABLE IF NOT EXISTS control_plane_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision INTEGER NOT NULL, payload BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS run_executions (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL, input_hash TEXT NOT NULL, enqueue_order INTEGER NOT NULL, owner_id TEXT NOT NULL, fencing_token INTEGER NOT NULL, state TEXT NOT NULL, lease_expires_at TEXT NOT NULL, cancel_requested_at TEXT, terminal_type TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY (tenant_id, session_id, request_id))`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS run_executions_one_owner_per_session ON run_executions(tenant_id, session_id) WHERE state = 'running'`,
 	}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -91,9 +95,12 @@ func MigratePostgresControlPlane(dsn string) error {
 	defer cancel()
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS control_plane_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING`,
+		`INSERT INTO control_plane_schema(singleton, version) VALUES (1, 2) ON CONFLICT(singleton) DO NOTHING`,
+		`UPDATE control_plane_schema SET version = 2 WHERE singleton = 1 AND version < 2`,
 		`CREATE TABLE IF NOT EXISTS control_plane_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision BIGINT NOT NULL, payload BYTEA NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS session_execution_leases (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, owner_id TEXT NOT NULL, fencing_token BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (tenant_id, session_id))`,
+		`CREATE TABLE IF NOT EXISTS run_executions (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL, input_hash TEXT NOT NULL, enqueue_order BIGSERIAL NOT NULL, owner_id TEXT NOT NULL, fencing_token BIGINT NOT NULL, state TEXT NOT NULL, lease_expires_at TIMESTAMPTZ NOT NULL, cancel_requested_at TIMESTAMPTZ, terminal_type TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (tenant_id, session_id, request_id))`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS run_executions_one_owner_per_session ON run_executions(tenant_id, session_id) WHERE state = 'running'`,
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate control plane: %w", err)
@@ -253,6 +260,7 @@ func controlPlaneSnapshotFrom(platform *SnapshotControlPlane) controlPlaneSnapsh
 		Tenants: platform.tenants, Apps: platform.apps, Deployments: platform.deployments,
 		Versions:           platform.versions,
 		ChannelBindings:    platform.channelBindings,
+		ProviderRoutes:     platform.providerRoutes,
 		BackendSelections:  platform.backendSelections,
 		GovernancePolicies: platform.governancePolicies,
 		VersionCreations:   make([]persistedVersionCreation, 0, len(platform.versionCreations)),
@@ -269,6 +277,10 @@ func controlPlaneSnapshotFrom(platform *SnapshotControlPlane) controlPlaneSnapsh
 func applyControlPlaneSnapshot(platform *SnapshotControlPlane, snapshot controlPlaneSnapshot) {
 	if snapshot.Tenants != nil {
 		platform.tenants = snapshot.Tenants
+		for id, tenant := range platform.tenants {
+			tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
+			platform.tenants[id] = tenant
+		}
 	}
 	if snapshot.Apps != nil {
 		platform.apps = snapshot.Apps
@@ -281,6 +293,9 @@ func applyControlPlaneSnapshot(platform *SnapshotControlPlane, snapshot controlP
 	}
 	if snapshot.ChannelBindings != nil {
 		platform.channelBindings = snapshot.ChannelBindings
+	}
+	if snapshot.ProviderRoutes != nil {
+		platform.providerRoutes = snapshot.ProviderRoutes
 	}
 	if snapshot.BackendSelections != nil {
 		platform.backendSelections = snapshot.BackendSelections

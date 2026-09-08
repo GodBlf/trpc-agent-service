@@ -64,6 +64,53 @@ type BotTenantAllowlist struct {
 	mu          sync.RWMutex
 	routes      map[string]BotRoute
 	persistPath string
+	load        func(context.Context) (map[string]BotRoute, error)
+	mutate      func(context.Context, func(map[string]BotRoute) error) (map[string]BotRoute, error)
+}
+
+// configurePersistence attaches the authoritative Control Plane adapter. A
+// legacy in-memory route set is imported only when the shared store is empty;
+// after that, callbacks always refresh from the shared store.
+func (a *BotTenantAllowlist) configurePersistence(load func(context.Context) (map[string]BotRoute, error), mutate func(context.Context, func(map[string]BotRoute) error) (map[string]BotRoute, error)) error {
+	a.mu.Lock()
+	local := copyBotRoutes(a.routes)
+	a.load, a.mutate = load, mutate
+	a.mu.Unlock()
+	if load == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	routes, err := load(ctx)
+	if err != nil {
+		return err
+	}
+	if len(routes) == 0 && len(local) > 0 && mutate != nil {
+		routes, err = mutate(ctx, func(shared map[string]BotRoute) error {
+			for key, route := range local {
+				if previous, exists := shared[key]; exists && (previous.TenantID != route.TenantID || previous.AppID != route.AppID) {
+					return errors.New("platform: ambiguous bot route")
+				}
+				shared[key] = route
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	a.mu.Lock()
+	a.routes = copyBotRoutes(routes)
+	a.mu.Unlock()
+	return nil
+}
+
+func copyBotRoutes(source map[string]BotRoute) map[string]BotRoute {
+	result := make(map[string]BotRoute, len(source))
+	for key, route := range source {
+		result[key] = route
+	}
+	return result
 }
 
 func NewBotTenantAllowlist() *BotTenantAllowlist {
@@ -113,31 +160,48 @@ func (a *BotTenantAllowlist) Upsert(route BotRoute) error {
 	if err := validateBotRoute(route); err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	key := botRouteKey(route.Provider, route.ExternalSubject)
-	if previous, ok := a.routes[key]; ok && (previous.TenantID != route.TenantID || previous.AppID != route.AppID) {
-		return errors.New("platform: ambiguous bot route")
-	}
 	route.Enabled = true
-	return a.replaceLocked(key, route)
+	key := botRouteKey(route.Provider, route.ExternalSubject)
+	return a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
+		if previous, ok := routes[key]; ok && (previous.TenantID != route.TenantID || previous.AppID != route.AppID) {
+			return errors.New("platform: ambiguous bot route")
+		}
+		routes[key] = route
+		return nil
+	})
 }
 
 func (a *BotTenantAllowlist) Resolve(provider, subject string) (BotRoute, bool) {
-	route, ok := a.Lookup(provider, subject)
+	route, ok, _ := a.ResolveContext(context.Background(), provider, subject)
 	return route, ok && route.Enabled
 }
 
 func (a *BotTenantAllowlist) Lookup(provider, subject string) (BotRoute, bool) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	route, ok := a.routes[botRouteKey(provider, subject)]
+	route, ok, _ := a.ResolveContext(context.Background(), provider, subject)
 	return route, ok
 }
 
+func (a *BotTenantAllowlist) ResolveContext(ctx context.Context, provider, subject string) (BotRoute, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.refreshLocked(ctx); err != nil {
+		return BotRoute{}, false, err
+	}
+	route, ok := a.routes[botRouteKey(provider, subject)]
+	return route, ok, nil
+}
+
 func (a *BotTenantAllowlist) List() []BotRoute {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	items, _ := a.ListContext(context.Background())
+	return items
+}
+
+func (a *BotTenantAllowlist) ListContext(ctx context.Context) ([]BotRoute, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.refreshLocked(ctx); err != nil {
+		return nil, err
+	}
 	items := make([]BotRoute, 0, len(a.routes))
 	for _, route := range a.routes {
 		items = append(items, route)
@@ -145,38 +209,66 @@ func (a *BotTenantAllowlist) List() []BotRoute {
 	sort.Slice(items, func(i, j int) bool {
 		return botRouteKey(items[i].Provider, items[i].ExternalSubject) < botRouteKey(items[j].Provider, items[j].ExternalSubject)
 	})
-	return items
+	return items, nil
 }
 
 func (a *BotTenantAllowlist) Update(provider, subject string, replacement BotRoute) (BotRoute, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	key := botRouteKey(provider, subject)
-	if _, ok := a.routes[key]; !ok {
-		return BotRoute{}, ErrNotFound
-	}
 	replacement.Provider = provider
 	replacement.ExternalSubject = subject
 	if err := validateBotRoute(replacement); err != nil {
 		return BotRoute{}, err
 	}
-	if err := a.replaceLocked(key, replacement); err != nil {
+	err := a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
+		if _, ok := routes[key]; !ok {
+			return ErrNotFound
+		}
+		routes[key] = replacement
+		return nil
+	})
+	if err != nil {
 		return BotRoute{}, err
 	}
 	return replacement, nil
 }
 
 func (a *BotTenantAllowlist) Delete(provider, subject string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	key := botRouteKey(provider, subject)
-	previous, ok := a.routes[key]
-	if !ok {
+	return a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
+		delete(routes, key)
+		return nil
+	})
+}
+
+func (a *BotTenantAllowlist) refreshLocked(ctx context.Context) error {
+	if a.load == nil {
 		return nil
 	}
-	delete(a.routes, key)
+	routes, err := a.load(ctx)
+	if err != nil {
+		return err
+	}
+	a.routes = copyBotRoutes(routes)
+	return nil
+}
+
+func (a *BotTenantAllowlist) mutateRoutes(ctx context.Context, mutate func(map[string]BotRoute) error) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.mutate != nil {
+		routes, err := a.mutate(ctx, mutate)
+		if err != nil {
+			return err
+		}
+		a.routes = copyBotRoutes(routes)
+		return nil
+	}
+	previous := copyBotRoutes(a.routes)
+	if err := mutate(a.routes); err != nil {
+		return err
+	}
 	if err := a.persistLocked(); err != nil {
-		a.routes[key] = previous
+		a.routes = previous
 		return err
 	}
 	return nil

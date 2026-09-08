@@ -217,9 +217,11 @@ func (rt *Runtime) Close() error {
 	return runnerErr
 }
 
-func (rt *Runtime) RetireVersion(versionID string) error {
-	if streaming, ok := rt.worker.runner.(interface{ RetireVersion(string) error }); ok {
-		return streaming.RetireVersion(versionID)
+func (rt *Runtime) RetireVersion(ref DeploymentVersionRef) error {
+	if streaming, ok := rt.worker.runner.(interface {
+		RetireVersion(DeploymentVersionRef) error
+	}); ok {
+		return streaming.RetireVersion(ref)
 	}
 	return nil
 }
@@ -247,7 +249,7 @@ func (rt *Runtime) Stream(ctx context.Context, tenant TenantContext, request Gat
 	if !found {
 		return nil, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, DeploymentVersionRef{TenantID: tenant.TenantID, VersionID: deployment.VersionID}); err != nil {
 		return nil, &runtimeError{code: "control_plane_unavailable", err: err}
 	} else if found {
 		request.Version = &version
@@ -386,7 +388,7 @@ func (rt *Runtime) Handle(ctx context.Context, tenant TenantContext, request Gat
 	if !found {
 		return GatewayResponse{}, &runtimeError{code: "active_deployment_not_found"}
 	}
-	if version, found, err := rt.platform.DeploymentVersion(ctx, deployment.VersionID); err != nil {
+	if version, found, err := rt.platform.DeploymentVersion(ctx, DeploymentVersionRef{TenantID: tenant.TenantID, VersionID: deployment.VersionID}); err != nil {
 		return GatewayResponse{}, &runtimeError{code: "control_plane_unavailable", err: err}
 	} else if found {
 		request.Version = &version

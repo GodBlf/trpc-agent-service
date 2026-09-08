@@ -470,7 +470,7 @@ func (h *AdminHandler) handleTransition(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if request.Status == DeploymentPaused && updated.VersionID != "" {
-		if err := h.runtime.RetireVersion(updated.VersionID); err != nil {
+		if err := h.runtime.RetireVersion(DeploymentVersionRef{TenantID: updated.TenantID, VersionID: updated.VersionID}); err != nil {
 			writeError(w, http.StatusServiceUnavailable, "runtime_close_failed", "deployment runtime could not be retired")
 			return
 		}

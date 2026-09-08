@@ -112,12 +112,20 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 	default:
 		return errors.New("unsupported provider")
 	}
-	route, exists := h.providers.Routes().Lookup(provider, subject)
+	requestID := "channel-" + messageID
+	route, exists, routeErr := h.providers.Routes().ResolveContext(ctx, provider, subject)
+	if routeErr != nil {
+		h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
+		return errors.New("control_plane_unavailable")
+	}
 	if !exists && fallbackSubject != "" && fallbackSubject != subject {
 		subject = fallbackSubject
-		route, exists = h.providers.Routes().Lookup(provider, subject)
+		route, exists, routeErr = h.providers.Routes().ResolveContext(ctx, provider, subject)
+		if routeErr != nil {
+			h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
+			return errors.New("control_plane_unavailable")
+		}
 	}
-	requestID := "channel-" + messageID
 	if !exists {
 		h.providers.recordRejected(provider, subject, requestID, "unmapped", BotRoute{})
 		return ErrProviderMessageIgnored
@@ -600,7 +608,14 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 	}
 	switch r.Method {
 	case http.MethodGet:
-		items := h.providers.Routes().List()
+		items, err := h.providers.Routes().ListContext(r.Context())
+		if err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		filtered := items[:0]
 		for _, item := range items {
 			if tenantCanSee(tenant, item.TenantID) {
@@ -627,13 +642,23 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if err := h.providers.Routes().Upsert(route); err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusConflict, "provider_route_conflict", "provider route conflicts with an existing mapping")
 			return
 		}
 		route.Enabled = true
 		writeJSON(w, http.StatusCreated, route)
 	case http.MethodPatch:
-		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if lookupErr != nil {
+			if writeControlPlaneError(w, lookupErr) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
@@ -668,12 +693,22 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if err != nil {
+			if writeControlPlaneError(w, err) {
+				return
+			}
 			writeError(w, http.StatusConflict, "provider_route_conflict", "provider route could not be updated")
 			return
 		}
 		writeJSON(w, http.StatusOK, route)
 	case http.MethodDelete:
-		existing, exists := h.providers.Routes().Lookup(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		if lookupErr != nil {
+			if writeControlPlaneError(w, lookupErr) {
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider routes are unavailable")
+			return
+		}
 		if !exists || !tenantAllowsPlatformAdmin(tenant, existing.TenantID) {
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
@@ -889,10 +924,18 @@ func (h *AdminHandler) handleCancelChatRun(w http.ResponseWriter, r *http.Reques
 		active.cancel()
 	}
 	status := chatRunStatus(events, request.RequestID)
+	if h.runCoordinator != nil {
+		disposition, err := h.runCoordinator.RequestCancel(r.Context(), RunKey{TenantID: tenant.TenantID, SessionID: sessionID, RequestID: request.RequestID})
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "run_coordinator_unavailable", "run coordinator is unavailable")
+			return
+		}
+		if disposition == CancelRequested && status == "running" {
+			status = "cancellation_requested"
+		}
+	}
 	if running {
 		status = "running"
-	} else if status == "running" {
-		status = "pending"
 	}
 	writeJSON(w, http.StatusOK, chatRunResponse{SessionID: sessionID, RequestID: request.RequestID, Status: status})
 }
@@ -1072,6 +1115,7 @@ type chatRunOptions struct {
 	traceParent    string
 	policyRevision uint64
 	fencingToken   uint64
+	runPermit      RunPermit
 }
 
 type activeChatRun struct {
@@ -1114,9 +1158,13 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 	}
 	options.policyRevision = governanceResult.PolicyRevision
 	started := false
+	var runPermit RunPermit
 	defer func() {
 		if !started && governanceResult.NewExecution {
 			completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, "storage_error", false))
+		}
+		if !started && runPermit != nil {
+			runPermit.Release()
 		}
 	}()
 	if options.binding != nil {
@@ -1139,13 +1187,48 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		}
 	}()
 	key := chatRunKey(options.tenant.TenantID, options.sessionID, options.requestID)
+	if h.runCoordinator != nil {
+		var disposition ClaimDisposition
+		runPermit, disposition, err = h.runCoordinator.Claim(h.chatCtx, RunKey{TenantID: options.tenant.TenantID, SessionID: options.sessionID, RequestID: options.requestID}, options.input)
+		if err != nil {
+			return chatRunResponse{}, err
+		}
+		switch disposition {
+		case ClaimAlreadyRun:
+			if events, listErr := store.ListSessionEvents(h.chatCtx, options.tenant.TenantID, options.sessionID, 0); listErr == nil {
+				if terminal := chatTerminalEvent(events, options.requestID); terminal != nil {
+					if reconciler, ok := h.runCoordinator.(runTerminalReconciler); ok {
+						_ = reconciler.ReconcileTerminal(context.Background(), RunKey{TenantID: options.tenant.TenantID, SessionID: options.sessionID, RequestID: options.requestID}, RunTerminal{Type: runTerminalState(terminal.Type)})
+					}
+					return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: chatRunStatus(events, options.requestID)}, nil
+				}
+			}
+			return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: "running"}, nil
+		case ClaimExisting:
+			status := "completed"
+			if runPermit != nil {
+				if terminal, ok := runPermit.(*memoryPermit); ok {
+					status = runTerminalState(terminal.run.terminal.Type)
+				} else if terminal, ok := runPermit.(*postgresPermit); ok {
+					status = runTerminalState(terminal.terminalType)
+				}
+			}
+			return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: status}, nil
+		}
+	}
 	h.chatMu.Lock()
 	if active, running := h.activeRuns[key]; running {
 		if active.input != options.input {
 			h.chatMu.Unlock()
+			if runPermit != nil {
+				runPermit.Release()
+			}
 			return chatRunResponse{}, errors.New("idempotency_key_reused")
 		}
 		h.chatMu.Unlock()
+		if runPermit != nil {
+			runPermit.Release()
+		}
 		return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: "running"}, nil
 	}
 	storageCtx, cancelStorage := context.WithTimeout(h.chatCtx, storageOperationTimeout)
@@ -1185,6 +1268,9 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			return chatRunResponse{}, errors.New("idempotency_key_reused")
 		}
 		if chatTerminalEvent(events, options.requestID) != nil {
+			if runPermit != nil {
+				_ = runPermit.Finish(context.Background(), RunTerminal{Type: runTerminalState(chatRunStatus(events, options.requestID))})
+			}
 			h.chatMu.Unlock()
 			return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: chatRunStatus(events, options.requestID)}, nil
 		}
@@ -1255,6 +1341,18 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 		return chatRunResponse{}, &GovernanceError{Code: "policy_unavailable"}
 	}
 	runCtx, cancel := runtimeTimeoutContext(h.chatCtx, policy.runtimeTimeout())
+	options.runPermit = runPermit
+	if runPermit != nil {
+		go func() {
+			select {
+			case <-runPermit.CancelRequested():
+				cancel()
+			case <-runPermit.Lost():
+				cancel()
+			case <-runCtx.Done():
+			}
+		}()
+	}
 	done := make(chan struct{})
 	h.activeRuns[key] = activeChatRun{cancel: cancel, input: options.input, done: done}
 	h.chatWG.Add(1)
@@ -1271,6 +1369,25 @@ func (h *AdminHandler) startChatRun(options chatRunOptions) (chatRunResponse, er
 			cancel()
 			release()
 		}()
+		if waiter, ok := runPermit.(interface{ Wait(context.Context) error }); ok {
+			if err := waiter.Wait(runCtx); err != nil {
+				cancelRequested := false
+				if runPermit != nil {
+					select {
+					case <-runPermit.CancelRequested():
+						cancelRequested = true
+					default:
+					}
+				}
+				if runPermit != nil && errors.Is(err, context.Canceled) && cancelRequested {
+					_ = runPermit.Finish(context.Background(), RunTerminal{Type: "cancelled", Error: "cancelled_before_start"})
+					terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
+					_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.cancelled", h.chatIdentityPayload(options, map[string]string{"error": "cancelled_before_start"}))
+					cancelTerminal()
+				}
+				return
+			}
+		}
 		h.runChat(runCtx, store, options)
 	}()
 	return chatRunResponse{SessionID: options.sessionID, RequestID: options.requestID, Status: "running"}, nil
@@ -1287,6 +1404,22 @@ func runtimeTimeoutContext(parent context.Context, timeout time.Duration) (conte
 
 func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options chatRunOptions) {
 	governanceRequest := h.governanceRequest(options)
+	defer func() {
+		if options.runPermit == nil {
+			return
+		}
+		terminalType := ""
+		if events, err := store.ListSessionEvents(context.Background(), options.tenant.TenantID, options.sessionID, 0); err == nil {
+			if terminal := chatTerminalEvent(events, options.requestID); terminal != nil {
+				terminalType = terminal.Type
+			}
+		}
+		if terminalType == "" {
+			options.runPermit.Release()
+			return
+		}
+		_ = options.runPermit.Finish(context.Background(), RunTerminal{Type: runTerminalState(terminalType)})
+	}()
 	agentInput, err := contextualAgentInput(ctx, store, options)
 	if err != nil {
 		h.finishChatStorageFailure(store, options, governanceRequest, err)
@@ -1707,7 +1840,7 @@ func (h *AdminHandler) governanceRequest(options chatRunOptions) GovernanceReque
 		request.ExternalSubject = options.binding.ConversationID
 	}
 	if deployment, ok, _ := h.platform.activeDeployment(h.chatCtx, options.tenant.TenantID, options.appID); ok {
-		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, deployment.VersionID); found {
+		if version, found, _ := h.platform.DeploymentVersion(h.chatCtx, DeploymentVersionRef{TenantID: options.tenant.TenantID, VersionID: deployment.VersionID}); found {
 			request.RequiredTools = configStrings(version.Config, "tools")
 			request.RequiredMCP = configStrings(version.Config, "mcp")
 		}

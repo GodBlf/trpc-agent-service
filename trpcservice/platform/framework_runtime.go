@@ -152,7 +152,7 @@ func deterministicFixtureDelay(value any, kind string) (time.Duration, error) {
 }
 
 type FrameworkRunnerAdapter struct {
-	resolve        func(context.Context, string) (DeploymentVersion, bool, error)
+	resolve        func(context.Context, DeploymentVersionRef) (DeploymentVersion, bool, error)
 	factory        AgentFactory
 	mu             sync.Mutex
 	runners        map[string]frameworkrunner.Runner
@@ -164,30 +164,31 @@ type FrameworkRunnerAdapter struct {
 	runWG          sync.WaitGroup
 }
 
-func NewFrameworkRunnerAdapter(resolve func(context.Context, string) (DeploymentVersion, bool, error), factory AgentFactory) *FrameworkRunnerAdapter {
+func NewFrameworkRunnerAdapter(resolve func(context.Context, DeploymentVersionRef) (DeploymentVersion, bool, error), factory AgentFactory) *FrameworkRunnerAdapter {
 	if factory == nil {
 		factory = DefaultAgentFactory()
 	}
 	return &FrameworkRunnerAdapter{resolve: resolve, factory: factory, runners: make(map[string]frameworkrunner.Runner), runs: make(map[string]map[uint64]context.CancelFunc)}
 }
 
-func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (frameworkrunner.Runner, error) {
+func (a *FrameworkRunnerAdapter) runner(ctx context.Context, ref DeploymentVersionRef) (frameworkrunner.Runner, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok, err := a.resolve(ctx, versionID)
+	version, ok, err := a.resolve(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	if !ok || version.ID != versionID {
+	if !ok || version.ID != ref.VersionID || version.TenantID != ref.TenantID {
 		return nil, errors.New("deployment_version_not_found")
 	}
 	if !version.Active {
 		return nil, errors.New("deployment_version_inactive")
 	}
-	if runner := a.runners[versionID]; runner != nil {
+	cacheKey := versionRefKey(ref)
+	if runner := a.runners[cacheKey]; runner != nil {
 		return runner, nil
 	}
 	agent, err := a.factory(ctx, version)
@@ -199,7 +200,7 @@ func (a *FrameworkRunnerAdapter) runner(ctx context.Context, versionID string) (
 		options = append(options, frameworkrunner.WithPlugins(&governanceRuntimePlugin{center: a.governance, tools: a.toolGovernance}))
 	}
 	runner := frameworkrunner.NewRunner(version.AgentAppID, agent, options...)
-	a.runners[versionID] = runner
+	a.runners[cacheKey] = runner
 	return runner, nil
 }
 
@@ -351,7 +352,8 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	if closed {
 		return nil, errors.New("framework_runtime_closed")
 	}
-	version, ok, err := a.resolve(ctx, request.VersionID)
+	ref := DeploymentVersionRef{TenantID: request.TenantID, VersionID: request.VersionID}
+	version, ok, err := a.resolve(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +372,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 		request.PolicyRevision = admission.PolicyRevision
 		governanceOwned = !externallyCompleted && admission.ExecutionActive
 	}
-	runner, err := a.runner(ctx, request.VersionID)
+	runner, err := a.runner(ctx, ref)
 	if err != nil {
 		if governanceOwned {
 			completeGovernance(ctx, a.governance, runnerGovernanceCompletion(request, "", 0, false, "runner_failed", false))
@@ -382,7 +384,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	runnerContext = context.WithValue(runnerContext, governanceAdmissionContextKey{}, true)
 	runnerContext = context.WithValue(runnerContext, governanceBufferContextKey{}, bufferOutput)
 	runCtx, cancel := context.WithCancel(runnerContext)
-	runID, registered := a.registerRun(request.VersionID, cancel)
+	runID, registered := a.registerRun(ref, cancel)
 	if !registered {
 		cancel()
 		if governanceOwned {
@@ -392,7 +394,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	}
 	upstream, err := runner.Run(runCtx, request.UserID, request.SessionID, model.NewUserMessage(request.Input), frameworkagent.WithRequestID(request.RequestID), frameworkagent.WithExecutionTraceEnabled(true))
 	if err != nil {
-		a.unregisterRun(request.VersionID, runID)
+		a.unregisterRun(ref, runID)
 		cancel()
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			results := make(chan RuntimeEvent, 1)
@@ -411,7 +413,7 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 	results := make(chan RuntimeEvent, 4)
 	go func() {
 		defer close(results)
-		defer a.unregisterRun(request.VersionID, runID)
+		defer a.unregisterRun(ref, runID)
 		defer cancel()
 		var rawOutput string
 		var sawContent, sawCompleted bool
@@ -611,7 +613,7 @@ func runnerGovernanceCompletion(request RunnerRequest, output string, tokens int
 	}
 }
 
-func (a *FrameworkRunnerAdapter) registerRun(versionID string, cancel context.CancelFunc) (uint64, bool) {
+func (a *FrameworkRunnerAdapter) registerRun(ref DeploymentVersionRef, cancel context.CancelFunc) (uint64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -619,35 +621,38 @@ func (a *FrameworkRunnerAdapter) registerRun(versionID string, cancel context.Ca
 	}
 	a.nextRun++
 	a.runWG.Add(1)
-	if a.runs[versionID] == nil {
-		a.runs[versionID] = make(map[uint64]context.CancelFunc)
+	key := versionRefKey(ref)
+	if a.runs[key] == nil {
+		a.runs[key] = make(map[uint64]context.CancelFunc)
 	}
-	a.runs[versionID][a.nextRun] = cancel
+	a.runs[key][a.nextRun] = cancel
 	return a.nextRun, true
 }
 
-func (a *FrameworkRunnerAdapter) unregisterRun(versionID string, runID uint64) {
+func (a *FrameworkRunnerAdapter) unregisterRun(ref DeploymentVersionRef, runID uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if runs := a.runs[versionID]; runs != nil {
+	key := versionRefKey(ref)
+	if runs := a.runs[key]; runs != nil {
 		if _, ok := runs[runID]; !ok {
 			return
 		}
 		delete(runs, runID)
 		a.runWG.Done()
 		if len(runs) == 0 {
-			delete(a.runs, versionID)
+			delete(a.runs, key)
 		}
 	}
 }
 
-func (a *FrameworkRunnerAdapter) RetireVersion(versionID string) error {
+func (a *FrameworkRunnerAdapter) RetireVersion(ref DeploymentVersionRef) error {
 	a.mu.Lock()
-	for _, cancel := range a.runs[versionID] {
+	key := versionRefKey(ref)
+	for _, cancel := range a.runs[key] {
 		cancel()
 	}
-	runner := a.runners[versionID]
-	delete(a.runners, versionID)
+	runner := a.runners[key]
+	delete(a.runners, key)
 	a.mu.Unlock()
 	if runner == nil {
 		return nil

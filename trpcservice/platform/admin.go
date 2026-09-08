@@ -57,6 +57,7 @@ type SnapshotControlPlane struct {
 	versions            map[string][]DeploymentVersion
 	versionCreations    map[versionCreationKey]versionCreation
 	channelBindings     map[string]ChannelBinding
+	providerRoutes      map[string]BotRoute
 	backendSelections   map[string]backendSelection
 	governancePolicies  map[string]TenantPolicy
 	persistence         controlPlanePersistence
@@ -70,7 +71,8 @@ type ControlPlaneStore interface {
 	seedTenant(context.Context, TenantAssignment) error
 	createTenant(context.Context, Tenant) (bool, error)
 	tenant(context.Context, string) (Tenant, bool, error)
-	DeploymentVersion(context.Context, string) (DeploymentVersion, bool, error)
+	updateTenantAuditPolicy(context.Context, string, AuditPolicy) (Tenant, error)
+	DeploymentVersion(context.Context, DeploymentVersionRef) (DeploymentVersion, bool, error)
 	listTenants(context.Context) ([]Tenant, error)
 	listTenantsFor(context.Context, TenantContext) ([]Tenant, error)
 	createApp(context.Context, AgentApp) (bool, error)
@@ -89,6 +91,8 @@ type ControlPlaneStore interface {
 	routeDeployment(context.Context, string, string, string) (Deployment, bool, error)
 	loadChannelBindings(context.Context) (map[string]ChannelBinding, error)
 	mutateChannelBindings(context.Context, func(map[string]ChannelBinding) error) (map[string]ChannelBinding, error)
+	loadProviderRoutes(context.Context) (map[string]BotRoute, error)
+	mutateProviderRoutes(context.Context, func(map[string]BotRoute) error) (map[string]BotRoute, error)
 	loadBackendSelections(context.Context) (map[string]backendSelection, error)
 	saveBackendSelection(context.Context, string, backendSelection) error
 	loadGovernancePolicies(context.Context) (map[string]TenantPolicy, error)
@@ -120,7 +124,7 @@ func NewInMemoryControlPlane() *SnapshotControlPlane {
 	return &SnapshotControlPlane{
 		tenants: make(map[string]Tenant), apps: make(map[string]AgentApp),
 		deployments: make(map[string]Deployment), versions: make(map[string][]DeploymentVersion),
-		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding),
+		versionCreations: make(map[versionCreationKey]versionCreation), channelBindings: make(map[string]ChannelBinding), providerRoutes: make(map[string]BotRoute),
 		backendSelections: make(map[string]backendSelection), governancePolicies: make(map[string]TenantPolicy),
 	}
 }
@@ -227,6 +231,34 @@ func (p *SnapshotControlPlane) mutateChannelBindings(ctx context.Context, mutate
 	return result, nil
 }
 
+func (p *SnapshotControlPlane) loadProviderRoutes(ctx context.Context) (map[string]BotRoute, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	return copyBotRoutes(p.providerRoutes), nil
+}
+
+func (p *SnapshotControlPlane) mutateProviderRoutes(ctx context.Context, mutate func(map[string]BotRoute) error) (map[string]BotRoute, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return nil, p.persistenceErr
+	}
+	previous := p.providerRoutes
+	routes := copyBotRoutes(previous)
+	if err := mutate(routes); err != nil {
+		return nil, err
+	}
+	p.providerRoutes = routes
+	if !p.persistLockedContext(ctx) {
+		p.providerRoutes = previous
+		return nil, p.persistenceErr
+	}
+	return copyBotRoutes(routes), nil
+}
+
 func (p *SnapshotControlPlane) persistLockedContext(ctx context.Context) bool {
 	if p.persistence == nil {
 		return true
@@ -277,7 +309,7 @@ func (p *SnapshotControlPlane) seedTenant(ctx context.Context, assignment Tenant
 		return p.persistenceErr
 	}
 	if _, exists := p.tenants[assignment.TenantID]; !exists {
-		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC()}
+		p.tenants[assignment.TenantID] = Tenant{ID: assignment.TenantID, Name: assignment.TenantName, CreatedAt: time.Now().UTC(), AuditPolicy: DefaultAuditPolicy()}
 		if !p.persistLockedContext(ctx) {
 			return p.persistenceErr
 		}
@@ -294,6 +326,7 @@ func (p *SnapshotControlPlane) createTenant(ctx context.Context, tenant Tenant) 
 	if _, exists := p.tenants[tenant.ID]; exists {
 		return false, nil
 	}
+	tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
 	p.tenants[tenant.ID] = tenant
 	ok := p.persistLockedContext(ctx)
 	return ok, p.persistenceErr
@@ -306,27 +339,67 @@ func (p *SnapshotControlPlane) tenant(ctx context.Context, id string) (Tenant, b
 		return Tenant{}, false, p.persistenceErr
 	}
 	tenant, ok := p.tenants[id]
+	if ok {
+		tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
+		p.tenants[id] = tenant
+	}
 	return tenant, ok, nil
 }
 
-func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, id string) (DeploymentVersion, bool, error) {
+func (p *SnapshotControlPlane) updateTenantAuditPolicy(ctx context.Context, id string, policy AuditPolicy) (Tenant, error) {
+	normalized, err := policy.Normalize()
+	if err != nil {
+		return Tenant{}, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.refreshLockedContext(ctx) {
+		return Tenant{}, p.persistenceErr
+	}
+	tenant, ok := p.tenants[id]
+	if !ok {
+		return Tenant{}, ErrNotFound
+	}
+	previous := tenant
+	tenant.AuditPolicy = normalized
+	p.tenants[id] = tenant
+	if !p.persistLockedContext(ctx) {
+		p.tenants[id] = previous
+		return Tenant{}, p.persistenceErr
+	}
+	return tenant, nil
+}
+
+func (p *SnapshotControlPlane) DeploymentVersion(ctx context.Context, ref DeploymentVersionRef) (DeploymentVersion, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.refreshLockedContext(ctx) {
 		return DeploymentVersion{}, false, p.persistenceErr
 	}
-	for _, versions := range p.versions {
-		for _, version := range versions {
-			if version.ID == id {
-				if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
-					version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
-						deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
-				}
-				return version, true, nil
-			}
+	if ref.TenantID == "" || ref.VersionID == "" {
+		return DeploymentVersion{}, false, nil
+	}
+	for _, version := range p.versionsByTenant(ref.TenantID) {
+		if version.ID != ref.VersionID {
+			continue
 		}
+		if deployment, ok := p.deployments[resourceKey(version.TenantID, version.DeploymentID)]; ok {
+			version.Active = deployment.Status == DeploymentActive && deployment.VersionID == version.ID ||
+				deployment.Status == DeploymentActive && deployment.GrayPercentage > 0 && deployment.TargetVersionID == version.ID
+		}
+		return version, true, nil
 	}
 	return DeploymentVersion{}, false, nil
+}
+
+func (p *SnapshotControlPlane) versionsByTenant(tenantID string) []DeploymentVersion {
+	var versions []DeploymentVersion
+	for key, items := range p.versions {
+		if strings.HasPrefix(key, tenantID+"\x00") {
+			versions = append(versions, items...)
+		}
+	}
+	return versions
 }
 
 func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error) {
@@ -337,6 +410,7 @@ func (p *SnapshotControlPlane) listTenants(ctx context.Context) ([]Tenant, error
 	}
 	items := make([]Tenant, 0, len(p.tenants))
 	for _, tenant := range p.tenants {
+		tenant.AuditPolicy = normalizedAuditPolicy(tenant.AuditPolicy)
 		items = append(items, tenant)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
@@ -351,6 +425,7 @@ func (p *SnapshotControlPlane) listTenantsFor(ctx context.Context, tenant Tenant
 	}
 	items := make([]Tenant, 0, len(tenant.Assignments))
 	for _, candidate := range p.tenants {
+		candidate.AuditPolicy = normalizedAuditPolicy(candidate.AuditPolicy)
 		if tenantCanSee(tenant, candidate.ID) {
 			items = append(items, candidate)
 		}
@@ -396,6 +471,7 @@ type AdminHandler struct {
 	failureCancel            context.CancelFunc
 	channels                 *ChannelCoordinator
 	providers                *ProviderRuntime
+	runCoordinator           RunCoordinator
 	chatMu                   sync.Mutex
 	activeRuns               map[string]activeChatRun
 	chatCtx                  context.Context
@@ -437,6 +513,11 @@ func (h *AdminHandler) ConfigureGovernance(center *GovernanceCenter) {
 	}
 	h.governance = center
 	center.configurePolicyStore(h.platform)
+	if tenants, err := h.platform.listTenants(context.Background()); err == nil {
+		for _, tenant := range tenants {
+			_ = center.SetAuditPolicy(tenant.ID, tenant.AuditPolicy)
+		}
+	}
 	if governed, ok := h.runtime.worker.runner.(interface{ SetGovernance(*GovernanceCenter) }); ok {
 		governed.SetGovernance(center)
 	}
@@ -455,16 +536,22 @@ func NewAdminHandler(platform ControlPlaneStore, identity DevelopmentIdentity) *
 	capacityCtx, capacityCancel := context.WithCancel(context.Background())
 	channels := NewChannelCoordinator(NewMockChannel())
 	channels.configurePersistence(platform.loadChannelBindings, platform.mutateChannelBindings)
-	return &AdminHandler{
+	h := &AdminHandler{
 		platform: platform, identity: identity, sessions: make(map[string]*developmentSession),
 		governance: NewGovernanceCenter(), productionSessions: make(map[string]*productionSession),
 		runtime: NewRuntime(platform, EchoRunner{}, nil), backends: newBackendRegistry(NewInMemoryStore(), nil),
 		migrations: make(map[string]migrationResult), backendCatalog: map[string]backendSelection{"inmemory": {Backend: "inmemory"}},
 		migrationCtx: migrationCtx, migrationCancel: migrationCancel, failureCtx: failureCtx, failureCancel: failureCancel,
-		channels: channels, activeRuns: make(map[string]activeChatRun),
+		channels: channels, activeRuns: make(map[string]activeChatRun), runCoordinator: NewInMemoryRunCoordinator(),
 		chatCtx: chatCtx, chatCancel: chatCancel, capacityCtx: capacityCtx, capacityCancel: capacityCancel,
 		capacityRuns: make(map[string]*capacityRun), drainState: DrainIdle, faultInjectionEnabled: true,
 	}
+	for _, assignment := range identity.Assignments {
+		if tenant, ok, err := platform.tenant(context.Background(), assignment.TenantID); err == nil && ok {
+			_ = h.governance.SetAuditPolicy(tenant.ID, tenant.AuditPolicy)
+		}
+	}
+	return h
 }
 
 func (h *AdminHandler) ConfigureFaultInjection(enabled bool) {
@@ -585,6 +672,9 @@ func (h *AdminHandler) Close() error {
 	h.chatWG.Wait()
 	h.capacityWG.Wait()
 	h.failureCancel()
+	if h.runCoordinator != nil {
+		_ = h.runCoordinator.Close()
+	}
 	runtimeErr := h.runtime.Close()
 	storeErr := h.backends.close()
 	if runtimeErr != nil {
@@ -603,6 +693,9 @@ func (h *AdminHandler) isClosing() bool {
 }
 
 func (h *AdminHandler) ConfigureProviderRuntime(providers *ProviderRuntime) {
+	if providers != nil {
+		_ = providers.routes.configurePersistence(h.platform.loadProviderRoutes, h.platform.mutateProviderRoutes)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.providers = providers
@@ -636,6 +729,22 @@ func (h *AdminHandler) ConfigureRuntime(runner RunnerAdapter, life RuntimeLifecy
 
 func (h *AdminHandler) ConfigureSessionLeases(manager SessionLeaseManager) {
 	h.runtime.SetSessionLeaseManager(manager)
+}
+
+// ConfigureRunCoordinator installs the shared execution coordinator used by
+// chat submission and cancellation. A nil value restores the single-process
+// in-memory adapter.
+func (h *AdminHandler) ConfigureRunCoordinator(coordinator RunCoordinator) {
+	h.mu.Lock()
+	previous := h.runCoordinator
+	if coordinator == nil {
+		coordinator = NewInMemoryRunCoordinator()
+	}
+	h.runCoordinator = coordinator
+	h.mu.Unlock()
+	if previous != nil && previous != coordinator {
+		_ = previous.Close()
+	}
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -827,7 +936,7 @@ func (h *AdminHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_tenant", "id and name must be valid")
 			return
 		}
-		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC()}
+		tenant := Tenant{ID: request.ID, Name: strings.TrimSpace(request.Name), CreatedAt: time.Now().UTC(), AuditPolicy: DefaultAuditPolicy()}
 		created, err := h.platform.createTenant(r.Context(), tenant)
 		if writeControlPlaneError(w, err) {
 			return
@@ -851,10 +960,6 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusUnauthorized, "identity_required", "development identity is required")
 		return
 	}
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
-		return
-	}
 	if !tenantCanSee(trusted, id) {
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
@@ -867,7 +972,43 @@ func (h *AdminHandler) handleTenant(w http.ResponseWriter, r *http.Request, id s
 		writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, tenant)
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, tenant)
+		return
+	}
+	if r.Method != http.MethodPatch && r.Method != http.MethodPut {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET, PATCH, or PUT")
+		return
+	}
+	assignment, _ := trusted.AssignmentFor(id)
+	if trusted.Role != RolePlatformAdmin && assignment.Role != RolePlatformAdmin && (trusted.Role != RoleTenantAdmin || trusted.TenantID != id) {
+		writeError(w, http.StatusForbidden, "forbidden", "tenant administrator role is required")
+		return
+	}
+	var request struct {
+		AuditPolicy AuditPolicy `json:"audit_policy"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_audit_policy", "audit_policy is required")
+		return
+	}
+	updated, err := h.platform.updateTenantAuditPolicy(r.Context(), id, request.AuditPolicy)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "tenant_not_found", "tenant was not found")
+			return
+		}
+		if errors.Is(err, errControlPlaneUnavailable) {
+			writeControlPlaneError(w, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_audit_policy", err.Error())
+		return
+	}
+	h.governance.SetAuditPolicy(id, updated.AuditPolicy)
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func writeControlPlaneError(w http.ResponseWriter, err error) bool {
