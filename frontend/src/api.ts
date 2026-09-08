@@ -111,6 +111,14 @@ export interface CapacityTestResult {
   estimated_tokens: number;
   estimated_cost: number;
   first_bottleneck: string;
+  sessions_per_node: number;
+  recommended_worker_nodes: number;
+  average_tokens_per_session: number;
+  token_throughput_per_second: number;
+  im_callback_peak_qps: number;
+  redis_qps: number;
+  sql_qps: number;
+  headroom_percent: number;
   started_at: string;
   completed_at?: string;
   error?: string;
@@ -170,7 +178,7 @@ export const api = {
   startOperationsDrain: () => request<DrainStatus>("/api/v1/admin/operations/drain", { method: "POST", body: JSON.stringify({ confirm: true }) }),
   runtimeFaults: () => request<{ enabled: boolean; scenarios: RuntimeFaultScenario[] }>("/api/v1/admin/operations/faults"),
   setRuntimeFaults: (agentAppID: string, scenario: RuntimeFaultScenario, delayMS = 0) => request<RuntimeFaultConfiguration>("/api/v1/admin/operations/faults", { method: "POST", body: JSON.stringify({ agent_app_id: agentAppID, scenario, delay_ms: delayMS }) }),
-  startCapacity: (input: { agent_app_id: string; concurrency: number; runs: number; timeout_ms: number }) => request<CapacityTestResult>("/api/v1/admin/capacity", { method: "POST", body: JSON.stringify(input) }),
+  startCapacity: (input: { agent_app_id: string; concurrency: number; runs: number; timeout_ms: number; peak_im_callbacks_per_second: number; average_tokens_per_session: number; redis_operations_per_session: number; sql_operations_per_session: number; headroom_percent: number }) => request<CapacityTestResult>("/api/v1/admin/capacity", { method: "POST", body: JSON.stringify(input) }),
   capacity: (id: string) => request<CapacityTestResult>(`/api/v1/admin/capacity/${encodeURIComponent(id)}`),
   cancelCapacity: (id: string) => request<CapacityTestResult>(`/api/v1/admin/capacity/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   backend: () => request<{ backend: string; health: BackendHealth; available_backends: string[] }>("/api/v1/admin/storage/backend"),

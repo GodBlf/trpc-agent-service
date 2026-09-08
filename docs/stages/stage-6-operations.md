@@ -90,6 +90,39 @@ estimated tokens/cost, the first identifiable bottleneck, request ID, and trace
 ID. Service drain, shutdown, and explicit cancellation terminate the run as a
 terminal capacity state without leaving an active governance reservation.
 
+The planning inputs make the production assumptions explicit instead of hiding
+them in a node count:
+
+- `peak_im_callbacks_per_second`: maximum one-minute callback rate observed per
+  Tenant, multiplied by the expected campaign/reconnect burst factor.
+- `average_tokens_per_session`: completed-run tokens divided by completed runs
+  over a representative seven-day window. Size model quotas separately against
+  the p95 value; when no measured value is supplied, the policy's
+  `estimated_tokens_per_run` is used.
+- `redis_operations_per_session` and `sql_operations_per_session`: read/write
+  counts obtained from storage spans or backend metrics for one completed run.
+- `headroom_percent`: capacity reserved for retries, uneven Tenant routing and
+  dependency latency; the API defaults to 30 percent.
+
+For callback peak `P`, average tokens `T`, Redis operations `R`, SQL operations
+`S`, observed single-node throughput `Q`, safe concurrency `C`, and headroom
+fraction `H`, the result reports:
+
+```text
+token/s                 = P * T
+Redis QPS               = P * R
+SQL QPS                 = P * S
+sessions per Worker     = max(1, floor(C * (1-H)))
+recommended Workers     = max(1, ceil(P / (Q * (1-H))))
+```
+
+Run the bounded estimator as a preflight, then validate its assumptions with a
+stair-step test against a staging deployment using production-like model,
+Tool, Redis and SQL latency. Stop increasing concurrency when the error rate is
+non-zero, p95 latency exceeds the SLO, a backend reaches its connection/QPS
+budget, or the IM backlog grows. Use the last healthy step as `C` and `Q`; do
+not treat the deterministic smoke result as a production benchmark.
+
 ## Compose Recovery Evidence
 
 Baseline:
@@ -114,6 +147,15 @@ and graceful drain. It writes deterministic evidence to
 ## Kubernetes Guidance
 
 Kubernetes is a production profile and is not required for local acceptance.
+
+The minimum runnable profile is `compose.stage6.yml`: one Gateway, one Worker,
+one Redis and one PostgreSQL, plus the control-plane migration job. The
+production starting profile is two or more Gateway replicas across failure
+domains, at least the capacity result's `recommended_worker_nodes` Workers
+(never fewer than two for availability), managed PostgreSQL and Redis, and an
+external telemetry/audit backend. Recalculate Worker replicas from IM peak and
+model throughput; size Redis and SQL against the reported QPS plus the same
+headroom, rather than copying the Compose resource limits.
 
 - Run Gateway and Worker as separate Deployments. Gateway replicas are stateless
   behind a Service; Worker replicas are stateless behind an internal Service.
@@ -162,8 +204,8 @@ Kubernetes is a production profile and is not required for local acceptance.
   artifact.
 - Governance state is an atomic local JSON snapshot; a distributed control-plane
   store and global rate/budget counters remain production work.
-- Capacity estimation is deterministic and bounded; it is a smoke estimate, not
-  a production load test.
+- Capacity preflight is deterministic and bounded; production sizing still
+  requires the documented staging stair-step measurement.
 - Gray rollout percentage is deterministic by request ID; it does not yet model
   user cohort affinity or external feature-flag systems.
 - The Compose Worker uses a fixed local token for acceptance. Production must

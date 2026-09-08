@@ -102,8 +102,11 @@ test("manages rollout rollback and capacity results with confirmation", async ()
     }
     if (url === "/api/v1/admin/deployments/deploy-one/rollback-preview") return jsonResponse({ tenant_id: "tenant-one", agent_app_id: "app-one", deployment_id: "deploy-one", current_version_id: "deploy-one-v1", previous_version_id: "deploy-one-v1", active_executions: 0, expected_result: "active routing returns to the previous immutable Version" });
     if (url === "/api/v1/admin/deployments/deploy-one/rollback" && init?.method === "POST") return jsonResponse({ ...activeDeployment, rollout_status: "completed", target_version_id: "deploy-one-v1", current_version_id: "deploy-one-v1", previous_version_id: "deploy-one-v1", gray_percentage: 100 });
-    if (url === "/api/v1/admin/capacity" && init?.method === "POST") return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "running", concurrency: 2, runs: 4, completed: 0, failed: 0, active: 2, safe_concurrency: 2, throughput_per_second: 0, model_latency_ms: 0, tool_latency_ms: 0, storage_latency_ms: 0, estimated_tokens: 0, estimated_cost: 0, first_bottleneck: "none", started_at: "2026-01-01T00:00:00Z" });
-    if (url === "/api/v1/admin/capacity/capacity-one") return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "completed", concurrency: 2, runs: 4, completed: 4, failed: 0, active: 0, safe_concurrency: 2, throughput_per_second: 10, model_latency_ms: 2, tool_latency_ms: 0, storage_latency_ms: 1, estimated_tokens: 20, estimated_cost: 0.2, first_bottleneck: "none", started_at: "2026-01-01T00:00:00Z", completed_at: "2026-01-01T00:00:01Z" });
+    if (url === "/api/v1/admin/capacity" && init?.method === "POST") {
+      expect(JSON.parse(String(init.body))).toEqual({ agent_app_id: "app-one", concurrency: 2, runs: 4, timeout_ms: 1000, peak_im_callbacks_per_second: 120, average_tokens_per_session: 800, redis_operations_per_session: 6, sql_operations_per_session: 4, headroom_percent: 25 });
+      return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "running", concurrency: 2, runs: 4, completed: 0, failed: 0, active: 2, safe_concurrency: 2, throughput_per_second: 0, model_latency_ms: 0, tool_latency_ms: 0, storage_latency_ms: 0, estimated_tokens: 0, estimated_cost: 0, first_bottleneck: "none", sessions_per_node: 1, recommended_worker_nodes: 1, average_tokens_per_session: 800, token_throughput_per_second: 96000, im_callback_peak_qps: 120, redis_qps: 720, sql_qps: 480, headroom_percent: 25, started_at: "2026-01-01T00:00:00Z" });
+    }
+    if (url === "/api/v1/admin/capacity/capacity-one") return jsonResponse({ id: "capacity-one", request_id: "capacity-request", trace_id: "trace-one", tenant_id: "tenant-one", agent_app_id: "app-one", status: "completed", concurrency: 2, runs: 4, completed: 4, failed: 0, active: 0, safe_concurrency: 2, throughput_per_second: 10, model_latency_ms: 2, tool_latency_ms: 0, storage_latency_ms: 1, estimated_tokens: 3200, estimated_cost: 0.2, first_bottleneck: "none", sessions_per_node: 1, recommended_worker_nodes: 16, average_tokens_per_session: 800, token_throughput_per_second: 96000, im_callback_peak_qps: 120, redis_qps: 720, sql_qps: 480, headroom_percent: 25, started_at: "2026-01-01T00:00:00Z", completed_at: "2026-01-01T00:00:01Z" });
     throw new Error(`unexpected request ${url}`);
   });
   const confirmMock = vi.fn(() => true);
@@ -123,5 +126,7 @@ test("manages rollout rollback and capacity results with confirmation", async ()
   await userEvent.click(screen.getByRole("button", { name: "容量评估" }));
   expect(await screen.findByText("trace-one")).toBeInTheDocument();
   await waitFor(() => expect(screen.getByText("10.00")).toBeInTheDocument());
+  expect(screen.getByText("720.00 / 480.00")).toBeInTheDocument();
+  expect(screen.getByText("120.00 / 96000.00")).toBeInTheDocument();
   await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(2));
 });

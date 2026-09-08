@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,35 +13,48 @@ import (
 )
 
 type capacityRunRequest struct {
-	AgentAppID  string `json:"agent_app_id"`
-	Concurrency int    `json:"concurrency"`
-	Runs        int    `json:"runs"`
-	TimeoutMS   int    `json:"timeout_ms"`
+	AgentAppID                string `json:"agent_app_id"`
+	Concurrency               int    `json:"concurrency"`
+	Runs                      int    `json:"runs"`
+	TimeoutMS                 int    `json:"timeout_ms"`
+	PeakIMCallbacksPerSecond  int64  `json:"peak_im_callbacks_per_second"`
+	AverageTokensPerSession   int64  `json:"average_tokens_per_session"`
+	RedisOperationsPerSession int64  `json:"redis_operations_per_session"`
+	SQLOperationsPerSession   int64  `json:"sql_operations_per_session"`
+	HeadroomPercent           int    `json:"headroom_percent"`
 }
 
 type CapacityTestResult struct {
-	ID                  string    `json:"id"`
-	RequestID           string    `json:"request_id"`
-	TraceID             string    `json:"trace_id"`
-	TenantID            string    `json:"tenant_id"`
-	AgentAppID          string    `json:"agent_app_id"`
-	Status              string    `json:"status"`
-	Concurrency         int       `json:"concurrency"`
-	Runs                int       `json:"runs"`
-	Completed           int       `json:"completed"`
-	Failed              int       `json:"failed"`
-	Active              int       `json:"active"`
-	SafeConcurrency     int       `json:"safe_concurrency"`
-	ThroughputPerSecond float64   `json:"throughput_per_second"`
-	ModelLatencyMS      int64     `json:"model_latency_ms"`
-	ToolLatencyMS       int64     `json:"tool_latency_ms"`
-	StorageLatencyMS    int64     `json:"storage_latency_ms"`
-	EstimatedTokens     int64     `json:"estimated_tokens"`
-	EstimatedCost       float64   `json:"estimated_cost"`
-	FirstBottleneck     string    `json:"first_bottleneck"`
-	StartedAt           time.Time `json:"started_at"`
-	CompletedAt         time.Time `json:"completed_at,omitempty"`
-	Error               string    `json:"error,omitempty"`
+	ID                       string    `json:"id"`
+	RequestID                string    `json:"request_id"`
+	TraceID                  string    `json:"trace_id"`
+	TenantID                 string    `json:"tenant_id"`
+	AgentAppID               string    `json:"agent_app_id"`
+	Status                   string    `json:"status"`
+	Concurrency              int       `json:"concurrency"`
+	Runs                     int       `json:"runs"`
+	Completed                int       `json:"completed"`
+	Failed                   int       `json:"failed"`
+	Active                   int       `json:"active"`
+	SafeConcurrency          int       `json:"safe_concurrency"`
+	ThroughputPerSecond      float64   `json:"throughput_per_second"`
+	ModelLatencyMS           int64     `json:"model_latency_ms"`
+	ToolLatencyMS            int64     `json:"tool_latency_ms"`
+	StorageLatencyMS         int64     `json:"storage_latency_ms"`
+	EstimatedTokens          int64     `json:"estimated_tokens"`
+	EstimatedCost            float64   `json:"estimated_cost"`
+	FirstBottleneck          string    `json:"first_bottleneck"`
+	SessionsPerNode          int       `json:"sessions_per_node"`
+	RecommendedWorkerNodes   int       `json:"recommended_worker_nodes"`
+	AverageTokensPerSession  int64     `json:"average_tokens_per_session"`
+	TokenThroughputPerSecond float64   `json:"token_throughput_per_second"`
+	IMCallbackPeakQPS        float64   `json:"im_callback_peak_qps"`
+	RedisQPS                 float64   `json:"redis_qps"`
+	SQLQPS                   float64   `json:"sql_qps"`
+	HeadroomPercent          int       `json:"headroom_percent"`
+	StartedAt                time.Time `json:"started_at"`
+	CompletedAt              time.Time `json:"completed_at,omitempty"`
+	Error                    string    `json:"error,omitempty"`
 }
 
 type capacityRun struct {
@@ -54,6 +68,7 @@ const maxCapacityRuns = 100
 const minCapacityTimeoutMS = 100
 const maxCapacityTimeoutMS = 5000
 const capacityRunDelay = 25 * time.Millisecond
+const defaultCapacityHeadroomPercent = 30
 
 type capacityRunner struct{}
 
@@ -107,9 +122,17 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 	var request capacityRunRequest
 	if err := decodeStrict(r, &request); err != nil || !validResourceID(request.AgentAppID) ||
 		request.Concurrency < 1 || request.Concurrency > maxCapacityConcurrency || request.Runs < 1 || request.Runs > maxCapacityRuns ||
-		request.TimeoutMS < minCapacityTimeoutMS || request.TimeoutMS > maxCapacityTimeoutMS {
+		request.TimeoutMS < minCapacityTimeoutMS || request.TimeoutMS > maxCapacityTimeoutMS ||
+		request.PeakIMCallbacksPerSecond < 0 || request.PeakIMCallbacksPerSecond > 1_000_000 ||
+		request.AverageTokensPerSession < 0 || request.AverageTokensPerSession > 10_000_000 ||
+		request.RedisOperationsPerSession < 0 || request.RedisOperationsPerSession > 10_000 ||
+		request.SQLOperationsPerSession < 0 || request.SQLOperationsPerSession > 10_000 ||
+		request.HeadroomPercent < 0 || request.HeadroomPercent > 90 {
 		writeError(w, http.StatusBadRequest, "invalid_capacity_request", "capacity test inputs are invalid")
 		return
+	}
+	if request.HeadroomPercent == 0 {
+		request.HeadroomPercent = defaultCapacityHeadroomPercent
 	}
 	if _, exists, err := h.platform.app(r.Context(), tenant.TenantID, request.AgentAppID); err != nil || !exists {
 		if writeControlPlaneError(w, err) {
@@ -163,7 +186,11 @@ func (h *AdminHandler) startCapacityRun(w http.ResponseWriter, r *http.Request, 
 		result: CapacityTestResult{
 			ID: runID, RequestID: requestID, TraceID: governanceResult.TraceID, TenantID: tenant.TenantID,
 			AgentAppID: request.AgentAppID, Status: "running", Concurrency: request.Concurrency,
-			Runs: request.Runs, StartedAt: time.Now().UTC(),
+			Runs: request.Runs, AverageTokensPerSession: request.AverageTokensPerSession,
+			IMCallbackPeakQPS: float64(request.PeakIMCallbacksPerSecond),
+			RedisQPS:          float64(request.PeakIMCallbacksPerSecond * request.RedisOperationsPerSession),
+			SQLQPS:            float64(request.PeakIMCallbacksPerSecond * request.SQLOperationsPerSession),
+			HeadroomPercent:   request.HeadroomPercent, StartedAt: time.Now().UTC(),
 		},
 	}
 	h.capacityMu.Lock()
@@ -228,12 +255,16 @@ func (h *AdminHandler) executeCapacityRun(ctx context.Context, run *capacityRun,
 	result.ModelLatencyMS = totalLatency.Load() / int64(max(result.Completed, 1))
 	result.ToolLatencyMS = 0
 	result.StorageLatencyMS = storageLatency
-	result.EstimatedTokens = policy.EstimatedTokensPerRun * int64(result.Completed)
+	if result.AverageTokensPerSession == 0 {
+		result.AverageTokensPerSession = policy.EstimatedTokensPerRun
+	}
+	result.EstimatedTokens = result.AverageTokensPerSession * int64(result.Completed)
 	result.EstimatedCost = policy.CostPerToken * float64(result.EstimatedTokens)
 	result.SafeConcurrency = result.Concurrency
 	if elapsed > 0 {
 		result.ThroughputPerSecond = float64(result.Completed) / elapsed.Seconds()
 	}
+	result.TokenThroughputPerSecond = result.IMCallbackPeakQPS * float64(result.AverageTokensPerSession)
 	if result.ModelLatencyMS > 0 {
 		budget := maxDuration(0, elapsed-time.Duration(storageLatency)*time.Millisecond)
 		latency := time.Duration(max(result.ModelLatencyMS, 1)) * time.Millisecond
@@ -248,6 +279,14 @@ func (h *AdminHandler) executeCapacityRun(ctx context.Context, run *capacityRun,
 		result.FirstBottleneck = "storage"
 	} else if result.SafeConcurrency < result.Concurrency {
 		result.FirstBottleneck = "model"
+	}
+	headroomFactor := 1 - float64(result.HeadroomPercent)/100
+	result.SessionsPerNode = max(1, int(math.Floor(float64(result.SafeConcurrency)*headroomFactor)))
+	effectiveThroughput := result.ThroughputPerSecond * headroomFactor
+	if result.IMCallbackPeakQPS > 0 && effectiveThroughput > 0 {
+		result.RecommendedWorkerNodes = max(1, int(math.Ceil(result.IMCallbackPeakQPS/effectiveThroughput)))
+	} else {
+		result.RecommendedWorkerNodes = 1
 	}
 	result.CompletedAt = time.Now().UTC()
 	errorType, cancelled := "", false

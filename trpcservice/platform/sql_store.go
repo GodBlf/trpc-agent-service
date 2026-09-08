@@ -179,6 +179,9 @@ func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) e
 		}
 		if err = s.validateFencingToken(ctx, tx, event.TenantID, event.SessionID, event.FencingToken); err != nil {
 			tx.Rollback()
+			if isPostgresRetryable(err) {
+				continue
+			}
 			return err
 		}
 		var typ string

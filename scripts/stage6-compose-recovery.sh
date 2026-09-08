@@ -133,7 +133,7 @@ ROLLBACK_PREVIEW_STATUS="$(get /api/v1/admin/deployments/deploy-recovery/rollbac
 ROLLBACK_STATUS="$(post /api/v1/admin/deployments/deploy-recovery/rollback '{"confirm":true}' X-Request-ID rollout-recovery)"
 record "rollout-rollback" "$ROLLOUT_STATUS -> $ROLLBACK_PREVIEW_STATUS -> $ROLLBACK_STATUS" "" "rollout-recovery"
 
-CAPACITY_STATUS="$(post /api/v1/admin/capacity '{"agent_app_id":"app-recovery","concurrency":2,"runs":4,"timeout_ms":2000}')"
+CAPACITY_STATUS="$(post /api/v1/admin/capacity '{"agent_app_id":"app-recovery","concurrency":2,"runs":4,"timeout_ms":2000,"peak_im_callbacks_per_second":120,"average_tokens_per_session":800,"redis_operations_per_session":6,"sql_operations_per_session":4,"headroom_percent":25}')"
 CAPACITY_ID="$(json .id)"
 for _ in $(seq 1 30); do
   get "/api/v1/admin/capacity/$CAPACITY_ID" >/dev/null
@@ -142,6 +142,10 @@ for _ in $(seq 1 30); do
 done
 if [[ "$(json .status)" != "completed" ]]; then
   echo "capacity run did not complete" >&2
+  exit 1
+fi
+if ! jq -e '.sessions_per_node >= 1 and .recommended_worker_nodes >= 1 and .average_tokens_per_session == 800 and .token_throughput_per_second == 96000 and .im_callback_peak_qps == 120 and .redis_qps == 720 and .sql_qps == 480 and .headroom_percent == 25' "$RESPONSE_FILE" >/dev/null; then
+  echo "capacity plan did not report the expected node, token, IM, Redis and SQL demand" >&2
   exit 1
 fi
 record "capacity-smoke" "$CAPACITY_STATUS -> completed" "" "$CAPACITY_ID"

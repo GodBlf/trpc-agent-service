@@ -224,6 +224,51 @@ func TestCapacityRunIsBoundedDeterministicAndTenantScoped(t *testing.T) {
 	assertChannelAPIError(t, response, http.StatusNotFound, "capacity_run_not_found")
 }
 
+func TestCapacityPlanReportsNodeTokenAndBackendDemand(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.activateApp("app-one", "deploy-one")
+	var started CapacityTestResult
+	client.post("/api/v1/admin/capacity", `{
+		"agent_app_id":"app-one",
+		"concurrency":4,
+		"runs":8,
+		"timeout_ms":1000,
+		"peak_im_callbacks_per_second":120,
+		"average_tokens_per_session":800,
+		"redis_operations_per_session":6,
+		"sql_operations_per_session":4,
+		"headroom_percent":25
+	}`, nil, http.StatusAccepted, &started)
+
+	var completed CapacityTestResult
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response := client.do(http.MethodGet, "/api/v1/admin/capacity/"+started.ID, "", nil)
+		if err := json.NewDecoder(response.Body).Decode(&completed); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if completed.Status != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity plan did not finish: %#v", completed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if completed.Status != "completed" || completed.SessionsPerNode < 1 || completed.RecommendedWorkerNodes < 1 {
+		t.Fatalf("capacity node plan = %#v", completed)
+	}
+	if completed.AverageTokensPerSession != 800 || completed.TokenThroughputPerSecond != 96000 {
+		t.Fatalf("capacity token plan = %#v", completed)
+	}
+	if completed.IMCallbackPeakQPS != 120 || completed.RedisQPS != 720 || completed.SQLQPS != 480 || completed.HeadroomPercent != 25 {
+		t.Fatalf("capacity backend plan = %#v", completed)
+	}
+}
+
 func TestCapacityRunIsValidatedAndCancelledWithoutActiveWork(t *testing.T) {
 	client := newChannelTestClient(t, EchoRunner{})
 	client.activateApp("app-one", "deploy-one")
