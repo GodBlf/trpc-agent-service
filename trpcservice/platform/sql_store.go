@@ -60,6 +60,25 @@ func (s *SQLStore) q(query string) string {
 	return b.String()
 }
 func (s *SQLStore) init(ctx context.Context) error {
+	var schemaTx *sql.Tx
+	execer := interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	}(s.db)
+	if s.backend == "postgres" {
+		var err error
+		schemaTx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer schemaTx.Rollback()
+		// CREATE TABLE IF NOT EXISTS is not safe when multiple PostgreSQL
+		// sessions create the same relation concurrently. Serialize the small
+		// compatibility bootstrap used by independently starting Gateways.
+		if _, err := schemaTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(0x5452504353544f52)); err != nil {
+			return err
+		}
+		execer = schemaTx
+	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS audit_events (tenant_id TEXT NOT NULL, audit_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(tenant_id,audit_id))`,
 		`CREATE TABLE IF NOT EXISTS session_write_fences (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, fencing_token BIGINT NOT NULL, PRIMARY KEY(tenant_id,session_id))`,
@@ -72,12 +91,12 @@ func (s *SQLStore) init(ctx context.Context) error {
 		statements[2] = strings.Replace(statements[2], "BYTEA", "BLOB", 1)
 	}
 	for _, stmt := range statements {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := execer.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
 	if s.backend == "postgres" {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE session_events ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`); err != nil {
+		if _, err := execer.ExecContext(ctx, `ALTER TABLE session_events ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 		for _, statement := range []string{
@@ -87,10 +106,11 @@ func (s *SQLStore) init(ctx context.Context) error {
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'`,
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`,
 		} {
-			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			if _, err := execer.ExecContext(ctx, statement); err != nil {
 				return err
 			}
 		}
+		return schemaTx.Commit()
 	} else {
 		if err := s.ensureSQLiteColumn(ctx, "session_memory", "fencing_token", "BIGINT NOT NULL DEFAULT 0"); err != nil {
 			return err
