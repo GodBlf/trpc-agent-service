@@ -34,6 +34,19 @@ func TestMemoryKnowledgeArtifactAndTraceCompletePublicWorkflow(t *testing.T) {
 	if err := waitForChatEvent(client, "session-rich", "run.completed"); err != nil {
 		t.Fatal(err)
 	}
+	trace, found := client.handler.governance.Trace("tenant-one", "", "request-rich")
+	if !found {
+		t.Fatal("request trace was not persisted")
+	}
+	spanNames := make(map[string]bool, len(trace.Spans))
+	for _, span := range trace.Spans {
+		spanNames[span.Name] = true
+	}
+	for _, expected := range []string{"storage.session_state.read", "storage.memory.read", "storage.knowledge.read"} {
+		if !spanNames[expected] {
+			t.Fatalf("trace misses %q: %#v", expected, trace.Spans)
+		}
+	}
 
 	response := client.do(http.MethodGet, "/api/v1/admin/artifacts?session_id=session-rich", "", nil)
 	defer response.Body.Close()

@@ -764,6 +764,10 @@ func (h *AdminHandler) ConfigureRunCoordinator(coordinator RunCoordinator) {
 }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/internal/metrics" {
+		h.handleInternalMetrics(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/internal/governance/tool/") {
 		h.handleInternalGovernance(w, r)
 		return

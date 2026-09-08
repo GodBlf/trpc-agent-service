@@ -89,6 +89,7 @@ func TestOpenAICompatibleModelStreamsThroughPublicChatSSE(t *testing.T) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		time.Sleep(10 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintln(w, `{"id":"fixture","object":"chat.completion","created":1699200000,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"fixture public reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
 	}))
@@ -119,6 +120,18 @@ func TestOpenAICompatibleModelStreamsThroughPublicChatSSE(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("public SSE did not contain fixture response: %#v", envelopes)
+	}
+	metrics := client.handler.governance.Metrics("tenant-one")
+	if metrics.ModelLatencyMS < 10 || metrics.ExecutionLatencyMS < metrics.ModelLatencyMS {
+		t.Fatalf("model and execution latency were not measured at their boundaries: %#v", metrics)
+	}
+	trace, traceFound := client.handler.governance.Trace("tenant-one", "", "request-model")
+	modelSpanFound := false
+	for _, span := range trace.Spans {
+		modelSpanFound = modelSpanFound || span.Name == "model.call"
+	}
+	if !traceFound || !modelSpanFound {
+		t.Fatalf("model call trace missing: %#v, found = %v", trace, traceFound)
 	}
 	if elapsed := time.Since(startedAt); elapsed >= 5*time.Second {
 		t.Fatalf("model workflow waited for an event completion notice: %v", elapsed)
@@ -299,6 +312,41 @@ func TestGovernancePluginConsumesDangerousConfirmationAndRecordsToolCompletion(t
 	}
 	if metrics := center.Metrics("tenant-one"); metrics.ToolLatencyMS != 25 {
 		t.Fatalf("Tool execution latency = %dms, want 25ms", metrics.ToolLatencyMS)
+	}
+}
+
+func TestGovernancePluginMeasuresModelCallSeparatelyFromExecution(t *testing.T) {
+	center := NewGovernanceCenter()
+	clock := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	center.now = func() time.Time { return clock }
+	callbacks := plugin.MustNewManager(&governanceRuntimePlugin{center: center}).ModelCallbacks()
+	request := RunnerRequest{
+		TenantID: "tenant-one", AppID: "app-one", UserID: "user-one", SessionID: "session-one",
+		RequestID: "request-one", TraceID: "trace-one", Channel: ChannelTelegram,
+	}
+	ctx := withRunnerIdentity(context.Background(), request)
+	before, err := callbacks.RunBeforeModel(ctx, &model.BeforeModelArgs{Request: &model.Request{}})
+	if err != nil || before == nil || before.Context == nil {
+		t.Fatalf("before model = %#v, %v", before, err)
+	}
+	clock = clock.Add(20 * time.Millisecond)
+	if _, err := callbacks.RunAfterModel(before.Context, &model.AfterModelArgs{Response: &model.Response{IsPartial: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := center.Metrics("tenant-one"); metrics.ModelLatencyMS != 0 {
+		t.Fatalf("partial response recorded model latency: %#v", metrics)
+	}
+	clock = clock.Add(15 * time.Millisecond)
+	if _, err := callbacks.RunAfterModel(before.Context, &model.AfterModelArgs{Response: &model.Response{}}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := center.Metrics("tenant-one")
+	if metrics.ModelLatencyMS != 35 || metrics.ExecutionLatencyMS != 0 {
+		t.Fatalf("model and execution latency = %#v", metrics)
+	}
+	trace, found := center.Trace("tenant-one", "trace-one", "")
+	if !found || len(trace.Spans) != 1 || trace.Spans[0].Name != "model.call" {
+		t.Fatalf("model trace = %#v, found = %v", trace, found)
 	}
 }
 

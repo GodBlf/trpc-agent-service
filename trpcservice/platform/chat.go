@@ -1420,10 +1420,21 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		}
 		_ = options.runPermit.Finish(context.Background(), RunTerminal{Type: runTerminalState(terminalType)})
 	}()
+	contextReadStarted := time.Now()
 	agentInput, err := contextualAgentInput(ctx, store, options)
+	h.governance.RecordStorageLatencyFor(options.tenant.TenantID, options.appID, options.provider(), time.Since(contextReadStarted))
 	if err != nil {
 		h.finishChatStorageFailure(store, options, governanceRequest, err)
 		return
+	}
+	contextSpans := []string{"storage.session_state.read", "storage.memory.read"}
+	if _, ok := store.(KnowledgeStore); ok {
+		contextSpans = append(contextSpans, "storage.knowledge.read")
+	}
+	for _, spanName := range contextSpans {
+		if err := h.governance.RecordSpan(governanceRequest, options.traceID, spanName, "ok"); err != nil {
+			return
+		}
 	}
 	events, err := h.runtime.Stream(ctx, options.tenant, GatewayRequest{
 		AppID: options.appID, SessionID: options.sessionID, Input: agentInput, RequestID: options.requestID, TraceID: options.traceID, TraceParent: options.traceParent, PolicyRevision: options.policyRevision,
@@ -1735,7 +1746,7 @@ func contextualAgentInput(ctx context.Context, store DataStore, options chatRunO
 	sections := make([]string, 0, 3)
 	state, stateErr := store.GetSessionState(ctx, options.tenant.TenantID, options.sessionID)
 	if stateErr != nil && !errors.Is(stateErr, ErrNotFound) {
-		return "", stateErr
+		return "", &contextReadError{span: "storage.session_state.read", err: stateErr}
 	}
 	if state.Summary != "" {
 		sections = append(sections, "Session summary:\n"+state.Summary)
@@ -1747,7 +1758,7 @@ func contextualAgentInput(ctx context.Context, store DataStore, options chatRunO
 		memory, err = contextual.ContextMemory(ctx, options.tenant.TenantID, options.sessionID)
 	}
 	if err != nil {
-		return "", err
+		return "", &contextReadError{span: "storage.memory.read", err: err}
 	}
 	if len(memory) > 0 {
 		var values []string
@@ -1764,7 +1775,7 @@ func contextualAgentInput(ctx context.Context, store DataStore, options chatRunO
 			records, err = searchable.SearchKnowledge(ctx, options.tenant.TenantID, options.appID, options.input)
 		}
 		if err != nil {
-			return "", err
+			return "", &contextReadError{span: "storage.knowledge.read", err: err}
 		}
 		if len(records) > 0 {
 			var values []string
@@ -1780,8 +1791,21 @@ func contextualAgentInput(ctx context.Context, store DataStore, options chatRunO
 	return strings.Join(sections, "\n\n") + "\n\nUser:\n" + options.input, nil
 }
 
+type contextReadError struct {
+	span string
+	err  error
+}
+
+func (e *contextReadError) Error() string { return e.err.Error() }
+func (e *contextReadError) Unwrap() error { return e.err }
+
 func (h *AdminHandler) finishChatStorageFailure(store DataStore, options chatRunOptions, request GovernanceRequest, cause error) {
-	_ = h.governance.RecordSpan(request, options.traceID, "storage.context.read", "error")
+	spanName := "storage.context.read"
+	var readErr *contextReadError
+	if errors.As(cause, &readErr) {
+		spanName = readErr.span
+	}
+	_ = h.governance.RecordSpan(request, options.traceID, spanName, "error")
 	_, _ = completeGovernance(h.chatCtx, h.governance, h.governanceCompletion(options, "", 0, false, "storage_error", false))
 	terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
 	defer cancel()

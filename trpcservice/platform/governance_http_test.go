@@ -409,6 +409,40 @@ func TestGovernanceConfirmationMetricsAndTraceAPIs(t *testing.T) {
 	}
 }
 
+func TestInternalPrometheusMetricsRequireAuthenticationAndExposeTenantCounters(t *testing.T) {
+	client := newChannelTestClient(t, EchoRunner{})
+	client.handler.ConfigureInternalGovernance("metrics-secret")
+	if _, err := client.handler.governance.PutPolicy(context.Background(), TenantPolicy{TenantID: "tenant-one", AgentAppID: "app-one"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.handler.governance.Evaluate(context.Background(), GovernanceRequest{TenantID: "tenant-one", AgentAppID: "app-one", RequestID: "request-one", Input: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.handler.governance.Complete(context.Background(), GovernanceCompletion{TenantID: "tenant-one", AgentAppID: "app-one", RequestID: "request-one", Tokens: 4}); err != nil {
+		t.Fatal(err)
+	}
+	unauthorized, err := client.client.Get(client.server.URL + "/internal/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized metrics status = %d", unauthorized.StatusCode)
+	}
+	request, _ := http.NewRequest(http.MethodGet, client.server.URL+"/internal/metrics", nil)
+	request.Header.Set("Authorization", "Bearer metrics-secret")
+	response, err := client.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `trpc_agent_requests_total{tenant_id="tenant-one"} 1`) || !strings.Contains(string(body), `trpc_agent_tokens_total{tenant_id="tenant-one"} 4`) {
+		t.Fatalf("metrics response = %d %s (trace %s)", response.StatusCode, body, result.TraceID)
+	}
+}
+
 func TestConfirmationDecisionWaitsForPendingChatRunToExit(t *testing.T) {
 	handler := NewAdminHandler(NewInMemoryControlPlane(), DevelopmentIdentity{ID: "operator", Assignments: []TenantAssignment{{TenantID: "tenant-a", Role: RoleOperator}}})
 	defer handler.Close()

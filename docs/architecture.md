@@ -50,7 +50,7 @@ Session Event 是运行数据事实源，Session State 与 Summary 是可重建�
 
 ## 6. 治理、观测与故障恢复
 
-每次执行同时拥有业务 `request_id`、平台 `trace_id` 和 W3C `traceparent`。Trace 覆盖 IM callback、Gateway admission、Run Coordinator Claim/Cancel、Lease、Worker、AgentFactory、Runner、Model/Tool、Session/Memory 写入和 IM reply；Audit Event 记录 tenant、channel、user、session、agent、tool、decision、latency、error、cost、policy revision 与按 Tenant Audit Policy 处理的 content。metadata_only 不保存正文，redacted_summary 只保存通用凭据脱敏后的摘要。日志 Redactor 在输出前处理已配置 secret，Deployment、浏览器状态、审计、错误响应和验收证据均不得保存凭据。
+每次执行同时拥有业务 `request_id`、平台 `trace_id` 和 W3C `traceparent`。Trace 覆盖 IM callback、Gateway admission、Run Coordinator Claim/Cancel、Lease、Worker、AgentFactory、Runner、Model/Tool、Session/Memory/Knowledge 读写和 IM reply；Audit Event 记录 tenant、channel、user、session、agent、tool、decision、latency、error、cost、policy revision 与按 Tenant Audit Policy 处理的 content。metadata_only 不保存正文，redacted_summary 只保存通用凭据脱敏后的摘要。日志 Redactor 在输出前处理已配置 secret 和所有数据库 DSN，Deployment、浏览器状态、审计、错误响应和验收证据均不得保存凭据。模型回调耗时与端到端执行耗时分别统计；管理 API 用于租户内查询，带内部 Bearer 认证的 `/internal/metrics` 提供 Prometheus 文本抓取。
 
 服务关闭采用分阶段排水。收到 SIGTERM 后先撤销 readiness 并停止 IM 拉取，再停止 HTTP admission；在独立期限内等待在途请求，超时后广播 context cancellation，最后给事件终结和资源关闭单独期限。Runner adapter 不创建无限 drain goroutine；忽略取消的模型会导致对应 Worker 退役，避免继续接收请求。
 
