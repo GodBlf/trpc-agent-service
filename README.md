@@ -179,7 +179,7 @@ npm run dev
 - **持久控制面与多 Gateway**：开发使用迁移后的 SQLite，Compose/生产使用 PostgreSQL；两 Gateway 共享 Tenant/App/Deployment/Version/Channel Binding、Backend Selection、Governance Policy 和配置幂等状态，并通过 PostgreSQL Session Lease 与 fencing token 串行化同一 Session。
 - **真实模型与数据上下文**：Deployment Version 引用服务端 `default-openai` Profile；兼容 Chat Completions，并为 `gpt-5.6-*` 使用 Responses 流式 API；Memory/Knowledge 进入后续 Agent 输入，执行结果产生带 request/trace 关联的 Artifact 元数据。
 - **故障恢复与运维**：优雅排水、组件与依赖健康、服务端运行超时、存储超时/不可用/关闭分类、Worker/依赖重启恢复、事件排水和终端事件唯一性。
-- **灰度与容量**：Deployment 灰度状态、确定性请求路由、回滚预览/确认和有界确定性容量评估；高风险操作均要求角色、确认和 Audit Event。
+- **灰度与容量**：Deployment 灰度状态、确定性请求路由、回滚预览/确认，以及覆盖每节点 Session、平均 Token、Redis/SQL QPS、IM 回调峰值与安全余量的有界容量评估；高风险操作均要求角色、确认和 Audit Event。
 - **Compose 恢复证据**：一键从零启动双 Gateway/Worker/Redis/PostgreSQL，并复现强制 lease loss/fencing、危险 Tool 批准与拒绝、Governance outage、Worker 执行中断连与 `outcome_unknown`、PostgreSQL 中断恢复、模型超时、Tool 故障、IM 重试与重复回调。
 
 企微不使用自建应用，不接受 CorpID、AgentID、应用 Secret、Access Token、EncodingAESKey 或传统 HTTP 回调配置。真实凭据仅从被忽略的 `.env.local` 读取；自动化验收使用本地协议 fixture，不消费真实消息。
