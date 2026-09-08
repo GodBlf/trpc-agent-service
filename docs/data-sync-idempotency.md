@@ -16,7 +16,7 @@ Session Event 是运行数据事实源，Session State、Summary 和向量索引
 4. 写入 token 唯一的 `session.lease.acquired` 和 `<request_id>:started`。
 5. Worker 执行 Runner；Gateway 按事件序号追加 delta、completed 或失败事件。
 6. 写入 `latest_agent_reply` Memory；发布 Artifact 内容并校验 checksum 后写入元数据；最后追加带 `source_sequence` 的 Summary Projection Checkpoint。
-7. 写入唯一运行终态 `run.completed`、`run.failed` 或 `run.cancelled`；成功终态提交后发送 IM 回复并记录投递结果，随后释放 Lease。
+7. 发送 IM 回复并记录投递结果，写入唯一运行终态 `run.completed`、`run.failed` 或 `run.cancelled`，随后释放 Lease。
 
 每个步骤都使用由 `request_id` 和阶段名确定性派生的幂等键。成功回复要求 Artifact、Memory 和投影已经提交；任何关键写失败都不能写成功终态。调用方取消和存储超时使用稳定错误分类，不能被误报为业务成功。
 

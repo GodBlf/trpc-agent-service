@@ -1644,13 +1644,6 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			return
 		}
 	}
-	h.appendCurrentConfirmationEvent(store, options)
-	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
-	terminalErr := h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
-	cancelTerminal()
-	if terminalErr != nil {
-		return
-	}
 	if options.binding != nil {
 		delivery, err := h.channels.Send(ctx, *options.binding, ChannelReply{MessageID: options.requestID, Text: output})
 		if err == nil {
@@ -1679,6 +1672,16 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			cancel()
 		}
 	}
+	if ctx.Err() != nil {
+		terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+		_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.cancelled", h.chatIdentityPayload(options, map[string]string{"error": "run cancelled"}))
+		cancel()
+		return
+	}
+	h.appendCurrentConfirmationEvent(store, options)
+	terminalCtx, cancelTerminal := context.WithTimeout(h.failureCtx, 2*time.Second)
+	_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":run-completed", "run.completed", h.chatIdentityPayload(options, nil))
+	cancelTerminal()
 }
 
 func (h *AdminHandler) cancelSupersededChatRuns(ctx context.Context, store DataStore, options chatRunOptions) error {
