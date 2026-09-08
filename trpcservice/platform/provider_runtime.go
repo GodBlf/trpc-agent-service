@@ -137,7 +137,7 @@ func NewPersistentBotTenantAllowlist(path string) (*BotTenantAllowlist, error) {
 		if err := validateBotRoute(route); err != nil {
 			return nil, errors.New("platform: invalid bot route store")
 		}
-		key := botRouteKey(route.Provider, route.ExternalSubject)
+		key := botRouteKey(route.Provider, route.ProviderAccount, route.ExternalSubject)
 		if _, exists := allowlist.routes[key]; exists {
 			return nil, errors.New("platform: duplicate bot route store entry")
 		}
@@ -146,7 +146,9 @@ func NewPersistentBotTenantAllowlist(path string) (*BotTenantAllowlist, error) {
 	return allowlist, nil
 }
 
-func botRouteKey(provider, subject string) string { return provider + "\x00" + subject }
+func botRouteKey(provider, account, subject string) string {
+	return provider + "\x00" + account + "\x00" + subject
+}
 
 func providerSessionID(provider, account, subject string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + account + "\x00" + subject))
@@ -161,10 +163,14 @@ func (a *BotTenantAllowlist) Upsert(route BotRoute) error {
 		return err
 	}
 	route.Enabled = true
-	key := botRouteKey(route.Provider, route.ExternalSubject)
+	key := botRouteKey(route.Provider, route.ProviderAccount, route.ExternalSubject)
 	return a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
-		if previous, ok := routes[key]; ok && (previous.TenantID != route.TenantID || previous.AppID != route.AppID) {
+		storedKey, previous, ok := findBotRouteStorageKey(routes, route.Provider, route.ProviderAccount, route.ExternalSubject)
+		if ok && (previous.TenantID != route.TenantID || previous.AppID != route.AppID) {
 			return errors.New("platform: ambiguous bot route")
+		}
+		if ok && storedKey != key {
+			delete(routes, storedKey)
 		}
 		routes[key] = route
 		return nil
@@ -173,6 +179,11 @@ func (a *BotTenantAllowlist) Upsert(route BotRoute) error {
 
 func (a *BotTenantAllowlist) Resolve(provider, subject string) (BotRoute, bool) {
 	route, ok, _ := a.ResolveContext(context.Background(), provider, subject)
+	return route, ok && route.Enabled
+}
+
+func (a *BotTenantAllowlist) ResolveAccount(provider, account, subject string) (BotRoute, bool) {
+	route, ok, _ := a.ResolveAccountContext(context.Background(), provider, account, subject)
 	return route, ok && route.Enabled
 }
 
@@ -187,8 +198,54 @@ func (a *BotTenantAllowlist) ResolveContext(ctx context.Context, provider, subje
 	if err := a.refreshLocked(ctx); err != nil {
 		return BotRoute{}, false, err
 	}
-	route, ok := a.routes[botRouteKey(provider, subject)]
-	return route, ok, nil
+	return resolveBotRoute(a.routes, provider, "", subject)
+}
+
+func (a *BotTenantAllowlist) ResolveAccountContext(ctx context.Context, provider, account, subject string) (BotRoute, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.refreshLocked(ctx); err != nil {
+		return BotRoute{}, false, err
+	}
+	return resolveBotRoute(a.routes, provider, account, subject)
+}
+
+func resolveBotRoute(routes map[string]BotRoute, provider, account, subject string) (BotRoute, bool, error) {
+	if route, ok := routes[botRouteKey(provider, account, subject)]; ok {
+		return route, true, nil
+	}
+	// An account-neutral route is an explicit fallback for installations that
+	// operate a single provider account. Account-specific routes always win.
+	if account != "" {
+		if route, ok := routes[botRouteKey(provider, "", subject)]; ok {
+			return route, true, nil
+		}
+	}
+	var match BotRoute
+	matches := 0
+	for _, route := range routes {
+		if route.Provider == provider && route.ExternalSubject == subject {
+			match = route
+			matches++
+		}
+	}
+	if matches == 1 {
+		return match, true, nil
+	}
+	return BotRoute{}, false, nil
+}
+
+func findBotRouteStorageKey(routes map[string]BotRoute, provider, account, subject string) (string, BotRoute, bool) {
+	key := botRouteKey(provider, account, subject)
+	if route, ok := routes[key]; ok {
+		return key, route, true
+	}
+	for storedKey, route := range routes {
+		if route.Provider == provider && route.ProviderAccount == account && route.ExternalSubject == subject {
+			return storedKey, route, true
+		}
+	}
+	return "", BotRoute{}, false
 }
 
 func (a *BotTenantAllowlist) List() []BotRoute {
@@ -207,21 +264,34 @@ func (a *BotTenantAllowlist) ListContext(ctx context.Context) ([]BotRoute, error
 		items = append(items, route)
 	}
 	sort.Slice(items, func(i, j int) bool {
-		return botRouteKey(items[i].Provider, items[i].ExternalSubject) < botRouteKey(items[j].Provider, items[j].ExternalSubject)
+		return botRouteKey(items[i].Provider, items[i].ProviderAccount, items[i].ExternalSubject) < botRouteKey(items[j].Provider, items[j].ProviderAccount, items[j].ExternalSubject)
 	})
 	return items, nil
 }
 
 func (a *BotTenantAllowlist) Update(provider, subject string, replacement BotRoute) (BotRoute, error) {
-	key := botRouteKey(provider, subject)
+	existing, ok := a.Lookup(provider, subject)
+	if !ok {
+		return BotRoute{}, ErrNotFound
+	}
+	return a.UpdateAccount(provider, existing.ProviderAccount, subject, replacement)
+}
+
+func (a *BotTenantAllowlist) UpdateAccount(provider, account, subject string, replacement BotRoute) (BotRoute, error) {
+	key := botRouteKey(provider, account, subject)
 	replacement.Provider = provider
+	replacement.ProviderAccount = account
 	replacement.ExternalSubject = subject
 	if err := validateBotRoute(replacement); err != nil {
 		return BotRoute{}, err
 	}
 	err := a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
-		if _, ok := routes[key]; !ok {
+		storedKey, _, ok := findBotRouteStorageKey(routes, provider, account, subject)
+		if !ok {
 			return ErrNotFound
+		}
+		if storedKey != key {
+			delete(routes, storedKey)
 		}
 		routes[key] = replacement
 		return nil
@@ -233,9 +303,21 @@ func (a *BotTenantAllowlist) Update(provider, subject string, replacement BotRou
 }
 
 func (a *BotTenantAllowlist) Delete(provider, subject string) error {
-	key := botRouteKey(provider, subject)
+	existing, ok := a.Lookup(provider, subject)
+	if !ok {
+		return nil
+	}
+	return a.DeleteAccount(provider, existing.ProviderAccount, subject)
+}
+
+func (a *BotTenantAllowlist) DeleteAccount(provider, account, subject string) error {
+	key := botRouteKey(provider, account, subject)
 	return a.mutateRoutes(context.Background(), func(routes map[string]BotRoute) error {
-		delete(routes, key)
+		if storedKey, _, ok := findBotRouteStorageKey(routes, provider, account, subject); ok {
+			delete(routes, storedKey)
+		} else {
+			delete(routes, key)
+		}
 		return nil
 	})
 }
@@ -307,7 +389,7 @@ func (a *BotTenantAllowlist) persistLocked() error {
 		items = append(items, route)
 	}
 	sort.Slice(items, func(i, j int) bool {
-		return botRouteKey(items[i].Provider, items[i].ExternalSubject) < botRouteKey(items[j].Provider, items[j].ExternalSubject)
+		return botRouteKey(items[i].Provider, items[i].ProviderAccount, items[i].ExternalSubject) < botRouteKey(items[j].Provider, items[j].ProviderAccount, items[j].ExternalSubject)
 	})
 	data, err := json.MarshalIndent(items, "", "  ")
 	if err != nil {
@@ -429,7 +511,7 @@ func (p *ProviderRuntime) recordDelivery(binding ChannelBinding, reply ChannelRe
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := botRouteKey(binding.Channel, binding.ConversationID)
+	key := botRouteKey(binding.Channel, binding.ProviderAccount, binding.ConversationID)
 	if existing, ok := p.deliveries[key]; ok && existing.RequestID == delivery.RequestID && status == "accepted" && existing.Status != "accepted" {
 		return
 	}
@@ -448,17 +530,17 @@ func (p *ProviderRuntime) recordDelivery(binding ChannelBinding, reply ChannelRe
 }
 
 func (p *ProviderRuntime) recordAccepted(route BotRoute, requestID string) {
-	p.recordDelivery(ChannelBinding{Channel: route.Provider, ConversationID: route.ExternalSubject, TenantID: route.TenantID, AppID: route.AppID}, ChannelReply{MessageID: requestID}, "accepted", "", 0)
+	p.recordDelivery(ChannelBinding{Channel: route.Provider, ProviderAccount: route.ProviderAccount, ConversationID: route.ExternalSubject, TenantID: route.TenantID, AppID: route.AppID}, ChannelReply{MessageID: requestID}, "accepted", "", 0)
 }
 
 func (p *ProviderRuntime) recordRejected(provider, subject, requestID, code string, route BotRoute) {
-	p.recordDelivery(ChannelBinding{Channel: provider, ConversationID: subject, TenantID: route.TenantID, AppID: route.AppID}, ChannelReply{MessageID: requestID}, "rejected", code, 0)
+	p.recordDelivery(ChannelBinding{Channel: provider, ProviderAccount: route.ProviderAccount, ConversationID: subject, TenantID: route.TenantID, AppID: route.AppID}, ChannelReply{MessageID: requestID}, "rejected", code, 0)
 }
 
 func (p *ProviderRuntime) recordTerminalIfPending(binding ChannelBinding, reply ChannelReply, code string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := botRouteKey(binding.Channel, binding.ConversationID)
+	key := botRouteKey(binding.Channel, binding.ProviderAccount, binding.ConversationID)
 	existing, ok := p.deliveries[key]
 	if !ok || existing.RequestID != reply.MessageID || (existing.Status != "accepted" && existing.Status != "retried") {
 		return
@@ -472,7 +554,7 @@ func (p *ProviderRuntime) recordTerminalIfPending(binding ChannelBinding, reply 
 func (p *ProviderRuntime) acceptInbound(route BotRoute, messageID string, sequence int64) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	routeKey := botRouteKey(route.Provider, route.ExternalSubject)
+	routeKey := botRouteKey(route.Provider, route.ProviderAccount, route.ExternalSubject)
 	messageKey := routeKey + "\x00" + messageID
 	if _, exists := p.inboundMessages[messageKey]; exists {
 		return "duplicate"
@@ -500,7 +582,7 @@ func (p *ProviderRuntime) acceptInbound(route BotRoute, messageID string, sequen
 func (p *ProviderRuntime) releaseInbound(route BotRoute, messageID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	routeKey := botRouteKey(route.Provider, route.ExternalSubject)
+	routeKey := botRouteKey(route.Provider, route.ProviderAccount, route.ExternalSubject)
 	delete(p.inboundMessages, routeKey+"\x00"+messageID)
 	var latest int64
 	for key, sequence := range p.inboundMessages {

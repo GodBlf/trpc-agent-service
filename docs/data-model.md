@@ -12,6 +12,7 @@
 | Deployment Version | `(tenant_id, deployment_id, number)`，租户内唯一 `version_id` | provider_profile, model, prompt, generation_config | 发布后不可变，不含凭据；运行时必须使用 `(tenant_id, version_id)` |
 | Backend Selection | `(tenant_id, data_kind)` | adapter_id, server_owned_config_ref | 客户端只能选择服务端目录中的 adapter |
 | Channel Binding | `(tenant_id, binding_id)` | app_id, provider, account, external_subject, session_id, enabled | 外部主体映射到 Tenant/App |
+| Provider Route | `(provider, provider_account, external_subject)` | tenant_id, app_id, conversation_type, enabled | 平台 Bot 账号下的外部主体唯一归属一个 Tenant/App |
 | Session | `(tenant_id, session_id)` | app_id, user_id | 由事件流物化 |
 | Session Event | `(tenant_id, session_id, sequence)` | event_id, idempotency_key, type, payload, fencing_token, occurred_at | sequence 连续；幂等 key 唯一；事实源 |
 | Projection Checkpoint | `(tenant_id, session_id, projection)` | last_sequence, updated_at | 只能从 N 推进到 N+1 |

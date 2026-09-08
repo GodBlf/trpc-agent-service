@@ -43,7 +43,7 @@ Tool 的治理不是只在入口做一次静态检查。`governanceRuntimePlugin
 
 企业微信实现是 API 模式智能机器人：`provider_runtime.go` 维护 WebSocket 连接并处理 `aibot_subscribe`、`aibot_msg_callback` 与 `aibot_respond_msg`。Telegram 以 long polling 获取 Update 并调用 `sendMessage`。平台不接受企业微信自建应用的 CorpID、AgentID、EncodingAESKey 或传统 callback 配置。
 
-`BotTenantAllowlist` 将 provider、provider account 和 external subject 绑定到 Tenant/App。进入 ChannelCoordinator 后按 message ID 去重、按 provider sequence 拒绝乱序，再调用与 Chat 相同的 Agent 执行路径。自动化测试使用本地协议 fixture，不消费真实 IM 消息或真实凭据。
+`BotTenantAllowlist` 以 `(provider, provider account, external subject)` 将外部主体绑定到 Tenant/App。进入 ChannelCoordinator 后按 message ID 去重、按 provider sequence 拒绝乱序，再调用与 Chat 相同的 Agent 执行路径。自动化测试使用本地协议 fixture，不消费真实 IM 消息或真实凭据。单群聊 Session 规则、认证差异和平台限制见 [IM Channel Adapter 设计](im-channel-adapter.md)。
 
 Governance Policy 覆盖 Tool/MCP allowlist、输入输出 Guardrail、外部主体和 provider account 授权、危险 Tool 确认、Tenant 限流、预算与脱敏。Audit Event 和 Platform Trace 使用 `request_id`、`trace_id` 关联 Gateway、Worker、模型、Tool、Storage、Artifact 和 Channel reply。当前指标与 Trace 可由管理 API 检索；生产拓扑可在相同边界接入独立 OpenTelemetry Collector。
 

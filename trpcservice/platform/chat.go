@@ -113,14 +113,14 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 		return errors.New("unsupported provider")
 	}
 	requestID := "channel-" + messageID
-	route, exists, routeErr := h.providers.Routes().ResolveContext(ctx, provider, subject)
+	route, exists, routeErr := h.providers.Routes().ResolveAccountContext(ctx, provider, account, subject)
 	if routeErr != nil {
 		h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
 		return errors.New("control_plane_unavailable")
 	}
 	if !exists && fallbackSubject != "" && fallbackSubject != subject {
 		subject = fallbackSubject
-		route, exists, routeErr = h.providers.Routes().ResolveContext(ctx, provider, subject)
+		route, exists, routeErr = h.providers.Routes().ResolveAccountContext(ctx, provider, account, subject)
 		if routeErr != nil {
 			h.providers.recordRejected(provider, subject, requestID, "control_plane_unavailable", BotRoute{})
 			return errors.New("control_plane_unavailable")
@@ -137,6 +137,12 @@ func (h *AdminHandler) ProcessProviderMessage(ctx context.Context, provider, acc
 	if route.ProviderAccount != "" && route.ProviderAccount != account {
 		h.providers.recordRejected(provider, subject, requestID, "provider_account_denied", route)
 		return ErrProviderMessageIgnored
+	}
+	if route.ProviderAccount == "" {
+		// Account-neutral routes are the single-account compatibility form. Once
+		// selected, use the authenticated runtime account for session, dedupe and
+		// delivery identity so different Bot accounts never share state.
+		route.ProviderAccount = account
 	}
 	if rejectionCode != "" {
 		h.providers.recordRejected(provider, subject, requestID, rejectionCode, route)
@@ -244,6 +250,7 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 	}
 	var request struct {
 		Provider        string `json:"provider"`
+		ProviderAccount string `json:"provider_account"`
 		ExternalSubject string `json:"external_subject"`
 		Text            string `json:"text"`
 	}
@@ -255,7 +262,17 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_provider_replay", "provider is unsupported")
 		return
 	}
-	route, found := h.providers.Routes().Lookup(request.Provider, request.ExternalSubject)
+	account := request.ProviderAccount
+	if account == "" && request.Provider == ChannelTelegram {
+		account = h.providers.config.TelegramUsername
+	}
+	if account == "" && request.Provider == ChannelEnterpriseWeChat {
+		account = h.providers.config.WeComBotID
+	}
+	if account == "" {
+		account = "replay-bot"
+	}
+	route, found := h.providers.Routes().ResolveAccount(request.Provider, account, request.ExternalSubject)
 	if !found || !route.Enabled || !tenantCanSee(tenant, route.TenantID) {
 		writeError(w, http.StatusNotFound, "provider_route_not_found", "enabled provider route was not found")
 		return
@@ -265,7 +282,7 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	sequence := time.Now().UnixNano()
-	var account, messageID string
+	var messageID string
 	var body []byte
 	switch request.Provider {
 	case ChannelTelegram:
@@ -274,17 +291,9 @@ func (h *AdminHandler) handleProviderReplay(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadRequest, "invalid_provider_replay", "Telegram subject must be a numeric chat ID")
 			return
 		}
-		account = h.providers.config.TelegramUsername
-		if account == "" {
-			account = "replay-bot"
-		}
 		messageID = strconv.FormatInt(sequence, 10)
 		body, _ = json.Marshal(map[string]any{"update_id": sequence, "message": map[string]any{"message_id": sequence, "chat": map[string]any{"id": chatID, "type": "private"}, "from": map[string]any{"id": chatID}, "text": request.Text}})
 	case ChannelEnterpriseWeChat:
-		account = h.providers.config.WeComBotID
-		if account == "" {
-			account = "replay-bot"
-		}
 		messageID = "replay-" + newRequestID()
 		body, _ = json.Marshal(map[string]any{
 			"cmd": "aibot_msg_callback", "headers": map[string]string{"req_id": newRequestID()}, "provider_session_id": "local-replay",
@@ -651,7 +660,8 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		route.Enabled = true
 		writeJSON(w, http.StatusCreated, route)
 	case http.MethodPatch:
-		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		provider, account, subject := r.URL.Query().Get("provider"), r.URL.Query().Get("provider_account"), r.URL.Query().Get("external_subject")
+		existing, exists, lookupErr := h.providers.Routes().ResolveAccountContext(r.Context(), provider, account, subject)
 		if lookupErr != nil {
 			if writeControlPlaneError(w, lookupErr) {
 				return
@@ -677,6 +687,10 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		if request.ProviderAccount == "" {
 			request.ProviderAccount = existing.ProviderAccount
 		}
+		if request.ProviderAccount != existing.ProviderAccount {
+			writeError(w, http.StatusConflict, "provider_route_identity_immutable", "delete and recreate a route to change its provider account")
+			return
+		}
 		if _, ok, err := h.platform.app(r.Context(), request.TenantID, request.AppID); err != nil || !ok {
 			if writeControlPlaneError(w, err) {
 				return
@@ -684,7 +698,7 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusNotFound, "agent_app_not_found", "Agent App was not found")
 			return
 		}
-		route, err := h.providers.Routes().Update(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"), BotRoute{
+		route, err := h.providers.Routes().UpdateAccount(provider, existing.ProviderAccount, subject, BotRoute{
 			TenantID: request.TenantID, AppID: request.AppID, ConversationType: request.ConversationType, Enabled: *request.Enabled,
 			ProviderAccount: request.ProviderAccount,
 		})
@@ -701,7 +715,8 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		writeJSON(w, http.StatusOK, route)
 	case http.MethodDelete:
-		existing, exists, lookupErr := h.providers.Routes().ResolveContext(r.Context(), r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject"))
+		provider, account, subject := r.URL.Query().Get("provider"), r.URL.Query().Get("provider_account"), r.URL.Query().Get("external_subject")
+		existing, exists, lookupErr := h.providers.Routes().ResolveAccountContext(r.Context(), provider, account, subject)
 		if lookupErr != nil {
 			if writeControlPlaneError(w, lookupErr) {
 				return
@@ -713,7 +728,7 @@ func (h *AdminHandler) handleProviderRoutes(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusForbidden, "forbidden", "platform administrator role is required")
 			return
 		}
-		if err := h.providers.Routes().Delete(r.URL.Query().Get("provider"), r.URL.Query().Get("external_subject")); err != nil {
+		if err := h.providers.Routes().DeleteAccount(provider, existing.ProviderAccount, subject); err != nil {
 			writeError(w, http.StatusServiceUnavailable, "provider_route_store_unavailable", "provider route could not be deleted")
 			return
 		}

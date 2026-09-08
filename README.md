@@ -189,6 +189,7 @@ npm run dev
 1. [架构设计文档](docs/architecture.md)
 2. [系统架构图](docs/system-architecture-diagram.md)
 3. [企业微信核心时序图](docs/core-sequence-diagram.md)
+   - [IM Channel Adapter 设计与实现边界](docs/im-channel-adapter.md)
 4. [数据模型设计](docs/data-model.md)
 5. [数据同步与幂等策略](docs/data-sync-idempotency.md)
 6. [多后端适配方案](docs/backend-adapters.md)

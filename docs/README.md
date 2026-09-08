@@ -9,6 +9,7 @@
 | 1 | 架构设计文档 | [architecture.md](architecture.md) | 多租户、节点化部署、组件职责、隔离治理、故障恢复和实现边界 |
 | 2 | 系统架构图 | [system-architecture-diagram.md](system-architecture-diagram.md) | Gateway、Worker、Channel/Storage Adapter、Guardrail、Telemetry、数据库和 IM 平台 |
 | 3 | 核心时序图 | [core-sequence-diagram.md](core-sequence-diagram.md) | 企业微信消息、Agent/Tool、Session/Memory 和 IM 回复完整链路 |
+| 3A | IM Channel Adapter | [im-channel-adapter.md](im-channel-adapter.md) | 企业微信/Telegram 差异、账号路由、Session 规则、认证与平台限制 |
 | 4 | 数据模型设计 | [data-model.md](data-model.md) | 核心实体、主键约束、ER 图、JSON Schema 和状态模型 |
 | 5 | 数据同步与幂等策略 | [data-sync-idempotency.md](data-sync-idempotency.md) | 事件顺序、消息去重、Lease/fencing、迁移、checkpoint 和恢复 |
 | 6 | 多后端适配方案 | [backend-adapters.md](backend-adapters.md) | PostgreSQL/SQLite、Redis、向量库、对象存储和 InMemory 职责 |

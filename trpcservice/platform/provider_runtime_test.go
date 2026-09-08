@@ -487,6 +487,44 @@ func TestBotTenantAllowlistRejectsConflictingRoute(t *testing.T) {
 	}
 }
 
+func TestBotTenantAllowlistSeparatesProviderAccounts(t *testing.T) {
+	allowlist := NewBotTenantAllowlist()
+	routes := []BotRoute{
+		{Provider: ChannelTelegram, ProviderAccount: "bot-a", ExternalSubject: "shared-chat", TenantID: "tenant-one", AppID: "app-one"},
+		{Provider: ChannelTelegram, ProviderAccount: "bot-b", ExternalSubject: "shared-chat", TenantID: "tenant-two", AppID: "app-two"},
+	}
+	for _, route := range routes {
+		if err := allowlist.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, want := range routes {
+		got, ok := allowlist.ResolveAccount(want.Provider, want.ProviderAccount, want.ExternalSubject)
+		if !ok || got.TenantID != want.TenantID || got.AppID != want.AppID {
+			t.Fatalf("route for %s = %#v/%v", want.ProviderAccount, got, ok)
+		}
+	}
+	if _, ok := allowlist.Resolve(ChannelTelegram, "shared-chat"); ok {
+		t.Fatal("account-neutral lookup must not choose between multiple Bot accounts")
+	}
+}
+
+func TestProviderSessionIDSeparatesAccountsAndConversations(t *testing.T) {
+	base := providerSessionID(ChannelTelegram, "bot-a", "chat-a")
+	if base != providerSessionID(ChannelTelegram, "bot-a", "chat-a") {
+		t.Fatal("provider session ID is not deterministic")
+	}
+	for _, candidate := range []string{
+		providerSessionID(ChannelTelegram, "bot-b", "chat-a"),
+		providerSessionID(ChannelTelegram, "bot-a", "chat-b"),
+		providerSessionID(ChannelEnterpriseWeChat, "bot-a", "chat-a"),
+	} {
+		if candidate == base {
+			t.Fatalf("provider session collision: %q", candidate)
+		}
+	}
+}
+
 func TestBotTenantAllowlistPersistsDisableUpdateAndDelete(t *testing.T) {
 	path := t.TempDir() + "/bot-routes.json"
 	allowlist, err := NewPersistentBotTenantAllowlist(path)

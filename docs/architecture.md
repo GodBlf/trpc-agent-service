@@ -8,7 +8,7 @@
 
 比赛交付提供两种运行拓扑。单节点开发使用 SQLite Control Plane 和可选择的 InMemory、SQLite 数据后端；Stage 7 Compose 使用 Nginx、两个 Gateway、独立 Worker、PostgreSQL 和 Redis。生产拓扑沿用相同组件边界，但还需把当前固定在 Gateway A 的部分治理运行态迁入共享事务存储。
 
-完整拓扑见[系统架构图](system-architecture-diagram.md)，企业微信端到端链路见[核心时序图](core-sequence-diagram.md)。
+完整拓扑见[系统架构图](system-architecture-diagram.md)，企业微信端到端链路见[核心时序图](core-sequence-diagram.md)，Provider 认证、账号路由、Session 规则和限制矩阵见 [IM Channel Adapter 设计](im-channel-adapter.md)。
 
 ## 2. 组件职责
 
