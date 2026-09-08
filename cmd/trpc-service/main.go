@@ -21,11 +21,7 @@ import (
 )
 
 func main() {
-	redactor := servicelog.NewRedactor([]string{
-		os.Getenv("TRPC_AUTH_HMAC_SECRET"), os.Getenv("TRPC_TELEGRAM_BOT_TOKEN"), os.Getenv("TRPC_WECOM_BOT_SECRET"),
-		os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_BACKEND_SELECTIONS"),
-		os.Getenv("OPENAI_API_KEY"), os.Getenv("TRPC_EXECUTION_MANIFEST_SECRET"), os.Getenv("TRPC_EXECUTION_MANIFEST_KEYS"), os.Getenv("TRPC_GOVERNANCE_TOKEN"),
-	}, nil)
+	redactor := servicelog.NewRedactor(redactionSecrets(os.Getenv), nil)
 	log.SetOutput(servicelog.NewRedactingWriter(os.Stderr, redactor))
 	defaultAddr := os.Getenv("TRPC_SERVICE_ADDR")
 	if defaultAddr == "" {
@@ -245,6 +241,21 @@ func main() {
 	if err := admin.Close(); err != nil {
 		log.Printf("data stores: %v", err)
 	}
+}
+
+func redactionSecrets(getenv func(string) string) []string {
+	names := []string{
+		"TRPC_AUTH_HMAC_SECRET", "TRPC_TELEGRAM_BOT_TOKEN", "TRPC_WECOM_BOT_SECRET",
+		"TRPC_WORKER_TOKEN", "TRPC_GOVERNANCE_TOKEN", "TRPC_EXECUTION_MANIFEST_SECRET", "TRPC_EXECUTION_MANIFEST_KEYS",
+		"OPENAI_API_KEY", "OPENAI_BASE_URL",
+		"TRPC_REDIS_ADDR", "TRPC_MIGRATION_REDIS_ADDR", "TRPC_BACKEND_SELECTIONS", "TRPC_BACKEND_PROFILES",
+		"TRPC_CONTROL_PLANE_POSTGRES_DSN", "TRPC_AUDIT_POSTGRES_DSN", "TRPC_POSTGRES_DSN",
+	}
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		values = append(values, getenv(name))
+	}
+	return values
 }
 
 func configuredDuration(name string, fallback time.Duration) (time.Duration, error) {

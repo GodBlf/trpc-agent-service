@@ -226,9 +226,42 @@ type governanceRuntimePlugin struct {
 	tools  ToolGovernance
 }
 
+type modelCallTiming struct {
+	started time.Time
+	once    sync.Once
+}
+
+type modelCallTimingContextKey struct{}
+
 func (p *governanceRuntimePlugin) Name() string { return "platform-governance" }
 
 func (p *governanceRuntimePlugin) Register(registry *plugin.Registry) {
+	registry.BeforeModel(func(ctx context.Context, _ *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
+		if _, ok := RunnerIdentityFromContext(ctx); !ok || p.center == nil {
+			return nil, nil
+		}
+		timing := &modelCallTiming{started: p.center.now().UTC()}
+		return &model.BeforeModelResult{Context: context.WithValue(ctx, modelCallTimingContextKey{}, timing)}, nil
+	})
+	registry.AfterModel(func(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+		request, ok := RunnerIdentityFromContext(ctx)
+		timing, timed := ctx.Value(modelCallTimingContextKey{}).(*modelCallTiming)
+		if !ok || !timed || p.center == nil || args != nil && args.Response != nil && args.Response.IsPartial && args.Error == nil {
+			return nil, nil
+		}
+		var recordErr error
+		timing.once.Do(func() {
+			var callErr error
+			if args != nil {
+				callErr = args.Error
+			}
+			recordErr = p.center.RecordModelCall(runnerGovernanceRequest(request, nil, nil, ""), request.TraceID, p.center.now().UTC().Sub(timing.started), callErr)
+		})
+		if recordErr != nil {
+			return nil, &GovernanceError{Code: "audit_unavailable", TraceID: request.TraceID}
+		}
+		return nil, nil
+	})
 	registry.BeforeAgent(func(ctx context.Context, args *frameworkagent.BeforeAgentArgs) (*frameworkagent.BeforeAgentResult, error) {
 		if request, ok := RunnerIdentityFromContext(ctx); ok && p.center != nil {
 			if _, admitted := ctx.Value(governanceAdmissionContextKey{}).(bool); !admitted {

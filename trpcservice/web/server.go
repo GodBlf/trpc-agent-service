@@ -74,6 +74,7 @@ func newHandler(runner platform.RunnerAdapter, tenant platform.TenantContext, li
 	if admin != nil {
 		mux.Handle("/api/", admin)
 		mux.Handle("/internal/governance/", admin)
+		mux.Handle("/internal/metrics", admin)
 	}
 	if serveFrontend {
 		mux.Handle("/", frontendHandler())

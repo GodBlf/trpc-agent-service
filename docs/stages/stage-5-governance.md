@@ -101,17 +101,23 @@ values are available. Authentication, authorization, policy, confirmation,
 management mutation, and execution outcomes use stable decision/error codes.
 
 Tenant metrics expose request, active/completed/failed/denied/rate-limited
-execution counters, token and cost totals, model/Tool/storage latency, and IM
-delivery totals. The deterministic Runner estimates token usage when upstream
+execution counters, token and cost totals, model/Tool/storage latency,
+end-to-end execution latency, and IM delivery totals. Model latency is measured
+at the framework's actual BeforeModel/AfterModel callbacks rather than inferred
+from the complete Runner duration. The deterministic Runner estimates token usage when upstream
 usage metadata is absent. Budgets use per-request reservations so concurrent
 runs cannot collectively start beyond the configured allowance. Reservations
 that remain active for 15 minutes are reconciled exactly once before the next
 admission decision. Metric samples use only bounded Tenant, Agent App, and
 provider dimensions; queries default to 24 hours and reject ranges over 31 days.
+An authenticated Prometheus text endpoint is available at
+`GET /internal/metrics`; it uses the same internal Bearer credential as Worker
+governance calls and must remain on the cluster-internal network.
 
 The platform trace model is deliberately independent of upstream telemetry
 types. `trace_id` follows browser/provider ingress, policy, Gateway, Worker,
-AgentFactory, Runner, Tool authorization, storage, and reply. Lookup is
+AgentFactory, Runner, Model/Tool authorization, successful and failed
+Session/Memory/Knowledge storage reads, storage writes, and reply. Lookup is
 Tenant-scoped by trace or request ID. This is an equivalent bounded trace model,
 not an OTLP exporter. Each span has a stable span ID and the preceding operation
 as its parent, forming an inspectable causal chain. Trace snapshots persist with
@@ -135,3 +141,6 @@ Redaction is applied at platform logs, policy responses, Runner input/output,
 Audit/Trace attributes, public errors, and Provider diagnostics. Explicitly
 clearing an existing write-only redaction pattern is not modeled: a policy
 update containing only placeholders preserves the stored values.
+The process log Redactor includes Worker/governance/manifest credentials, model
+and IM credentials, Redis/backend configuration, and every supported PostgreSQL
+DSN; URL passwords are independently registered as redaction values.

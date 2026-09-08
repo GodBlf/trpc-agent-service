@@ -76,10 +76,14 @@ func (c *RemoteToolGovernance) call(ctx context.Context, operation string, call 
 
 func (h *AdminHandler) ConfigureInternalGovernance(token string) { h.internalGovernanceToken = token }
 
-func (h *AdminHandler) handleInternalGovernance(w http.ResponseWriter, r *http.Request) {
+func (h *AdminHandler) internalRequestAuthorized(r *http.Request) bool {
 	provided := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	expected := []byte(h.internalGovernanceToken)
-	if len(expected) == 0 || subtle.ConstantTimeCompare(provided, expected) != 1 {
+	return len(expected) > 0 && subtle.ConstantTimeCompare(provided, expected) == 1
+}
+
+func (h *AdminHandler) handleInternalGovernance(w http.ResponseWriter, r *http.Request) {
+	if !h.internalRequestAuthorized(r) {
 		writeError(w, http.StatusUnauthorized, "governance_unauthorized", "governance authorization failed")
 		return
 	}
@@ -118,4 +122,18 @@ func (h *AdminHandler) handleInternalGovernance(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *AdminHandler) handleInternalMetrics(w http.ResponseWriter, r *http.Request) {
+	if !h.internalRequestAuthorized(r) {
+		writeError(w, http.StatusUnauthorized, "metrics_unauthorized", "metrics authorization failed")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, h.governance.PrometheusMetrics())
 }

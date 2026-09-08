@@ -150,25 +150,26 @@ type AuditQuery struct {
 }
 
 type TenantMetrics struct {
-	TenantID         string    `json:"tenant_id"`
-	Requests         int64     `json:"requests"`
-	Active           int64     `json:"active_executions"`
-	Completed        int64     `json:"completed_executions"`
-	Failed           int64     `json:"failed_executions"`
-	Denied           int64     `json:"denied_requests"`
-	RateLimited      int64     `json:"rate_limited_requests"`
-	Tokens           int64     `json:"tokens"`
-	Cost             float64   `json:"cost"`
-	ModelLatencyMS   int64     `json:"model_latency_ms"`
-	ToolLatencyMS    int64     `json:"tool_latency_ms"`
-	StorageLatencyMS int64     `json:"storage_latency_ms"`
-	IMDelivered      int64     `json:"im_delivered"`
-	IMFailed         int64     `json:"im_failed"`
-	TokenBudget      int64     `json:"token_budget"`
-	TokensRemaining  int64     `json:"tokens_remaining"`
-	CostBudget       float64   `json:"cost_budget"`
-	CostRemaining    float64   `json:"cost_remaining"`
-	BudgetPeriodFrom time.Time `json:"budget_period_from,omitempty"`
+	TenantID           string    `json:"tenant_id"`
+	Requests           int64     `json:"requests"`
+	Active             int64     `json:"active_executions"`
+	Completed          int64     `json:"completed_executions"`
+	Failed             int64     `json:"failed_executions"`
+	Denied             int64     `json:"denied_requests"`
+	RateLimited        int64     `json:"rate_limited_requests"`
+	Tokens             int64     `json:"tokens"`
+	Cost               float64   `json:"cost"`
+	ModelLatencyMS     int64     `json:"model_latency_ms"`
+	ExecutionLatencyMS int64     `json:"execution_latency_ms"`
+	ToolLatencyMS      int64     `json:"tool_latency_ms"`
+	StorageLatencyMS   int64     `json:"storage_latency_ms"`
+	IMDelivered        int64     `json:"im_delivered"`
+	IMFailed           int64     `json:"im_failed"`
+	TokenBudget        int64     `json:"token_budget"`
+	TokensRemaining    int64     `json:"tokens_remaining"`
+	CostBudget         float64   `json:"cost_budget"`
+	CostRemaining      float64   `json:"cost_remaining"`
+	BudgetPeriodFrom   time.Time `json:"budget_period_from,omitempty"`
 }
 
 type MetricsQuery struct {
@@ -852,7 +853,8 @@ func (g *GovernanceCenter) Complete(ctx context.Context, completion GovernanceCo
 	}
 	metrics.Tokens += tokens
 	metrics.Cost += executionCost
-	metrics.ModelLatencyMS += g.now().Sub(execution.started).Milliseconds()
+	executionLatency := g.now().Sub(execution.started).Milliseconds()
+	metrics.ExecutionLatencyMS += executionLatency
 	decision := "run.completed"
 	if completion.Cancelled {
 		metrics.Failed++
@@ -864,7 +866,7 @@ func (g *GovernanceCenter) Complete(ctx context.Context, completion GovernanceCo
 		metrics.Completed++
 	}
 	g.metrics[completion.TenantID] = metrics
-	delta := TenantMetrics{Active: -1, Tokens: tokens, Cost: executionCost, ModelLatencyMS: g.now().Sub(execution.started).Milliseconds()}
+	delta := TenantMetrics{Active: -1, Tokens: tokens, Cost: executionCost, ExecutionLatencyMS: executionLatency}
 	if completion.Cancelled || completion.ErrorType != "" {
 		delta.Failed = 1
 	} else {
@@ -942,6 +944,28 @@ func (g *GovernanceCenter) RecordStorageLatencyFor(tenantID, appID, provider str
 	if err := g.persistLocked(); err != nil {
 		g.restoreLocked(checkpoint)
 	}
+}
+
+func (g *GovernanceCenter) RecordModelCall(request GovernanceRequest, traceID string, latency time.Duration, callErr error) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	checkpoint := g.snapshotLocked()
+	latencyMS := latency.Milliseconds()
+	metrics := g.metrics[request.TenantID]
+	metrics.TenantID = request.TenantID
+	metrics.ModelLatencyMS += latencyMS
+	g.metrics[request.TenantID] = metrics
+	g.recordMetricSampleLocked(request.TenantID, request.AgentAppID, request.Channel, g.now().UTC(), TenantMetrics{ModelLatencyMS: latencyMS})
+	status := "ok"
+	if callErr != nil {
+		status = "error"
+	}
+	g.recordTraceLocked(request, traceID, "model.call", status, g.now().UTC())
+	if err := g.persistLocked(); err != nil {
+		g.restoreLocked(checkpoint)
+		return err
+	}
+	return nil
 }
 
 func (g *GovernanceCenter) AuthorizeTool(ctx context.Context, request GovernanceRequest, traceID, toolName string, arguments []byte) error {
@@ -1256,6 +1280,46 @@ func (g *GovernanceCenter) Metrics(tenantID string) TenantMetrics {
 	return metrics
 }
 
+func (g *GovernanceCenter) PrometheusMetrics() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	tenantIDs := make([]string, 0, len(g.metrics))
+	for tenantID := range g.metrics {
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+	sort.Strings(tenantIDs)
+	definitions := []struct {
+		name       string
+		help       string
+		metricType string
+		value      func(TenantMetrics) string
+	}{
+		{"trpc_agent_requests_total", "Accepted tenant requests.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.Requests, 10) }},
+		{"trpc_agent_active_executions", "Currently active tenant executions.", "gauge", func(m TenantMetrics) string { return strconv.FormatInt(m.Active, 10) }},
+		{"trpc_agent_completed_executions_total", "Completed tenant executions.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.Completed, 10) }},
+		{"trpc_agent_failed_executions_total", "Failed tenant executions.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.Failed, 10) }},
+		{"trpc_agent_denied_requests_total", "Governance-denied tenant requests.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.Denied, 10) }},
+		{"trpc_agent_rate_limited_requests_total", "Rate-limited tenant requests.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.RateLimited, 10) }},
+		{"trpc_agent_tokens_total", "Model tokens attributed to the tenant.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.Tokens, 10) }},
+		{"trpc_agent_cost_total", "Model and tool cost attributed to the tenant.", "counter", func(m TenantMetrics) string { return strconv.FormatFloat(m.Cost, 'f', -1, 64) }},
+		{"trpc_agent_model_latency_milliseconds_total", "Cumulative model call latency.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.ModelLatencyMS, 10) }},
+		{"trpc_agent_execution_latency_milliseconds_total", "Cumulative end-to-end execution latency.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.ExecutionLatencyMS, 10) }},
+		{"trpc_agent_tool_latency_milliseconds_total", "Cumulative tool call latency.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.ToolLatencyMS, 10) }},
+		{"trpc_agent_storage_latency_milliseconds_total", "Cumulative storage operation latency.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.StorageLatencyMS, 10) }},
+		{"trpc_agent_im_delivered_total", "Successful IM deliveries.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.IMDelivered, 10) }},
+		{"trpc_agent_im_failed_total", "Failed IM deliveries.", "counter", func(m TenantMetrics) string { return strconv.FormatInt(m.IMFailed, 10) }},
+	}
+	var output strings.Builder
+	for _, definition := range definitions {
+		output.WriteString("# HELP " + definition.name + " " + definition.help + "\n")
+		output.WriteString("# TYPE " + definition.name + " " + definition.metricType + "\n")
+		for _, tenantID := range tenantIDs {
+			output.WriteString(definition.name + "{tenant_id=" + strconv.Quote(tenantID) + "} " + definition.value(g.metrics[tenantID]) + "\n")
+		}
+	}
+	return output.String()
+}
+
 func (g *GovernanceCenter) QueryMetrics(query MetricsQuery) (TenantMetrics, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1309,6 +1373,7 @@ func addMetricDelta(metrics *TenantMetrics, delta TenantMetrics) {
 	metrics.Tokens += delta.Tokens
 	metrics.Cost += delta.Cost
 	metrics.ModelLatencyMS += delta.ModelLatencyMS
+	metrics.ExecutionLatencyMS += delta.ExecutionLatencyMS
 	metrics.ToolLatencyMS += delta.ToolLatencyMS
 	metrics.StorageLatencyMS += delta.StorageLatencyMS
 	metrics.IMDelivered += delta.IMDelivered

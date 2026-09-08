@@ -13,7 +13,7 @@ beforeEach(() => {
     if (path.startsWith("/api/v1/admin/governance/policy") && init?.method === "POST") return response({ tenant_id: "tenant-a", agent_app_id: "app-a", revision: 1, allowed_tools: ["search"], allowed_mcp: [], dangerous_tools: [], denied_input_patterns: [], denied_output_patterns: [], redacted_patterns: [], allowed_im_users: [], allowed_im_subjects: [], allowed_provider_accounts: [], allowed_conversation_types: [], token_budget: 100, cost_budget: 1, cost_per_token: 0.01, tool_costs: { search: 0.02 }, estimated_tokens_per_run: 10, rate_limit: 10, rate_window_seconds: 60, updated_at: "now" });
     if (path.startsWith("/api/v1/admin/governance/policy")) return new Response(JSON.stringify({ error: { code: "policy_not_found", message: "not found" } }), { status: 404, headers: { "Content-Type": "application/json" } });
     if (path.startsWith("/api/v1/admin/governance/audit")) return response({ items: [{ id: "audit-1", tenant_id: "tenant-a", decision: "policy.allowed", trace_id: "trace-1", request_id: "request-1", latency: 0, cost: 0, occurred_at: "now" }] });
-    if (path.startsWith("/api/v1/admin/governance/metrics")) return response({ tenant_id: "tenant-a", requests: 4, active_executions: 0, completed_executions: 3, failed_executions: 1, denied_requests: 1, rate_limited_requests: 2, tokens: 42, cost: 0.42, model_latency_ms: 20, tool_latency_ms: 7, storage_latency_ms: 3, im_delivered: 1, im_failed: 1 });
+    if (path.startsWith("/api/v1/admin/governance/metrics")) return response({ tenant_id: "tenant-a", requests: 4, active_executions: 0, completed_executions: 3, failed_executions: 1, denied_requests: 1, rate_limited_requests: 2, tokens: 42, cost: 0.42, model_latency_ms: 20, execution_latency_ms: 30, tool_latency_ms: 7, storage_latency_ms: 3, im_delivered: 1, im_failed: 1 });
     if (path === "/api/v1/admin/governance/confirmations") return response({ items: [] });
     if (path.startsWith("/api/v1/admin/governance/traces")) return response({ trace_id: "trace-1", tenant_id: "tenant-a", request_id: "request-1", session_id: "session-1", agent_app_id: "app-a", spans: [{ name: "gateway.receive", status: "ok", occurred_at: "now" }] });
     throw new Error(`unexpected request ${path}`);
@@ -43,6 +43,7 @@ test("manages policy and inspects audit metrics and traces", async () => {
   await user.click(screen.getByRole("button", { name: "指标与成本" }));
   expect(await screen.findByText("0.42")).toBeVisible();
 	expect(screen.getByText("Tool 延迟 ms")).toBeVisible();
+	expect(screen.getByText("执行延迟 ms")).toBeVisible();
 	expect(screen.getByText("IM 失败")).toBeVisible();
 	await user.selectOptions(screen.getByLabelText("Provider"), "telegram");
 	await user.click(screen.getByRole("button", { name: "查询指标" }));
