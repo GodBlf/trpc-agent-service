@@ -56,8 +56,18 @@ func (s *RedisStore) AppendSessionEvent(ctx context.Context, event SessionEvent)
 	stream := s.stream(event.TenantID, event.SessionID)
 	idem := s.idem(event.TenantID, event.SessionID)
 	signature := event.Type + "\x00" + string(event.Payload)
-	for attempts := 0; attempts < 8; attempts++ {
+	for attempts := 0; attempts < 32; attempts++ {
 		err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+			if err := s.checkMigration(ctx, tx, event.TenantID); err != nil {
+				return err
+			}
+			current, err := tx.Get(ctx, s.fence(event.TenantID, event.SessionID)).Uint64()
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+			if event.FencingToken > 0 && event.FencingToken < current && !importingMigration(ctx) {
+				return ErrStaleFencingToken
+			}
 			prior, err := tx.HGet(ctx, idem, event.IdempotencyKey).Result()
 			if err == nil {
 				if prior == signature {
@@ -84,12 +94,15 @@ func (s *RedisStore) AppendSessionEvent(ctx context.Context, event SessionEvent)
 				return err
 			}
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				if event.FencingToken > current {
+					pipe.Set(ctx, s.fence(event.TenantID, event.SessionID), strconv.FormatUint(event.FencingToken, 10), 0)
+				}
 				pipe.ZAdd(ctx, stream, redis.Z{Score: float64(event.Sequence), Member: encoded})
 				pipe.HSet(ctx, idem, event.IdempotencyKey, signature)
 				return nil
 			})
 			return err
-		}, stream, idem)
+		}, stream, idem, s.fence(event.TenantID, event.SessionID), s.migrationKey(event.TenantID))
 		if err == nil || errors.Is(err, ErrDuplicateEvent) {
 			return err
 		}
@@ -131,6 +144,9 @@ func (s *RedisStore) ListMemory(ctx context.Context, tenant, session string) ([]
 	return items, nil
 }
 func (s *RedisStore) PutMemory(ctx context.Context, m MemoryRecord) error {
+	if m.TenantID == "" || m.SessionID == "" || m.Key == "" {
+		return errors.New("platform: invalid memory record")
+	}
 	if m.ID == "" {
 		m.ID = m.TenantID + ":" + m.SessionID + ":" + m.Key
 	}
@@ -141,7 +157,10 @@ func (s *RedisStore) PutMemory(ctx context.Context, m MemoryRecord) error {
 	if err != nil {
 		return err
 	}
-	return s.client.HSet(ctx, s.memory(m.TenantID, m.SessionID), m.Key, encoded).Err()
+	return s.fencedWrite(ctx, m.TenantID, m.SessionID, m.FencingToken, func(pipe redis.Pipeliner) error {
+		pipe.HSet(ctx, s.memory(m.TenantID, m.SessionID), m.Key, encoded)
+		return nil
+	})
 }
 func (s *RedisStore) Health(ctx context.Context) BackendHealth {
 	status := "healthy"

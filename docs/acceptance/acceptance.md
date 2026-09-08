@@ -25,7 +25,7 @@ Stage 7 是本项目最后一个交付阶段，不存在后续验收阶段。验
 | 多租户、节点化、同步、多后端、IM、治理监控、恢复 | [`docs/architecture.md`](../architecture.md) | Stage 7 文档检查、Compose |
 | tenant/app/channel/session/event/memory/summary/audit 模型 | [`docs/data-model.md`](../data-model.md) | storage、governance、HTTP tests |
 | 至少两种 IM，含微信/企微 | 企业微信 WebSocket + Telegram long polling | provider runtime fixture tests |
-| 至少三类后端策略 | [`backend-adapters.md`](../backend-adapters.md) 的 SQL、Redis、向量、对象存储 | SQL/Redis tests；向量/S3 明确为设计 |
+| 至少三类后端策略 | [`backend-adapters.md`](../backend-adapters.md) 的 SQL、Redis、向量、对象存储 | SQL/Redis tests；Qdrant/MinIO 真实后端集成测试 |
 | 完整消息链与 trace/request | [`core-sequence-diagram.md`](../core-sequence-diagram.md)、Execution Manifest | remote worker、rich storage HTTP tests |
 | 至少八项生产风险 | [`production-risks.md`](../production-risks.md) | `verify-docs.sh` |
 | 上游复用与平台新增边界 | [`architecture.md`](../architecture.md) 第 1、2、7 节 | build、framework runtime tests |
@@ -48,6 +48,6 @@ Stage 7 是本项目最后一个交付阶段，不存在后续验收阶段。验
 
 ## 交付状态与限制
 
-比赛要求的参考实现和八份正式文档在 Stage 7 一并交付，入口见 [`docs/README.md`](../README.md)。S3、Qdrant、Milvus 是有一致性说明的适配器设计，不宣称已完成生产接入；Kubernetes 仍是部署指导。
+比赛要求的参考实现和八份正式文档在 Stage 7 一并交付，入口见 [`docs/README.md`](../README.md)。S3 Artifact 内容和 Qdrant Knowledge 索引已有可运行适配器及真实后端集成测试；Milvus、增量向量 outbox、对象孤儿自动回收和 Kubernetes 仍是设计或部署指导。
 
-PostgreSQL Control Plane 已共享 Tenant、Agent App、Deployment/Version、Channel Binding、Backend Selection、Governance Policy 和配置幂等状态。Compose 为可复现实验拓扑，Worker 的内部 Governance 请求固定使用 Gateway A；确认、执行中 Tool、预算计数、Audit 和 Platform Trace 等治理运行态仍由该实例持有并持久化到本地卷。真实生产多 Gateway 需要把这些运行态迁入共享事务存储，并为内部 Governance Service 提供高可用路由。该限制不影响 README 比赛环境中的共享配置、跨 Gateway Session fencing 和完整危险 Tool 恢复验收，但属于上线前必须完成的生产化工作。
+PostgreSQL Control Plane 已共享 Tenant、Agent App、Deployment/Version、Channel Binding、Backend Selection、Governance Policy 和配置幂等状态；Audit Event 也由两个 Gateway 共享 PostgreSQL。Compose 为可复现实验拓扑，Worker 的内部 Governance 请求固定使用 Gateway A；确认、执行中 Tool、预算计数和 Platform Trace 等治理运行态仍由该实例持有并持久化到本地卷。真实生产多 Gateway 需要把这些剩余运行态迁入共享事务存储，并为内部 Governance Service 提供高可用路由。该限制不影响 README 比赛环境中的共享配置、跨 Gateway Session fencing 和完整危险 Tool 恢复验收，但属于上线前必须完成的生产化工作。

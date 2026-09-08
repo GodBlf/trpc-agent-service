@@ -1591,7 +1591,10 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 			_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":delta", "message.delta", payload)
 		}
 		payload := h.chatIdentityPayload(options, map[string]string{"output": output})
-		_ = h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", "message.completed", payload)
+		if err := h.appendChatEvent(ctx, store, options.tenant.TenantID, options.sessionID, options.requestID+":completed", "message.completed", payload); err != nil {
+			h.finishChatStorageFailure(store, options, governanceRequest, err)
+			return
+		}
 		if err := store.PutMemory(ctx, MemoryRecord{
 			TenantID: options.tenant.TenantID, SessionID: options.sessionID,
 			Key: "latest_agent_reply", Value: output, FencingToken: options.fencingToken,
@@ -1625,10 +1628,19 @@ func (h *AdminHandler) runChat(ctx context.Context, store DataStore, options cha
 		if artifactErr != nil {
 			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
 			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":artifact-failed", "artifact.publication.failed", h.chatIdentityPayload(options, map[string]string{"error": "artifact publication failed"}))
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "artifact publication failed"}))
 			cancel()
 			return
 		}
 		if err := h.governance.RecordSpan(governanceRequest, options.traceID, "storage.artifact.publish", "ok"); err != nil {
+			return
+		}
+	}
+	if sawCompleted {
+		if err := h.updateSessionSummary(ctx, store, options); err != nil {
+			terminalCtx, cancel := context.WithTimeout(h.failureCtx, 2*time.Second)
+			_ = h.appendCriticalChatEvent(terminalCtx, store, options.tenant.TenantID, options.sessionID, options.requestID+":terminal", "run.failed", h.chatIdentityPayload(options, map[string]string{"error": "summary write failed"}))
+			cancel()
 			return
 		}
 	}
@@ -1720,8 +1732,20 @@ func (h *AdminHandler) cancelSupersededChatRuns(ctx context.Context, store DataS
 }
 
 func contextualAgentInput(ctx context.Context, store DataStore, options chatRunOptions) (string, error) {
-	sections := make([]string, 0, 2)
+	sections := make([]string, 0, 3)
+	state, stateErr := store.GetSessionState(ctx, options.tenant.TenantID, options.sessionID)
+	if stateErr != nil && !errors.Is(stateErr, ErrNotFound) {
+		return "", stateErr
+	}
+	if state.Summary != "" {
+		sections = append(sections, "Session summary:\n"+state.Summary)
+	}
 	memory, err := store.ListMemory(ctx, options.tenant.TenantID, options.sessionID)
+	if contextual, ok := store.(interface {
+		ContextMemory(context.Context, string, string) ([]MemoryRecord, error)
+	}); ok {
+		memory, err = contextual.ContextMemory(ctx, options.tenant.TenantID, options.sessionID)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1734,6 +1758,11 @@ func contextualAgentInput(ctx context.Context, store DataStore, options chatRunO
 	}
 	if knowledge, ok := store.(KnowledgeStore); ok {
 		records, err := knowledge.ListKnowledge(ctx, options.tenant.TenantID, options.appID)
+		if searchable, ok := store.(interface {
+			SearchKnowledge(context.Context, string, string, string) ([]KnowledgeRecord, error)
+		}); ok {
+			records, err = searchable.SearchKnowledge(ctx, options.tenant.TenantID, options.appID, options.input)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -1950,6 +1979,8 @@ func writeStorageError(w http.ResponseWriter, err error) {
 	}
 	code := storageFailureError(err).Error()
 	switch code {
+	case "tenant_storage_migrating":
+		writeError(w, http.StatusServiceUnavailable, code, "tenant storage is temporarily read-only during migration")
 	case "storage_timeout":
 		writeError(w, http.StatusGatewayTimeout, code, "storage operation timed out")
 	case "request_cancelled":
@@ -2014,6 +2045,9 @@ func newRequestID() string {
 }
 
 func storageFailureError(err error) error {
+	if errors.Is(err, ErrTenantMigrating) {
+		return errors.New("tenant_storage_migrating")
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return errors.New("storage_timeout")
 	}
@@ -2056,6 +2090,8 @@ func writeChatStartError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusRequestTimeout, "request_cancelled", "request was cancelled")
 	case "service_closing":
 		writeError(w, http.StatusServiceUnavailable, "service_closing", "service is closing")
+	case "tenant_storage_migrating":
+		writeError(w, http.StatusServiceUnavailable, "tenant_storage_migrating", "tenant storage is temporarily read-only during migration")
 	case "storage_unavailable":
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "storage is unavailable")
 	case "control_plane_unavailable":

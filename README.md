@@ -167,7 +167,7 @@ npm run dev
 当前代码已覆盖 Stage 7 最终可运行验收范围：
 
 - **多租户管理**：Development Identity、租户切换、Agent 应用、部署版本与状态流转、Gateway/Worker 状态。
-- **存储与数据管理**：租户级 InMemory/Redis/SQLite/PostgreSQL 后端选择、事件回放、迁移与数据检查页面。
+- **存储与数据管理**：租户级 Backend Profile 可分别路由 Session/Summary、Memory、Knowledge 和 Artifact，支持 InMemory/Redis/SQLite/PostgreSQL、Qdrant Knowledge 索引、S3 Artifact 内容、外部 Memory、事件回放、迁移与数据检查页面。
 - **Chat Workspace**：在 Management Console 中创建/打开租户隔离 Session、读取后端历史、发送消息、取消运行、失败重试和刷新恢复；浏览器仅保存最近打开的 Session ID，不保存会话历史。
 - **Mock IM 通道**：提供租户/Session 绑定、HMAC 回调验签、用户与会话映射、消息去重、provider sequence 乱序拒绝、回复投递和可配置故障注入。
 - **真实 IM Provider**：Telegram Bot 使用 long polling/`sendMessage`，企微 API 模式智能机器人使用 WebSocket `aibot_subscribe`/`aibot_msg_callback`/`aibot_respond_msg`；两者通过持久化 Bot Tenant Allowlist 进行租户与 Agent App 路由。

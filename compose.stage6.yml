@@ -50,6 +50,7 @@ services:
       TRPC_REDIS_ADDR: redis:6379
       TRPC_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
       TRPC_CONTROL_PLANE_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
+      TRPC_AUDIT_POSTGRES_DSN: postgres://trpc:trpc@postgres:5432/trpc_agent?sslmode=disable
       TRPC_SQLITE_PATH: /data/stage6.db
       TRPC_FAULT_INJECTION: "1"
       TRPC_BACKEND_SELECTIONS: /data/backend-selections.json

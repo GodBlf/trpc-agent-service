@@ -60,4 +60,4 @@ Session Event 是运行数据事实源，Session State 与 Summary 是可重建�
 
 当前参考实现已经覆盖 SQLite/PostgreSQL Control Plane，InMemory/Redis/SQLite/PostgreSQL Session/Memory，SQL Artifact/Knowledge 元数据，InMemory/PostgreSQL Run Coordinator，OpenAI-compatible Chat Completions 与 Responses，签名远程 Worker，内部 Tool 治理，Telegram 与企业微信 Provider，SSE、审计、指标、Trace、灰度回滚和有界关闭。源码和测试入口见[GitHub 实现代码详解](implementation-details.md)。
 
-S3 对象内容、Qdrant/Milvus 向量索引和 Kubernetes 清单仍是设计边界。治理确认、预算、Audit 和 Trace 的现有实现仍可配置本地持久化；若部署为多副本，需将治理运行态统一接入共享事务存储。Run Coordinator 的 PostgreSQL 适配器、共享 Provider Route 和 Session fencing 已不依赖 sticky placement；危险 Tool owner loss 仍保持 `outcome_unknown`，禁止自动 replay。
+S3 Artifact 对象内容和 Qdrant Knowledge 向量索引已有运行适配器；Milvus、增量向量 outbox、对象孤儿自动回收和 Kubernetes 清单仍是设计边界。Audit Event 可接入共享 PostgreSQL；治理确认、预算和 Trace 的现有实现仍可配置本地持久化，部署为多副本时需将这些剩余运行态统一接入共享事务存储。Run Coordinator 的 PostgreSQL 适配器、共享 Provider Route 和 Session fencing 已不依赖 sticky placement；危险 Tool owner loss 仍保持 `outcome_unknown`，禁止自动 replay。

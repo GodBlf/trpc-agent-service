@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -15,10 +16,11 @@ import (
 // SessionState is the materialized, tenant-scoped view of a Session.
 type SessionState struct {
 	Session
-	Summary            string    `json:"summary"`
-	EventCount         int       `json:"event_count"`
-	ProjectionSequence uint64    `json:"projection_sequence"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	SummarySourceSequence uint64    `json:"summary_source_sequence"`
+	Summary               string    `json:"summary"`
+	EventCount            int       `json:"event_count"`
+	ProjectionSequence    uint64    `json:"projection_sequence"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 type MemoryRecord struct {
@@ -132,6 +134,13 @@ func materializeSession(tenant, session string, events []SessionEvent) (SessionS
 		state.UpdatedAt = event.OccurredAt
 		if event.Type == "summary" {
 			state.Summary = string(event.Payload)
+			var projection summaryProjection
+			if json.Unmarshal(event.Payload, &projection) == nil && projection.SourceSequence > 0 {
+				if projection.SourceSequence >= event.Sequence {
+					return SessionState{}, errors.New("platform: invalid summary checkpoint")
+				}
+				state.Summary, state.SummarySourceSequence = projection.Text, projection.SourceSequence
+			}
 		}
 	}
 	return state, nil
@@ -147,7 +156,7 @@ func (s *InMemoryStore) AppendSessionEvent(ctx context.Context, event SessionEve
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	stream := storageSessionKey(event.TenantID, event.SessionID)
-	if event.FencingToken > 0 && event.FencingToken < s.fences[stream] {
+	if event.FencingToken > 0 && event.FencingToken < s.fences[stream] && !importingMigration(ctx) {
 		return ErrStaleFencingToken
 	}
 	if event.FencingToken > s.fences[stream] {
@@ -217,7 +226,7 @@ func (s *InMemoryStore) PutMemory(ctx context.Context, item MemoryRecord) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	stream := storageSessionKey(item.TenantID, item.SessionID)
-	if item.FencingToken > 0 && item.FencingToken < s.fences[stream] {
+	if item.FencingToken > 0 && item.FencingToken < s.fences[stream] && !importingMigration(ctx) {
 		return ErrStaleFencingToken
 	}
 	if item.FencingToken > s.fences[stream] {

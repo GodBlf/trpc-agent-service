@@ -51,7 +51,7 @@ Governance Policy 覆盖 Tool/MCP allowlist、输入输出 Guardrail、外部主
 
 Control Plane 在 SQLite/PostgreSQL 中保存带 revision 的序列化配置状态；PostgreSQL 额外保存 `session_execution_leases`。业务 SQL Store 创建 `session_events`、`session_memory`、`artifacts` 和 `knowledge_records`，主键都包含 Tenant。`session_events` 额外对幂等键建唯一约束。
 
-`control-migrate` 是生产 schema 前置命令，服务启动只验证已迁移版本。`storage-migrate` 按 Tenant 迁移 Session Event 和 Memory，支持 dry-run、checkpoint、checksum 和恢复。向量 generation/outbox 与 S3 两阶段内容发布在当前交付中是设计方案，尚无 Qdrant、Milvus 或 S3 客户端实现。
+`control-migrate` 是生产 schema 前置命令，服务启动只验证已迁移版本。`storage-migrate` 按 Tenant 迁移 Session Event、Memory、Artifact metadata 和 Knowledge，支持 dry-run、checkpoint、checksum、恢复、源冻结和原子路由切换。Qdrant generation 可从权威 Knowledge 重建；S3 兼容对象存储在内容 checksum 校验成功后发布 Artifact metadata。增量向量 outbox、Milvus 客户端、对象孤儿自动回收仍是后续生产扩展。
 
 ## 6. Management Console 与部署
 
@@ -70,8 +70,8 @@ Stage 7 Compose 先运行 PostgreSQL Control Plane migration，再启动 Worker�
 | Tool/Guardrail/预算/确认 | 已实现 | Runner 调用点治理，`outcome_unknown` 禁止自动重放 |
 | Artifact/Knowledge | 部分实现 | SQL/InMemory 元数据和权威内容已实现 |
 | Telemetry | 已实现参考能力 | Audit、Tenant metrics、Platform Trace；外部 Collector 为部署扩展 |
-| Qdrant/Milvus | 仅设计 | 有隔离、generation、迁移与重建策略，无生产客户端 |
-| S3 对象内容 | 仅设计 | 有两阶段发布和恢复策略，无生产客户端 |
+| Qdrant/Milvus | Qdrant 已接入，Milvus 仅设计 | Tenant/generation collection、metadata 双重过滤、确定性 ID、重建命令和真实 Qdrant 集成测试 |
+| S3 对象内容 | 已接入 | 版本、checksum、Tenant 引用校验和真实 MinIO 集成测试；孤儿自动回收待扩展 |
 | Kubernetes | 仅指导 | 当前可执行交付为 Docker Compose |
 | 多 Gateway 共享治理运行态 | 生产待补 | Compose 将 Worker Governance 请求固定路由 Gateway A |
 

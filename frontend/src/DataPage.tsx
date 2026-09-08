@@ -72,7 +72,7 @@ export function DataPage({ identity }: { identity: Identity }) {
   };
   const createMigration = async () => {
     try {
-      setMigration(await api.migrate({ dry_run: dryRun, batch_size: 100 }));
+      setMigration(await api.migrate({ dry_run: dryRun, batch_size: 100, cutover: !dryRun }));
     } catch { setActionFailed(true); }
   };
 
@@ -89,9 +89,9 @@ export function DataPage({ identity }: { identity: Identity }) {
       {canConfigure && <button className="primary" onClick={() => void createMigration()}><Database aria-hidden="true" />启动迁移</button>}
     </div>
     {actionFailed && <div className="migration-state failed">操作失败，请重试</div>}
-    {migration && <div className={`migration-state ${migration.status}`}>迁移 {migration.status}：Session {migration.processed_sessions || 0} / {migration.sessions || 0}，记录 {migration.source_count} / {migration.destination_count} {migration.message}</div>}
+    {migration && <div className={`migration-state ${migration.status}`}>迁移 {migration.status}：Session {migration.processed_sessions || 0} / {migration.sessions || 0}，记录 {migration.source_count} / {migration.destination_count}{migration.matched === true ? "，校验一致" : migration.matched === false ? "，存在差异" : ""} {migration.message}</div>}
     <div className="data-grid">
-      <DataPanel title="Session / Summary">{sessionFailed ? <AsyncState kind="error" /> : session ? <dl><dt>事件数</dt><dd>{session.event_count}</dd><dt>序列</dt><dd>{session.sequence}</dd><dt>Summary</dt><dd>{session.summary || "暂无"}</dd></dl> : <AsyncState kind="empty" />}</DataPanel>
+      <DataPanel title="Session / Summary">{sessionFailed ? <AsyncState kind="error" /> : session ? <dl><dt>事件数</dt><dd>{session.event_count}</dd><dt>序列</dt><dd>{session.sequence}</dd><dt>摘要检查点</dt><dd>{session.summary_source_sequence || 0}</dd><dt>Summary</dt><dd>{session.summary || "暂无"}</dd></dl> : <AsyncState kind="empty" />}</DataPanel>
       <DataPanel title="Session Events">{eventsFailed ? <AsyncState kind="error" /> : events.length ? <ol className="event-list">{events.map((event) => <li key={event.id}><code>#{event.sequence}</code> {event.type}<span>{event.payload}</span></li>)}</ol> : <AsyncState kind="empty" />}</DataPanel>
       <DataPanel title="Memory">{memoryFailed ? <AsyncState kind="error" /> : memory.length ? <dl>{memory.map((item) => <div key={item.id}><dt>{item.key}</dt><dd>{item.value}</dd></div>)}</dl> : <AsyncState kind="empty" />}</DataPanel>
     </div>

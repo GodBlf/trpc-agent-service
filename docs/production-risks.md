@@ -29,6 +29,6 @@
 
 ## 4. 当前已知生产限制
 
-当前 Compose 的内部 Governance 请求固定使用 Gateway A；确认、执行中 Tool、预算计数、Audit 和 Platform Trace 等运行态尚未全部迁入多 Gateway 共享事务存储。该限制不影响比赛拓扑的确定性验收，但生产高可用部署必须先完成共享 Governance Store 和内部 Service 路由。
+当前 Compose 已把 Audit Event 写入共享 PostgreSQL，两个 Gateway 的查询可立即看到同一审计事实。内部 Governance 请求仍固定使用 Gateway A；确认、执行中 Tool、预算计数和 Platform Trace 等运行态尚未全部迁入多 Gateway 共享事务存储。该限制不影响比赛拓扑的确定性验收，但生产高可用部署仍需完成其余 Governance 状态共享和内部 Service 路由。
 
-Qdrant/Milvus、S3 和 Kubernetes 只有设计方案，不应以“已接入”方式对外承诺。Production Identity 当前参考实现使用 HS256 JWT 和服务端 Identity Directory，托管 OIDC、企业密钥管理、告警值班和异地容灾属于部署方上线工作。
+Qdrant Knowledge 索引和 S3 Artifact 内容已提供适配及真实后端集成测试；Milvus、Knowledge 原文件、增量向量 outbox、对象孤儿自动回收和 Kubernetes 仍只有设计或扩展边界，不应以“已完成”方式对外承诺。Production Identity 当前参考实现使用 HS256 JWT 和服务端 Identity Directory，托管 OIDC、企业密钥管理、告警值班和异地容灾属于部署方上线工作。

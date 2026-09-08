@@ -118,6 +118,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("governance state: %v", err)
 	}
+	if dsn := os.Getenv("TRPC_AUDIT_POSTGRES_DSN"); dsn != "" {
+		auditStore, err := platform.NewPostgresStore(dsn)
+		if err != nil {
+			log.Fatal("audit store unavailable")
+		}
+		defer auditStore.Close()
+		governance.ConfigureAuditStore(auditStore)
+	}
 	admin.ConfigureGovernance(governance)
 	switch authMode := os.Getenv("TRPC_AUTH_MODE"); authMode {
 	case "", "development":
@@ -180,6 +188,9 @@ func main() {
 		admin.ConfigureRunCoordinator(runCoordinator)
 	}
 	admin.ConfigureBackendCatalog(os.Getenv("TRPC_REDIS_ADDR"), os.Getenv("TRPC_SQLITE_PATH"))
+	if err := admin.ConfigureBackendProfiles(os.Getenv("TRPC_BACKEND_PROFILES")); err != nil {
+		log.Fatal("invalid backend profiles")
+	}
 	admin.ConfigurePostgresBackend(os.Getenv("TRPC_POSTGRES_DSN"))
 	admin.ConfigureMigration(os.Getenv("TRPC_MIGRATION_REDIS_ADDR"), os.Getenv("TRPC_MIGRATION_SQLITE_PATH"), os.Getenv("TRPC_MIGRATION_CHECKPOINT_PATH"))
 	var routes *platform.BotTenantAllowlist

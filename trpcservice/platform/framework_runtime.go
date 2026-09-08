@@ -392,7 +392,12 @@ func (a *FrameworkRunnerAdapter) RunEvents(ctx context.Context, request RunnerRe
 		}
 		return nil, errors.New("framework_runtime_closed")
 	}
-	upstream, err := runner.Run(runCtx, request.UserID, request.SessionID, model.NewUserMessage(request.Input), frameworkagent.WithRequestID(request.RequestID), frameworkagent.WithExecutionTraceEnabled(true))
+	// Platform Session Events and Summary are the shared source of conversation
+	// context. Give the upstream runner a request-scoped session so its default
+	// in-memory session service cannot make behavior depend on which Worker was
+	// selected or retain duplicate history after a cross-node retry.
+	upstreamSessionID := request.SessionID + ":" + request.RequestID
+	upstream, err := runner.Run(runCtx, request.UserID, upstreamSessionID, model.NewUserMessage(request.Input), frameworkagent.WithRequestID(request.RequestID), frameworkagent.WithExecutionTraceEnabled(true))
 	if err != nil {
 		a.unregisterRun(ref, runID)
 		cancel()

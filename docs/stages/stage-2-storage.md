@@ -37,5 +37,7 @@ The command migrates in deterministic Session order, retries transient writes, p
 - Session and Summary state is rebuilt from immutable events; events cannot be updated through the API.
 - Migration and backend-selection failures expose stable public error codes and sanitized messages; driver, network, and filesystem diagnostics remain internal.
 - The data page remounts on Tenant Context changes and renders backend health independently of Session, Event, and Memory load failures.
-- Arbitrary SQL, destructive event editing, vector/object vendor migration, and online provider cutover are excluded.
+- Arbitrary SQL and destructive event editing are excluded. Redis-to-SQL supports source freezing, complete validation, and optional atomic cutover; Qdrant generations can be rebuilt from authoritative Knowledge; S3 Artifact content uses version and checksum validation. Cross-provider incremental outbox and automatic cleanup remain production extensions.
 - Redis and PostgreSQL integration profiles require the explicitly documented environment variables; local unit tests use deterministic isolated providers.
+
+Backend Profile, S3, Qdrant, Mem0, and shared Audit Store configuration is documented in [the backend adapter guide](../backend-adapters.md). A real local integration profile is available in `compose.data.yml`.

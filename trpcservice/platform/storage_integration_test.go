@@ -2,7 +2,10 @@ package platform
 
 import (
 	"context"
+	"database/sql"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,5 +42,53 @@ func TestPostgreSQLCompatibilityProfile(t *testing.T) {
 	events, err := store.ListSessionEvents(context.Background(), tenant, session, 0)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("events=%#v err=%v", events, err)
+	}
+}
+
+func TestPostgreSQLConcurrentStorageInitialization(t *testing.T) {
+	dsn := os.Getenv("TRPC_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TRPC_TEST_POSTGRES_DSN is not set")
+	}
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := "storage_init_" + stableID(time.Now().UTC().String())
+	if _, err := admin.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`) })
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	scopedDSN := dsn + separator + "search_path=" + schema
+	if !strings.Contains(dsn, "://") {
+		scopedDSN = dsn + " search_path=" + schema
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store, err := NewPostgresStore(scopedDSN)
+			if err == nil {
+				err = store.Close()
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

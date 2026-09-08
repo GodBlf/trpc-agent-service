@@ -60,22 +60,43 @@ func (s *SQLStore) q(query string) string {
 	return b.String()
 }
 func (s *SQLStore) init(ctx context.Context) error {
+	var schemaTx *sql.Tx
+	execer := interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	}(s.db)
+	if s.backend == "postgres" {
+		var err error
+		schemaTx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer schemaTx.Rollback()
+		// CREATE TABLE IF NOT EXISTS is not safe when multiple PostgreSQL
+		// sessions create the same relation concurrently. Serialize the small
+		// compatibility bootstrap used by independently starting Gateways.
+		if _, err := schemaTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(0x5452504353544f52)); err != nil {
+			return err
+		}
+		execer = schemaTx
+	}
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS audit_events (tenant_id TEXT NOT NULL, audit_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(tenant_id,audit_id))`,
+		`CREATE TABLE IF NOT EXISTS session_write_fences (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, fencing_token BIGINT NOT NULL, PRIMARY KEY(tenant_id,session_id))`,
 		`CREATE TABLE IF NOT EXISTS session_events (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, sequence BIGINT NOT NULL, event_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_type TEXT NOT NULL, payload BYTEA NOT NULL, occurred_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, session_id, sequence), UNIQUE (tenant_id, session_id, idempotency_key))`,
 		`CREATE TABLE IF NOT EXISTS session_memory (tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, memory_key TEXT NOT NULL, memory_id TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, session_id, memory_key))`,
 		`CREATE TABLE IF NOT EXISTS artifacts (tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, session_id TEXT NOT NULL, name TEXT NOT NULL, content_reference TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', trace_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, fencing_token BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, artifact_id))`,
 		`CREATE TABLE IF NOT EXISTS knowledge_records (tenant_id TEXT NOT NULL, knowledge_id TEXT NOT NULL, agent_app_id TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, index_status TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, knowledge_id))`,
 	}
 	if s.backend == "sqlite" {
-		statements[0] = strings.Replace(statements[0], "BYTEA", "BLOB", 1)
+		statements[2] = strings.Replace(statements[2], "BYTEA", "BLOB", 1)
 	}
 	for _, stmt := range statements {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := execer.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
 	if s.backend == "postgres" {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE session_events ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`); err != nil {
+		if _, err := execer.ExecContext(ctx, `ALTER TABLE session_events ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 		for _, statement := range []string{
@@ -85,10 +106,11 @@ func (s *SQLStore) init(ctx context.Context) error {
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'`,
 			`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0`,
 		} {
-			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			if _, err := execer.ExecContext(ctx, statement); err != nil {
 				return err
 			}
 		}
+		return schemaTx.Commit()
 	} else {
 		if err := s.ensureSQLiteColumn(ctx, "session_memory", "fencing_token", "BIGINT NOT NULL DEFAULT 0"); err != nil {
 			return err
@@ -141,6 +163,9 @@ func (s *SQLStore) GetSessionState(ctx context.Context, tenant, session string) 
 	return materializeSession(tenant, session, events)
 }
 func (s *SQLStore) AppendSessionEvent(ctx context.Context, event SessionEvent) error {
+	if event.Payload == nil {
+		event.Payload = []byte{}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -255,14 +280,37 @@ func (s *SQLStore) PutMemory(ctx context.Context, m MemoryRecord) error {
 }
 
 func (s *SQLStore) validateFencingToken(ctx context.Context, tx *sql.Tx, tenantID, sessionID string, token uint64) error {
-	if s.backend != "postgres" || token == 0 {
+	if token == 0 {
 		return nil
 	}
+	// PostgreSQL deployments may share the authoritative execution lease table.
+	// Independently routed databases still fence using their local generation.
+	if importingMigration(ctx) {
+		_, err := tx.ExecContext(ctx, s.q(`INSERT INTO session_write_fences(tenant_id,session_id,fencing_token) VALUES(?,?,?) ON CONFLICT(tenant_id,session_id) DO UPDATE SET fencing_token=CASE WHEN session_write_fences.fencing_token<excluded.fencing_token THEN excluded.fencing_token ELSE session_write_fences.fencing_token END`), tenantID, sessionID, token)
+		return err
+	}
+	if s.backend == "postgres" {
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT to_regclass('session_execution_leases') IS NOT NULL`).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			var current uint64
+			err := tx.QueryRowContext(ctx, `SELECT fencing_token FROM session_execution_leases WHERE tenant_id=$1 AND session_id=$2 FOR SHARE`, tenantID, sessionID).Scan(&current)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil && current != token {
+				return ErrStaleFencingToken
+			}
+		}
+	}
 	var current uint64
-	if err := tx.QueryRowContext(ctx, `SELECT fencing_token FROM session_execution_leases WHERE tenant_id=$1 AND session_id=$2`, tenantID, sessionID).Scan(&current); err != nil || current != token {
+	err := tx.QueryRowContext(ctx, s.q(`INSERT INTO session_write_fences(tenant_id,session_id,fencing_token) VALUES(?,?,?) ON CONFLICT(tenant_id,session_id) DO UPDATE SET fencing_token=excluded.fencing_token WHERE session_write_fences.fencing_token<=excluded.fencing_token RETURNING fencing_token`), tenantID, sessionID, token).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrStaleFencingToken
 	}
-	return nil
+	return err
 }
 func (s *SQLStore) Health(ctx context.Context) BackendHealth {
 	status := "healthy"
