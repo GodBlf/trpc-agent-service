@@ -78,4 +78,4 @@ session_id = "im-" + hex(SHA-256(provider + NUL + provider_account + NUL + exter
 
 ## 6. 测试与验收证据
 
-自动化 fixture 覆盖 Telegram polling/回复/429 重试、企业微信 WebSocket 认证/心跳/回复确认/重连、账号路由、重复与乱序、非文本拒绝、Session 确定性和服务关闭。真实凭据 smoke 属于显式本地操作，常规 CI 不消费真实消息或额度。
+自动化 fixture 覆盖 Telegram polling/回复/429 重试、企业微信 WebSocket 认证/心跳/回复确认/重连、账号路由、重复与乱序、非文本拒绝、Session 确定性和服务关闭。真实凭据 smoke 属于显式本地操作，常规 CI 不消费真实消息或额度。2026-09-09 已分别完成 Telegram 与企业微信真人客户端的真实消息、真实模型和 Provider 回复回环，非敏感结果见 [`acceptance/live-im-smoke-2026-09-09.md`](acceptance/live-im-smoke-2026-09-09.md)。

@@ -12,7 +12,7 @@
 
 - [x] 架构方案覆盖多租户、节点化部署、数据同步、多后端支持、IM 接入、治理监控和故障恢复。证据：[`architecture.md`](../architecture.md)；Stage 7 Compose 验收通过。
 - [x] 数据模型表达 tenant、agent、channel binding、session、event、memory、summary、audit log 的关系。证据：[`data-model.md`](../data-model.md) 的“所有权与主键”和“关系”。
-- [x] 说明并实现至少两种 IM 通道，其中包含企业微信。证据：企业微信智能机器人 WebSocket 与 Telegram long polling，见 [`stage-4-im.md`](../stages/stage-4-im.md)；对应 provider runtime 测试通过。
+- [x] 说明并实现至少两种 IM 通道，其中包含企业微信。证据：企业微信智能机器人 WebSocket 与 Telegram long polling，见 [`stage-4-im.md`](../stages/stage-4-im.md)；对应 provider runtime 测试通过，且 [`2026-09-09 真实消息 smoke`](live-im-smoke-2026-09-09.md) 已完成两种客户端回环。
 - [x] 说明至少三类后端的数据存储和同步策略。证据：[`backend-adapters.md`](../backend-adapters.md) 与 [`data-sync-idempotency.md`](../data-sync-idempotency.md)。
 - [x] 给出包含 `request_id`、`trace_id` 和 W3C `traceparent` 的完整消息时序。证据：[`core-sequence-diagram.md`](../core-sequence-diagram.md)；远程 Worker identity/trace/version 测试通过。
 - [x] 列出不少于 8 个生产风险及缓解措施。证据：[`production-risks.md`](../production-risks.md) 共列出 12 项。
@@ -55,8 +55,9 @@
 - [x] README 关键纵向测试通过，包括 SQLite 重启、Chat Completions/Responses、远程 Worker、Execution Manifest、Session Lease、治理恢复和 Memory/Knowledge/Artifact/Trace。
 - [x] 文档自动检查通过：交付文件、两张 Mermaid 图、企业微信、风险数量、多后端说明及最终阶段声明均满足断言。
 - [x] 双 Gateway Compose 验收通过。
+- [x] Telegram 与企业微信真实客户端消息、真实模型和 Provider 回复回环通过；凭据和外部身份未写入证据。
 - [x] 受审实现基线证据已生成：`.scratch/evidence/stage7-0629c3eb01a0f55d11e99ad4d859bea8129a57b5-schema-1.json`。
 
 ## 审查边界
 
-本次“通过”只表示对应单项有 README、代码或自动化证据支撑；未列入的要求不视为通过，也不代表主办方尚未公布的规则已被确认。真实模型与真实外部 IM 凭据 smoke 未纳入自动化通过项；S3 Artifact 内容和 Qdrant Knowledge 索引已有真实后端集成测试，Milvus、增量向量 outbox、对象孤儿自动回收和 Kubernetes 仍是设计或部署指导。
+本次“通过”只表示对应单项有 README、代码、自动化或显式人工 smoke 证据支撑；未列入的要求不视为通过，也不代表主办方尚未公布的规则已被确认。真实模型与真实外部 IM 凭据 smoke 不属于自动化通过项；2026-09-09 两种真实 IM 已人工执行成功，后续提交仍需单独复验。S3 Artifact 内容和 Qdrant Knowledge 索引已有真实后端集成测试，Milvus、增量向量 outbox、对象孤儿自动回收和 Kubernetes 仍是设计或部署指导。

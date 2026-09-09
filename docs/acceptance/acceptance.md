@@ -18,13 +18,15 @@ Stage 7 是本项目最后一个交付阶段，不存在后续验收阶段。验
 
 脚本读取被 Git 忽略的 `.env.local`，要求 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL=gpt-5.6-luna`，不会打印或写入这些值。常规 CI 使用本地 OpenAI-compatible fixture，不消费真实额度。
 
+真实 IM smoke 同样与自动化 fixture 分开。2026-09-09 已用真人 Telegram 和企业微信客户端分别完成一次真实消息、真实模型和 Provider 回复回环；非敏感证据见 [`live-im-smoke-2026-09-09.md`](live-im-smoke-2026-09-09.md)。该结果不进入常规 CI，复验需要显式使用真实凭据和外部客户端。
+
 ## README 对照
 
 | README 验收要求 | 实现/设计证据 | 自动断言 |
 | --- | --- | --- |
 | 多租户、节点化、同步、多后端、IM、治理监控、恢复 | [`docs/architecture.md`](../architecture.md) | Stage 7 文档检查、Compose |
 | tenant/app/channel/session/event/memory/summary/audit 模型 | [`docs/data-model.md`](../data-model.md) | storage、governance、HTTP tests |
-| 至少两种 IM，含微信/企微 | 企业微信 WebSocket + Telegram long polling | provider runtime fixture tests |
+| 至少两种 IM，含微信/企微 | 企业微信 WebSocket + Telegram long polling；[`2026-09-09 真实消息 smoke`](live-im-smoke-2026-09-09.md) | provider runtime fixture tests；真实客户端回环 |
 | 至少三类后端策略 | [`backend-adapters.md`](../backend-adapters.md) 的 SQL、Redis、向量、对象存储 | SQL/Redis tests；Qdrant/MinIO 真实后端集成测试 |
 | 完整消息链与 trace/request | [`core-sequence-diagram.md`](../core-sequence-diagram.md)、Execution Manifest | remote worker、rich storage HTTP tests |
 | 至少八项生产风险 | [`production-risks.md`](../production-risks.md) | `verify-docs.sh` |
