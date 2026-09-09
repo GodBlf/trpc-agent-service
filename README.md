@@ -137,6 +137,42 @@
     `-- workspace          # 工作目录，包含本地、容器等沙箱环境
 ```
 
+## 真实模型与 IM 凭据配置
+
+需要联调真实模型、Telegram Bot 或企业微信智能机器人时，先从仓库模板创建本地配置：
+
+```bash
+cp .env.example .env.local
+```
+
+编辑 `.env.local`，填写以下七个环境变量：
+
+```bash
+# Telegram Bot
+TRPC_TELEGRAM_BOT_USERNAME=
+TRPC_TELEGRAM_BOT_TOKEN=
+
+# 企业微信 API 模式智能机器人
+TRPC_WECOM_BOT_ID=
+TRPC_WECOM_BOT_SECRET=
+
+# OpenAI-compatible model
+OPENAI_BASE_URL=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.6-luna
+```
+
+Telegram 的 username 和 token 从 [BotFather](https://t.me/BotFather) 创建的 Bot 获取，username 不包含开头的 `@`。企业微信使用 API 模式智能机器人的 BotID 和长连接 Secret，不使用自建应用的 CorpID、AgentID、应用 Secret、Access Token、EncodingAESKey 或 HTTP 回调配置。模型配置支持 OpenAI-compatible 服务；`OPENAI_MODEL` 应填写该服务实际提供的模型名，运行 `stage7-live-model-smoke.sh` 时必须为 `gpt-5.6-luna`。
+
+`./start.sh` 会自动加载根目录 `.env.local`。该文件包含真实密钥，已被 `.gitignore` 忽略，任何情况下都不得提交；可提交的 `.env.example` 只能保留空值和说明。
+
+最短真实消息验收流程：
+
+1. 准备外部 subject：Telegram 私聊使用数字 `chat_id`（也可用 sender user ID 回退），企业微信单聊使用成员 `userid`。
+2. 执行 `./build.sh && ./start.sh`，打开 `http://127.0.0.1:8080/`；先创建并激活一个真实模型 Deployment，再在“IM 通道”中把外部 subject 绑定到目标 Tenant 和 Agent App，确认对应 Provider 为 `connected`。
+3. 从 Telegram 或企业微信真人客户端向 Bot 发送一条唯一测试文本，确认客户端收到 Agent 回复，并在“IM 通道”中看到 `delivered`，在 Session/Audit 中看到同一 `request_id` 对应的 `channel.reply` 和 `run.completed`。
+4. 验收结束后执行 `./stop.sh`。本项目 2026-09-09 的非敏感实测证据见 [真实 IM 消息 Smoke 记录](docs/acceptance/live-im-smoke-2026-09-09.md)，更详细的 Provider 配置与路由说明见 [Stage 4 IM Providers](docs/stages/stage-4-im.md)。
+
 ## 快速开始
 
 ```bash
